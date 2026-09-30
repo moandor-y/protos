@@ -1,5 +1,7 @@
 /* boot.S — x86-64 Multiboot1/Multiboot2 Bootstrap Assembly (GNU as) */
 
+.intel_syntax noprefix
+
 .section .multiboot, "a"
 .align 8
 
@@ -50,60 +52,60 @@ _start:
     cld
 
     /* 2. Zero the 3 page tables (PML4, PDPT, PD = 3 * 4096 = 12288 bytes) */
-    xorl %eax, %eax
-    movl $pml4_table, %edi
-    movl $3072, %ecx            /* 12288 / 4 = 3072 dwords */
-    rep stosl
+    xor eax, eax
+    mov edi, offset pml4_table
+    mov ecx, 3072               /* 12288 / 4 = 3072 dwords */
+    rep stosd
 
     /* 3. Set up identity paging using 2 MiB huge pages for first 1 GiB
      *    PML4[0] -> PDPT
      *    PDPT[0] -> PD
      *    PD[0..511] -> 0x00000000 .. 0x3FFFFFFF (2 MiB pages, Present + RW + PS)
      */
-    movl $pdpt_table, %eax
-    orl  $0x03, %eax            /* Present (bit 0) | Read/Write (bit 1) */
-    movl %eax, pml4_table
+    mov eax, offset pdpt_table
+    or  eax, 0x03               /* Present (bit 0) | Read/Write (bit 1) */
+    mov dword ptr [pml4_table], eax
 
-    movl $pd_table, %eax
-    orl  $0x03, %eax            /* Present (bit 0) | Read/Write (bit 1) */
-    movl %eax, pdpt_table
+    mov eax, offset pd_table
+    or  eax, 0x03               /* Present (bit 0) | Read/Write (bit 1) */
+    mov dword ptr [pdpt_table], eax
 
-    movl $0, %ecx
+    mov ecx, 0
 .Lmap_pd_loop:
-    movl %ecx, %eax
-    shll $21, %eax              /* eax = ecx * 2 MiB (0x200000) */
-    orl  $0x83, %eax            /* Present (0x01) | RW (0x02) | Page Size 2MiB (0x80) */
-    movl %eax, pd_table(,%ecx,8)
-    movl $0, pd_table+4(,%ecx,8)
-    incl %ecx
-    cmpl $512, %ecx
-    jne  .Lmap_pd_loop
+    mov eax, ecx
+    shl eax, 21                 /* eax = ecx * 2 MiB (0x200000) */
+    or  eax, 0x83               /* Present (0x01) | RW (0x02) | Page Size 2MiB (0x80) */
+    mov dword ptr [pd_table + ecx * 8], eax
+    mov dword ptr [pd_table + ecx * 8 + 4], 0
+    inc ecx
+    cmp ecx, 512
+    jne .Lmap_pd_loop
 
     /* 4. Load CR3 with physical base address of PML4 */
-    movl $pml4_table, %eax
-    movl %eax, %cr3
+    mov eax, offset pml4_table
+    mov cr3, eax
 
     /* 5. Enable PAE (Physical Address Extension) in CR4 (bit 5) */
-    movl %cr4, %eax
-    orl  $(1 << 5), %eax
-    movl %eax, %cr4
+    mov eax, cr4
+    or  eax, (1 << 5)
+    mov cr4, eax
 
     /* 6. Enable Long Mode in IA32_EFER MSR (0xC0000080, bit 8 = LME) */
-    movl $0xC0000080, %ecx
+    mov ecx, 0xC0000080
     rdmsr
-    orl  $(1 << 8), %eax
+    or  eax, (1 << 8)
     wrmsr
 
     /* 7. Enable Paging (bit 31 = PG) and Protected Mode (bit 0 = PE) in CR0 */
-    movl %cr0, %eax
-    orl  $((1 << 31) | (1 << 0)), %eax
-    movl %eax, %cr0
+    mov eax, cr0
+    or  eax, ((1 << 31) | (1 << 0))
+    mov cr0, eax
 
     /* 8. Load 64-bit Global Descriptor Table (GDT) */
-    lgdt gdt64_pointer
+    lgdt [gdt64_pointer]
 
     /* 9. Far jump to 64-bit Kernel Code Segment (selector 0x08) to enter 64-bit mode */
-    ljmp $0x08, $long_mode_start
+    jmp 0x08:long_mode_start
 
 
 /* =========================================================================
@@ -112,16 +114,16 @@ _start:
 .code64
 long_mode_start:
     /* 10. Reload all data segment registers with Kernel Data Segment selector (0x10) */
-    movw $0x10, %ax
-    movw %ax, %ds
-    movw %ax, %es
-    movw %ax, %fs
-    movw %ax, %gs
-    movw %ax, %ss
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
 
     /* 11. Set up 64-bit stack pointer (16-byte aligned) */
-    movq $stack_top, %rsp
-    xorq %rbp, %rbp
+    mov rsp, offset stack_top
+    xor rbp, rbp
 
     /* 12. Call freestanding C++ kernel entry point */
     .extern kernel_main

@@ -13,12 +13,12 @@ static inline void outb(
     const uint16_t port,  //
     const uint8_t value   //
 ) {
-  asm volatile("outb %0, %1" : : "a"(value), "Nd"(port) : "memory");
+  asm volatile("out %1, %0" : : "a"(value), "Nd"(port) : "memory");
 }
 
 static inline uint8_t inb(const uint16_t port) {
   uint8_t value = 0;
-  asm volatile("inb %1, %0" : "=a"(value) : "Nd"(port) : "memory");
+  asm volatile("in %0, %1" : "=a"(value) : "Nd"(port) : "memory");
   return value;
 }
 

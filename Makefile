@@ -3,7 +3,7 @@ CXX := g++
 LD := ld
 
 ASFLAGS := --64
-CXXFLAGS := -m64 -std=c++20 -O2 -Wall -Wextra -Werror \
+CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra -Werror \
             -ffreestanding -nostdlib -fno-builtin \
             -fno-exceptions -fno-rtti -mno-red-zone \
             -fno-stack-protector -fno-pie
