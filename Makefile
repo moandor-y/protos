@@ -11,6 +11,28 @@ LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 --no-warn-rwx-segments -T linke
 
 BUILD_DIR := build
 
+CXX_SRCS := \
+    uart.cpp \
+    vga.cpp \
+    multiboot.cpp \
+    paging.cpp \
+    pmm.cpp \
+    heap.cpp \
+    memory_tests.cpp \
+    kernel.cpp
+
+CXX_HDRS := \
+    uart.h \
+    vga.h \
+    multiboot.h \
+    paging.h \
+    pmm.h \
+    heap.h \
+    memory_tests.h
+
+CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
+OBJS := $(BUILD_DIR)/boot.o $(CXX_OBJS)
+
 DOCKER ?= docker
 DOCKER_IMAGE ?= x86-64-kernel-build
 DOCKER_PLATFORM ?= linux/amd64
@@ -39,11 +61,11 @@ $(DOCKER_STAMP): Dockerfile | $(BUILD_DIR)
 $(BUILD_DIR)/boot.o: boot.S $(DOCKER_STAMP) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(AS) $(ASFLAGS) $< -o $@
 
-$(BUILD_DIR)/kernel.o: kernel.cpp $(DOCKER_STAMP) | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(DOCKER_STAMP) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kernel.bin: $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o linker.ld $(DOCKER_STAMP) | $(BUILD_DIR)
-	$(DOCKER_RUN) $(LD) $(LDFLAGS) $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o -o $@
+$(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(DOCKER_STAMP) | $(BUILD_DIR)
+	$(DOCKER_RUN) $(LD) $(LDFLAGS) $(OBJS) -o $@
 
 $(BUILD_DIR)/kernel.iso: $(BUILD_DIR)/kernel.bin $(DOCKER_STAMP) | $(BUILD_DIR)
 	rm -rf $(BUILD_DIR)/isodir

@@ -47,20 +47,24 @@ multiboot1_header_end:
 
 .code32
 _start:
-    /* 1. Disable interrupts and clear direction flag */
+    /* Disable interrupts and clear direction flag */
     cli
     cld
 
-    /* 2. Zero the 3 page tables (PML4, PDPT, PD = 3 * 4096 = 12288 bytes) */
+    /* Preserve Multiboot magic (eax) in ebp; ebx holds Multiboot info physical address */
+    mov ebp, eax
+
+    /* Zero the 3 page tables (PML4, PDPT, PD = 3 * 4096 = 12288 bytes) */
     xor eax, eax
     mov edi, offset pml4_table
     mov ecx, 3072               /* 12288 / 4 = 3072 dwords */
     rep stosd
 
-    /* 3. Set up identity paging using 2 MiB huge pages for first 1 GiB
-     *    PML4[0] -> PDPT
-     *    PDPT[0] -> PD
-     *    PD[0..511] -> 0x00000000 .. 0x3FFFFFFF (2 MiB pages, Present + RW + PS)
+    /* Set up bootstrap identity paging using 2 MiB huge pages for first 64 MiB
+     * PML4[0] -> PDPT
+     * PDPT[0] -> PD
+     * PD[0..31] -> 0x00000000 .. 0x03FFFFFF (2 MiB pages, Present + RW + PS)
+     * Remaining physical RAM is identity-mapped dynamically once PMM initializes.
      */
     mov eax, offset pdpt_table
     or  eax, 0x03               /* Present (bit 0) | Read/Write (bit 1) */
@@ -78,33 +82,35 @@ _start:
     mov dword ptr [pd_table + ecx * 8], eax
     mov dword ptr [pd_table + ecx * 8 + 4], 0
     inc ecx
-    cmp ecx, 512
+    cmp ecx, 32
     jne .Lmap_pd_loop
 
-    /* 4. Load CR3 with physical base address of PML4 */
+    /* Load CR3 with physical base address of PML4 */
     mov eax, offset pml4_table
     mov cr3, eax
 
-    /* 5. Enable PAE (Physical Address Extension) in CR4 (bit 5) */
+    /* Enable PAE (bit 5), OSFXSR (bit 9), and OSXMMEXCPT (bit 10) in CR4 */
     mov eax, cr4
-    or  eax, (1 << 5)
+    or  eax, ((1 << 5) | (1 << 9) | (1 << 10))
     mov cr4, eax
 
-    /* 6. Enable Long Mode in IA32_EFER MSR (0xC0000080, bit 8 = LME) */
+    /* Enable Long Mode in IA32_EFER MSR (0xC0000080, bit 8 = LME) */
     mov ecx, 0xC0000080
     rdmsr
     or  eax, (1 << 8)
     wrmsr
 
-    /* 7. Enable Paging (bit 31 = PG) and Protected Mode (bit 0 = PE) in CR0 */
+    /* Enable Paging (bit 31 = PG), Monitor Coprocessor (bit 1 = MP),
+     * and Protected Mode (bit 0 = PE) while clearing Emulation (bit 2 = EM) in CR0 */
     mov eax, cr0
-    or  eax, ((1 << 31) | (1 << 0))
+    and eax, ~(1 << 2)
+    or  eax, ((1 << 31) | (1 << 1) | (1 << 0))
     mov cr0, eax
 
-    /* 8. Load 64-bit Global Descriptor Table (GDT) */
+    /* Load 64-bit Global Descriptor Table (GDT) */
     lgdt [gdt64_pointer]
 
-    /* 9. Far jump to 64-bit Kernel Code Segment (selector 0x08) to enter 64-bit mode */
+    /* Far jump to 64-bit Kernel Code Segment (selector 0x08) to enter 64-bit mode */
     jmp 0x08:long_mode_start
 
 
@@ -113,7 +119,7 @@ _start:
  * ========================================================================= */
 .code64
 long_mode_start:
-    /* 10. Reload all data segment registers with Kernel Data Segment selector (0x10) */
+    /* Reload all data segment registers with Kernel Data Segment selector (0x10) */
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -121,15 +127,19 @@ long_mode_start:
     mov gs, ax
     mov ss, ax
 
-    /* 11. Set up 64-bit stack pointer (16-byte aligned) */
+    /* Set up 64-bit stack pointer (16-byte aligned) */
     mov rsp, offset stack_top
+
+    /* Pass (uint32_t magic, uint64_t mb_info_phys) in (edi, rsi) per System V AMD64 ABI */
+    mov edi, ebp
+    mov esi, ebx
     xor rbp, rbp
 
-    /* 12. Call freestanding C++ kernel entry point */
+    /* Call freestanding C++ kernel entry point */
     .extern kernel_main
     call kernel_main
 
-    /* 13. Clean CPU halt loop if kernel_main returns */
+    /* Clean CPU halt loop if kernel_main returns */
 .Lhalt_loop:
     cli
     hlt

@@ -8,6 +8,8 @@ fi
 BUILD_DIR="build"
 ISO_FILE="${1:-${BUILD_DIR}/kernel.iso}"
 EXPECTED_STRING="Hello, x86-64 Kernel World!"
+COMPLETION_MARKER="[TEST] ALL MEMORY TESTS PASSED"
+FAILURE_MARKER="FAIL"
 SERIAL_LOG="${BUILD_DIR}/serial_test_output.log"
 MONITOR_SOCK="${BUILD_DIR}/qemu_monitor.sock"
 VGA_DUMP="${BUILD_DIR}/vga_dump.bin"
@@ -41,11 +43,16 @@ qemu-system-x86_64 \
   >/dev/null 2>&1 &
 QEMU_PID=$!
 
-# Poll up to 10 seconds (100 * 0.1s) for the greeting string to appear on COM1
+# Poll up to 10 seconds (100 * 0.1s) for the greeting and memory test completion marker on COM1
 MATCHED=0
 for ((i = 0; i < 100; i++)); do
-  if [[ -f "${SERIAL_LOG}" ]] && grep -Fq "${EXPECTED_STRING}" "${SERIAL_LOG}" 2>/dev/null; then
+  if [[ -f "${SERIAL_LOG}" ]] && \
+     grep -Fq "${EXPECTED_STRING}" "${SERIAL_LOG}" 2>/dev/null && \
+     grep -Fq "${COMPLETION_MARKER}" "${SERIAL_LOG}" 2>/dev/null; then
     MATCHED=1
+    break
+  fi
+  if [[ -f "${SERIAL_LOG}" ]] && grep -Fq "[TEST] MEMORY VERIFICATION FAILED" "${SERIAL_LOG}" 2>/dev/null; then
     break
   fi
   if ! kill -0 "${QEMU_PID}" 2>/dev/null; then
@@ -55,11 +62,39 @@ for ((i = 0; i < 100; i++)); do
 done
 
 if [[ "${MATCHED}" -ne 1 ]]; then
-  echo "FAIL: Greeting string '${EXPECTED_STRING}' not found in serial output within timeout." >&2
+  echo "FAIL: Expected greeting '${EXPECTED_STRING}' and '${COMPLETION_MARKER}' not found in serial output within timeout." >&2
   if [[ -f "${SERIAL_LOG}" ]]; then
     echo "Captured serial output:" >&2
     cat "${SERIAL_LOG}" >&2
   fi
+  exit 1
+fi
+
+REQUIRED_MARKERS=(
+  "[PMM] mmap entry:"
+  "[PMM] Total RAM:"
+  "[TEST] pmm_memory_map_init: PASS"
+  "[TEST] pmm_alloc_and_bounds: PASS"
+  "[TEST] pmm_free_and_reuse: PASS"
+  "[TEST] heap_varied_sizes_and_alignment: PASS"
+  "[TEST] heap_pattern_isolation: PASS"
+  "[TEST] cpp_new_delete_lifecycle: PASS"
+  "[TEST] heap_stress_reuse: PASS"
+  "[TEST] edge_cases_and_oom: PASS"
+  "[TEST] ALL MEMORY TESTS PASSED"
+)
+
+for marker in "${REQUIRED_MARKERS[@]}"; do
+  if ! grep -Fq "${marker}" "${SERIAL_LOG}"; then
+    echo "FAIL: Missing required verification marker '${marker}' in serial output." >&2
+    cat "${SERIAL_LOG}" >&2
+    exit 1
+  fi
+done
+
+if grep -Fq "${FAILURE_MARKER}" "${SERIAL_LOG}"; then
+  echo "FAIL: Found failure marker in serial output." >&2
+  cat "${SERIAL_LOG}" >&2
   exit 1
 fi
 
@@ -108,5 +143,5 @@ fi
 
 echo "Captured serial output:"
 cat "${SERIAL_LOG}"
-echo "SUCCESS: Verified '${EXPECTED_STRING}' on UART COM1, VGA 0xB8000, and clean CPU halt."
+echo "SUCCESS: Verified '${EXPECTED_STRING}' on UART COM1, VGA 0xB8000, all memory tests PASSED, and clean CPU halt."
 exit 0
