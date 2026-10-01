@@ -1,6 +1,8 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace protos {
+
 namespace {
 
 constexpr uint16_t kCom1Port = 0x3F8;
@@ -92,3 +94,5 @@ extern "C" [[noreturn]] void kernel_main() {
     asm volatile("cli; hlt");
   }
 }
+
+}  // namespace protos
