@@ -1,12 +1,11 @@
+#include "rbtree.h"
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
-
-#include "rbtree.h"
 
 namespace protos {
 namespace {
@@ -14,31 +13,31 @@ namespace {
 namespace t = ::testing;
 
 struct BasicRbTestNode {
-  uint64_t key;
-  uint64_t value;
+  int key;
+  int value;
   RbNode node;
 };
 
 struct AugmentedRbTestNode {
-  uint64_t key;
-  size_t payload_size;
-  size_t subtree_max_size;
-  size_t subtree_count;
-  uint64_t subtree_key_sum;
+  int key;
+  int64_t payload_size;
+  int64_t subtree_max_size;
+  int64_t subtree_count;
+  int subtree_key_sum;
   RbNode node;
 };
 
 struct AugmentedRbTestTraits {
-  static uint64_t GetKey(const AugmentedRbTestNode& item) { return item.key; }
+  static int GetKey(const AugmentedRbTestNode& item) { return item.key; }
 
-  static bool Less(const uint64_t a, const uint64_t b) { return a < b; }
+  static bool Less(const int a, const int b) { return a < b; }
 
-  static void UpdateAugment(AugmentedRbTestNode* const item,        //
-                            const AugmentedRbTestNode* const left,  //
+  static void UpdateAugment(AugmentedRbTestNode* const item,
+                            const AugmentedRbTestNode* const left,
                             const AugmentedRbTestNode* const right) {
-    size_t max_size = item->payload_size;
-    size_t count = 1;
-    uint64_t key_sum = item->key;
+    int64_t max_size = item->payload_size;
+    int64_t count = 1;
+    int key_sum = item->key;
 
     if (left != nullptr) {
       if (left->subtree_max_size > max_size) {
@@ -61,38 +60,38 @@ struct AugmentedRbTestTraits {
   }
 };
 
-constexpr size_t kMaxVerifyDepth = 64;
-constexpr size_t kBulkTestNodeCount = 128;
-constexpr size_t kSearchTestNodeCount = 256;
+constexpr int64_t kMaxVerifyDepth = 64;
+constexpr int64_t kBulkTestNodeCount = 128;
+constexpr int64_t kSearchTestNodeCount = 256;
 
-static bool VerifyNodeAugment(const BasicRbTestNode& item,        //
-                              const BasicRbTestNode& recomputed,  //
-                              const BasicRbTestNode* const left,  //
+static bool VerifyNodeAugment(const BasicRbTestNode& item,
+                              const BasicRbTestNode& recomputed,
+                              const BasicRbTestNode* const left,
                               const BasicRbTestNode* const right) {
   (void)left;
   (void)right;
   return item.key == recomputed.key && item.value == recomputed.value;
 }
 
-static bool VerifyNodeAugment(const AugmentedRbTestNode& item,        //
-                              const AugmentedRbTestNode& recomputed,  //
-                              const AugmentedRbTestNode* const left,  //
+static bool VerifyNodeAugment(const AugmentedRbTestNode& item,
+                              const AugmentedRbTestNode& recomputed,
+                              const AugmentedRbTestNode* const left,
                               const AugmentedRbTestNode* const right) {
-  const size_t left_max = (left != nullptr) ? left->subtree_max_size : 0;
-  const size_t right_max = (right != nullptr) ? right->subtree_max_size : 0;
-  size_t expected_max = item.payload_size;
+  const int64_t left_max = (left != nullptr) ? left->subtree_max_size : 0;
+  const int64_t right_max = (right != nullptr) ? right->subtree_max_size : 0;
+  int64_t expected_max = item.payload_size;
   if (left_max > expected_max) {
     expected_max = left_max;
   }
   if (right_max > expected_max) {
     expected_max = right_max;
   }
-  const size_t expected_count = 1 +
-                                ((left != nullptr) ? left->subtree_count : 0) +
-                                ((right != nullptr) ? right->subtree_count : 0);
-  const uint64_t expected_sum =
-      item.key + ((left != nullptr) ? left->subtree_key_sum : 0) +
-      ((right != nullptr) ? right->subtree_key_sum : 0);
+  const int64_t expected_count =
+      1 + ((left != nullptr) ? left->subtree_count : 0) +
+      ((right != nullptr) ? right->subtree_count : 0);
+  const int expected_sum = item.key +
+                           ((left != nullptr) ? left->subtree_key_sum : 0) +
+                           ((right != nullptr) ? right->subtree_key_sum : 0);
 
   return item.subtree_max_size == recomputed.subtree_max_size &&
          item.subtree_count == recomputed.subtree_count &&
@@ -108,9 +107,9 @@ static bool VerifyRbSubtree(const RbTree<T, kNodeMember, Traits>& tree,  //
                             const T* const expected_parent,              //
                             const T* const min_node,                     //
                             const T* const max_node,                     //
-                            const size_t depth,                          //
-                            size_t* const out_black_height,              //
-                            size_t* const io_visited_count) {
+                            const int64_t depth,                         //
+                            int64_t* const out_black_height,             //
+                            int64_t* const io_visited_count) {
   if (curr == nullptr) {
     *out_black_height = 1;
     return true;
@@ -151,8 +150,8 @@ static bool VerifyRbSubtree(const RbTree<T, kNodeMember, Traits>& tree,  //
     }
   }
 
-  size_t left_bh = 0;
-  size_t right_bh = 0;
+  int64_t left_bh = 0;
+  int64_t right_bh = 0;
   if (!VerifyRbSubtree(tree,       //
                        left,       //
                        curr,       //
@@ -181,13 +180,8 @@ static bool VerifyRbSubtree(const RbTree<T, kNodeMember, Traits>& tree,  //
   // Invariant (5): Every node's augmented value matches the freshly recomputed
   // value of its left and right children.
   T recomputed = *curr;
-  Traits::UpdateAugment(&recomputed,  //
-                        left,         //
-                        right);
-  if (!VerifyNodeAugment(*curr,       //
-                         recomputed,  //
-                         left,        //
-                         right)) {
+  Traits::UpdateAugment(&recomputed, left, right);
+  if (!VerifyNodeAugment(*curr, recomputed, left, right)) {
     return false;
   }
 
@@ -196,7 +190,7 @@ static bool VerifyRbSubtree(const RbTree<T, kNodeMember, Traits>& tree,  //
 
 template <typename T, RbNode T::* kNodeMember, typename Traits>
 static t::AssertionResult VerifyRbTree(
-    const RbTree<T, kNodeMember, Traits>& tree, const size_t expected_count) {
+    const RbTree<T, kNodeMember, Traits>& tree, const int64_t expected_count) {
   const T* const root = tree.root();
   if (root == nullptr) {
     if (tree.Empty() && tree.First() == nullptr && tree.Last() == nullptr &&
@@ -218,8 +212,8 @@ static t::AssertionResult VerifyRbTree(
     return t::AssertionFailure() << "Root must be black with null parent";
   }
 
-  size_t black_height = 0;
-  size_t visited_count = 0;
+  int64_t black_height = 0;
+  int64_t visited_count = 0;
   const T* const null_node = nullptr;
   if (!VerifyRbSubtree(tree,           //
                        root,           //
@@ -248,15 +242,14 @@ static t::AssertionResult VerifyRbTree(
   if (tree.First() != leftmost || tree.Last() != rightmost) {
     return t::AssertionFailure() << "First()/Last() mismatch with tree extrema";
   }
-  if (tree.Prev(tree.First()) != nullptr ||
-      tree.Next(tree.Last()) != nullptr) {
+  if (tree.Prev(tree.First()) != nullptr || tree.Next(tree.Last()) != nullptr) {
     return t::AssertionFailure()
            << "Prev(First()) and Next(Last()) must be null";
   }
 
   // Invariant (4): In-order traversal keys are strictly ordered, and
   // Next()/Prev() are exact inverses across all nodes.
-  size_t iter_count = 0;
+  int64_t iter_count = 0;
   const T* prev = nullptr;
   const T* curr = tree.First();
   while (curr != nullptr) {
@@ -283,8 +276,8 @@ static t::AssertionResult VerifyRbTree(
 }
 
 template <typename Tree>
-static std::vector<uint64_t> CollectKeys(const Tree& tree) {
-  std::vector<uint64_t> keys;
+static std::vector<int> CollectKeys(const Tree& tree) {
+  std::vector<int> keys;
   for (auto* curr = tree.First(); curr != nullptr; curr = Tree::Next(curr)) {
     keys.push_back(curr->key);
   }
@@ -292,8 +285,8 @@ static std::vector<uint64_t> CollectKeys(const Tree& tree) {
 }
 
 template <typename Tree>
-static std::vector<uint64_t> CollectKeysReverse(const Tree& tree) {
-  std::vector<uint64_t> keys;
+static std::vector<int> CollectKeysReverse(const Tree& tree) {
+  std::vector<int> keys;
   for (auto* curr = tree.Last(); curr != nullptr; curr = Tree::Prev(curr)) {
     keys.push_back(curr->key);
   }
@@ -301,9 +294,9 @@ static std::vector<uint64_t> CollectKeysReverse(const Tree& tree) {
 }
 
 static void InitAugmentedTestNode(AugmentedRbTestNode* const item,
-                                  const size_t index) {
-  const uint64_t key = (index + 1) * 16;
-  const size_t payload_size = ((index * 97 + 31) % 500) + 16;
+                                  const int64_t index) {
+  const int key = static_cast<int>(index + 1) * 16;
+  const int64_t payload_size = ((index * 97 + 31) % 500) + 16;
   item->key = key;
   item->payload_size = payload_size;
   item->subtree_max_size = 0;
@@ -312,15 +305,15 @@ static void InitAugmentedTestNode(AugmentedRbTestNode* const item,
   item->node = {};
 }
 
-static void VerifyThreeNodeRotationCase(const uint64_t k0,  //
-                                        const uint64_t k1,  //
-                                        const uint64_t k2) {
+static void VerifyThreeNodeRotationCase(const int k0,  //
+                                        const int k1,  //
+                                        const int k2) {
   using Tree = RbTree<BasicRbTestNode, &BasicRbTestNode::node>;
   Tree tree;
   BasicRbTestNode nodes[3] = {
-      {k0, k0 * 10, {}},  //
-      {k1, k1 * 10, {}},  //
-      {k2, k2 * 10, {}},  //
+      {k0, k0 * 10, {}},
+      {k1, k1 * 10, {}},
+      {k2, k2 * 10, {}},
   };
 
   ASSERT_TRUE(tree.Insert(&nodes[0]));
@@ -332,18 +325,18 @@ static void VerifyThreeNodeRotationCase(const uint64_t k0,  //
 
   BasicRbTestNode* const root = tree.root();
   ASSERT_THAT(root, t::NotNull());
-  EXPECT_THAT(root->key, t::Eq(20u));
+  EXPECT_THAT(root->key, t::Eq(20));
   EXPECT_THAT(tree.Color(root), t::Eq(RbColor::kBlack));
 
   const BasicRbTestNode* const left = tree.Left(root);
   const BasicRbTestNode* const right = tree.Right(root);
   ASSERT_THAT(left, t::NotNull());
   ASSERT_THAT(right, t::NotNull());
-  EXPECT_THAT(left->key, t::Eq(10u));
-  EXPECT_THAT(right->key, t::Eq(30u));
+  EXPECT_THAT(left->key, t::Eq(10));
+  EXPECT_THAT(right->key, t::Eq(30));
   EXPECT_THAT(tree.Color(left), t::Eq(RbColor::kRed));
   EXPECT_THAT(tree.Color(right), t::Eq(RbColor::kRed));
-  EXPECT_THAT(CollectKeys(tree), t::ElementsAre(10u, 20u, 30u));
+  EXPECT_THAT(CollectKeys(tree), t::ElementsAre(10, 20, 30));
 
   tree.Erase(root);
   ASSERT_TRUE(VerifyRbTree(tree, 2));
@@ -401,7 +394,7 @@ TEST(RbTreeTest, SingleNodeLifecycleAndDuplicateKeyRejection) {
   EXPECT_THAT(Tree::Parent(&first_node), t::IsNull());
   EXPECT_THAT(Tree::Color(&first_node), t::Eq(RbColor::kBlack));
   EXPECT_THAT(tree.Find(50), t::Eq(&first_node));
-  EXPECT_THAT(CollectKeys(tree), t::ElementsAre(50u));
+  EXPECT_THAT(CollectKeys(tree), t::ElementsAre(50));
 
   tree.Erase(first_node);
   EXPECT_TRUE(VerifyRbTree(tree, 0));
@@ -418,50 +411,21 @@ TEST(RbTreeTest, RotationsAndMultiLevelInsertEraseFixup) {
 
   using Tree = RbTree<BasicRbTestNode, &BasicRbTestNode::node>;
   Tree tree;
-  constexpr uint64_t kFixupKeys[] = {
-      20,  //
-      10,  //
-      30,  //
-      5,   //
-      15,  //
-      25,  //
-      35,  //
-      2,   //
-      7,   //
-      12,  //
-      18,  //
-      1,   //
-      3,   //
-      6,   //
-      8,   //
-  };
-  constexpr size_t kFixupCount = sizeof(kFixupKeys) / sizeof(kFixupKeys[0]);
+  constexpr int kFixupKeys[] = {20, 10, 30, 5, 15, 25, 35, 2,
+                                7,  12, 18, 1, 3,  6,  8};
+  constexpr int64_t kFixupCount = sizeof(kFixupKeys) / sizeof(kFixupKeys[0]);
   BasicRbTestNode nodes[kFixupCount];
 
-  for (size_t i = 0; i < kFixupCount; ++i) {
+  for (int64_t i = 0; i < kFixupCount; ++i) {
     nodes[i] = {kFixupKeys[i], kFixupKeys[i] * 3, {}};
     ASSERT_TRUE(tree.Insert(&nodes[i]));
     ASSERT_TRUE(VerifyRbTree(tree, i + 1));
   }
 
-  EXPECT_THAT(CollectKeys(tree),
-              t::ElementsAre(1u,   //
-                             2u,   //
-                             3u,   //
-                             5u,   //
-                             6u,   //
-                             7u,   //
-                             8u,   //
-                             10u,  //
-                             12u,  //
-                             15u,  //
-                             18u,  //
-                             20u,  //
-                             25u,  //
-                             30u,  //
-                             35u));
+  EXPECT_THAT(CollectKeys(tree), t::ElementsAre(1, 2, 3, 5, 6, 7, 8, 10, 12, 15,
+                                                18, 20, 25, 30, 35));
 
-  for (size_t i = 0; i < kFixupCount; ++i) {
+  for (int64_t i = 0; i < kFixupCount; ++i) {
     BasicRbTestNode* const victim = ((i & 1) == 0) ? tree.root() : tree.First();
     tree.Erase(victim);
     ASSERT_TRUE(VerifyRbTree(tree, kFixupCount - 1 - i));
@@ -474,29 +438,13 @@ TEST(RbTreeTest, QueriesAndBidirectionalIteration) {
   using Tree = RbTree<BasicRbTestNode, &BasicRbTestNode::node>;
   Tree tree;
 
-  constexpr uint64_t kInsertOrder[] = {
-      80,   //
-      40,   //
-      120,  //
-      20,   //
-      60,   //
-      100,  //
-      140,  //
-      10,   //
-      30,   //
-      50,   //
-      70,   //
-      90,   //
-      110,  //
-      130,  //
-      150,  //
-      160,  //
-  };
-  constexpr size_t kCount = sizeof(kInsertOrder) / sizeof(kInsertOrder[0]);
+  constexpr int kInsertOrder[] = {80, 40, 120, 20, 60,  100, 140, 10,
+                                  30, 50, 70,  90, 110, 130, 150, 160};
+  constexpr int64_t kCount = sizeof(kInsertOrder) / sizeof(kInsertOrder[0]);
   BasicRbTestNode nodes[kCount];
 
-  for (size_t i = 0; i < kCount; ++i) {
-    nodes[i] = {kInsertOrder[i], i + 100, {}};
+  for (int64_t i = 0; i < kCount; ++i) {
+    nodes[i] = {kInsertOrder[i], static_cast<int>(i + 100), {}};
     ASSERT_TRUE(tree.Insert(&nodes[i]));
     ASSERT_TRUE(VerifyRbTree(tree, i + 1));
   }
@@ -507,17 +455,17 @@ TEST(RbTreeTest, QueriesAndBidirectionalIteration) {
   EXPECT_THAT(tree.Find(0), t::IsNull());
   EXPECT_THAT(const_tree.Find(9), t::IsNull());
   ASSERT_THAT(tree.LowerBound(0), t::NotNull());
-  EXPECT_THAT(tree.LowerBound(0)->key, t::Eq(10u));
+  EXPECT_THAT(tree.LowerBound(0)->key, t::Eq(10));
   ASSERT_THAT(const_tree.LowerBound(9), t::NotNull());
-  EXPECT_THAT(const_tree.LowerBound(9)->key, t::Eq(10u));
+  EXPECT_THAT(const_tree.LowerBound(9)->key, t::Eq(10));
   ASSERT_THAT(tree.UpperBound(0), t::NotNull());
-  EXPECT_THAT(tree.UpperBound(0)->key, t::Eq(10u));
+  EXPECT_THAT(tree.UpperBound(0)->key, t::Eq(10));
   ASSERT_THAT(const_tree.UpperBound(9), t::NotNull());
-  EXPECT_THAT(const_tree.UpperBound(9)->key, t::Eq(10u));
+  EXPECT_THAT(const_tree.UpperBound(9)->key, t::Eq(10));
 
   // Exact keys (10, 20, ..., 160) and missing odd midpoint keys (15, 25, ...).
-  for (size_t idx = 1; idx <= kCount; ++idx) {
-    const uint64_t exact_key = idx * 10;
+  for (int64_t idx = 1; idx <= kCount; ++idx) {
+    const int exact_key = static_cast<int>(idx) * 10;
     const BasicRbTestNode* const found = tree.Find(exact_key);
     const BasicRbTestNode* const cfound = const_tree.Find(exact_key);
     const BasicRbTestNode* const lb = tree.LowerBound(exact_key);
@@ -536,7 +484,7 @@ TEST(RbTreeTest, QueriesAndBidirectionalIteration) {
       ASSERT_THAT(ub, t::NotNull());
       EXPECT_THAT(ub->key, t::Eq(exact_key + 10));
 
-      const uint64_t mid_key = exact_key + 5;
+      const int mid_key = exact_key + 5;
       EXPECT_THAT(tree.Find(mid_key), t::IsNull());
       EXPECT_THAT(const_tree.Find(mid_key), t::IsNull());
       EXPECT_THAT(tree.LowerBound(mid_key), t::Eq(ub));
@@ -557,42 +505,14 @@ TEST(RbTreeTest, QueriesAndBidirectionalIteration) {
   EXPECT_THAT(const_tree.UpperBound(1000), t::IsNull());
 
   EXPECT_THAT(CollectKeys(const_tree),
-              t::ElementsAre(10u,   //
-                             20u,   //
-                             30u,   //
-                             40u,   //
-                             50u,   //
-                             60u,   //
-                             70u,   //
-                             80u,   //
-                             90u,   //
-                             100u,  //
-                             110u,  //
-                             120u,  //
-                             130u,  //
-                             140u,  //
-                             150u,  //
-                             160u));
+              t::ElementsAre(10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120,
+                             130, 140, 150, 160));
 
   EXPECT_THAT(CollectKeysReverse(const_tree),
-              t::ElementsAre(160u,  //
-                             150u,  //
-                             140u,  //
-                             130u,  //
-                             120u,  //
-                             110u,  //
-                             100u,  //
-                             90u,   //
-                             80u,   //
-                             70u,   //
-                             60u,   //
-                             50u,   //
-                             40u,   //
-                             30u,   //
-                             20u,   //
-                             10u));
+              t::ElementsAre(160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60,
+                             50, 40, 30, 20, 10));
 
-  for (size_t i = 0; i < kCount; ++i) {
+  for (int64_t i = 0; i < kCount; ++i) {
     tree.Erase(&nodes[i]);
     ASSERT_TRUE(VerifyRbTree(tree, kCount - 1 - i));
   }
@@ -606,40 +526,40 @@ TEST(RbTreeTest, AugmentedBulkInsertAndErase) {
   AugmentedRbTestNode nodes[kBulkTestNodeCount];
 
   // Phase 1: Ascending insert (0..127) and ascending erase (0..127).
-  for (size_t i = 0; i < kBulkTestNodeCount; ++i) {
+  for (int64_t i = 0; i < kBulkTestNodeCount; ++i) {
     InitAugmentedTestNode(&nodes[i], i);
     ASSERT_TRUE(tree.Insert(&nodes[i]));
     ASSERT_TRUE(VerifyRbTree(tree, i + 1));
   }
-  for (size_t i = 0; i < kBulkTestNodeCount; ++i) {
+  for (int64_t i = 0; i < kBulkTestNodeCount; ++i) {
     tree.Erase(&nodes[i]);
     ASSERT_TRUE(VerifyRbTree(tree, kBulkTestNodeCount - 1 - i));
   }
 
   // Phase 2: Descending insert (127..0) and descending erase (127..0).
-  for (size_t i = kBulkTestNodeCount; i > 0; --i) {
-    const size_t idx = i - 1;
+  for (int64_t i = kBulkTestNodeCount; i > 0; --i) {
+    const int64_t idx = i - 1;
     InitAugmentedTestNode(&nodes[idx], idx);
-    const size_t expected_count = kBulkTestNodeCount - idx;
+    const int64_t expected_count = kBulkTestNodeCount - idx;
     ASSERT_TRUE(tree.Insert(&nodes[idx]));
     ASSERT_TRUE(VerifyRbTree(tree, expected_count));
   }
-  for (size_t i = kBulkTestNodeCount; i > 0; --i) {
-    const size_t idx = i - 1;
+  for (int64_t i = kBulkTestNodeCount; i > 0; --i) {
+    const int64_t idx = i - 1;
     tree.Erase(&nodes[idx]);
     ASSERT_TRUE(VerifyRbTree(tree, idx));
   }
 
   // Phase 3: Interleaved outside-in insert + continuous root deletion (forcing
   // two-child successor transplants and fixups at every step).
-  for (size_t step = 0; step < kBulkTestNodeCount; ++step) {
-    const size_t idx =
+  for (int64_t step = 0; step < kBulkTestNodeCount; ++step) {
+    const int64_t idx =
         ((step & 1) == 0) ? (step / 2) : (kBulkTestNodeCount - 1 - step / 2);
     InitAugmentedTestNode(&nodes[idx], idx);
     ASSERT_TRUE(tree.Insert(&nodes[idx]));
     ASSERT_TRUE(VerifyRbTree(tree, step + 1));
   }
-  for (size_t step = 0; step < kBulkTestNodeCount; ++step) {
+  for (int64_t step = 0; step < kBulkTestNodeCount; ++step) {
     AugmentedRbTestNode* const current_root = tree.root();
     ASSERT_THAT(current_root, t::NotNull());
     tree.Erase(current_root);
@@ -648,14 +568,14 @@ TEST(RbTreeTest, AugmentedBulkInsertAndErase) {
 
   // Phase 4: Pseudo-random permutation insert + independent pseudo-random
   // permutation erase (gcd(37, 128) == 1 and gcd(83, 128) == 1).
-  for (size_t step = 0; step < kBulkTestNodeCount; ++step) {
-    const size_t idx = (step * 37 + 11) & (kBulkTestNodeCount - 1);
+  for (int64_t step = 0; step < kBulkTestNodeCount; ++step) {
+    const int64_t idx = (step * 37 + 11) & (kBulkTestNodeCount - 1);
     InitAugmentedTestNode(&nodes[idx], idx);
     ASSERT_TRUE(tree.Insert(&nodes[idx]));
     ASSERT_TRUE(VerifyRbTree(tree, step + 1));
   }
-  for (size_t step = 0; step < kBulkTestNodeCount; ++step) {
-    const size_t idx = (step * 83 + 59) & (kBulkTestNodeCount - 1);
+  for (int64_t step = 0; step < kBulkTestNodeCount; ++step) {
+    const int64_t idx = (step * 83 + 59) & (kBulkTestNodeCount - 1);
     tree.Erase(&nodes[idx]);
     ASSERT_TRUE(VerifyRbTree(tree, kBulkTestNodeCount - 1 - step));
   }
@@ -679,23 +599,23 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
   }
 
   // Populate 256 nodes in pseudo-random order (gcd(73, 256) == 1).
-  for (size_t step = 0; step < kSearchTestNodeCount; ++step) {
-    const size_t idx = (step * 73 + 19) & (kSearchTestNodeCount - 1);
+  for (int64_t step = 0; step < kSearchTestNodeCount; ++step) {
+    const int64_t idx = (step * 73 + 19) & (kSearchTestNodeCount - 1);
     InitAugmentedTestNode(&nodes[idx], idx);
     ASSERT_TRUE(tree.Insert(&nodes[idx]));
   }
   ASSERT_TRUE(VerifyRbTree(tree, kSearchTestNodeCount));
 
   // Test PropagateAugment after in-place payload_size mutations.
-  const size_t original_size_42 = nodes[42].payload_size;
+  const int64_t original_size_42 = nodes[42].payload_size;
   nodes[42].payload_size = 50000;
   tree.PropagateAugment(&nodes[42]);
-  EXPECT_THAT(tree.root()->subtree_max_size, t::Eq(50000u));
+  EXPECT_THAT(tree.root()->subtree_max_size, t::Eq(50000));
   ASSERT_TRUE(VerifyRbTree(tree, kSearchTestNodeCount));
 
   nodes[42].payload_size = 8;
   tree.PropagateAugment(nodes[42]);
-  EXPECT_THAT(tree.root()->subtree_max_size, t::Lt(50000u));
+  EXPECT_THAT(tree.root()->subtree_max_size, t::Lt(50000));
   ASSERT_TRUE(VerifyRbTree(tree, kSearchTestNodeCount));
 
   nodes[42].payload_size = original_size_42;
@@ -704,10 +624,10 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
 
   // Mutate root in-place and propagate.
   AugmentedRbTestNode* const root_node = tree.root();
-  const size_t old_root_size = root_node->payload_size;
+  const int64_t old_root_size = root_node->payload_size;
   root_node->payload_size = 12345;
   tree.PropagateAugment(root_node);
-  EXPECT_THAT(tree.root()->subtree_max_size, t::Eq(12345u));
+  EXPECT_THAT(tree.root()->subtree_max_size, t::Eq(12345));
   ASSERT_TRUE(VerifyRbTree(tree, kSearchTestNodeCount));
   root_node->payload_size = old_root_size;
   tree.PropagateAugment(root_node);
@@ -716,27 +636,17 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
   // any unpruned search for 20000 would have to visit all 256 nodes.
   nodes[kSearchTestNodeCount - 1].payload_size = 20000;
   tree.PropagateAugment(&nodes[kSearchTestNodeCount - 1]);
-  EXPECT_THAT(tree.root()->subtree_max_size, t::Eq(20000u));
+  EXPECT_THAT(tree.root()->subtree_max_size, t::Eq(20000));
   ASSERT_TRUE(VerifyRbTree(tree, kSearchTestNodeCount));
 
-  constexpr size_t kTargetSizes[] = {
-      1,      //
-      8,      //
-      16,     //
-      100,    //
-      250,    //
-      400,    //
-      500,    //
-      515,    //
-      20000,  //
-      20001,  //
-      99999,  //
-  };
-  constexpr size_t kNumTargets = sizeof(kTargetSizes) / sizeof(kTargetSizes[0]);
+  constexpr int64_t kTargetSizes[] = {1,   8,   16,    100,   250,  400,
+                                      500, 515, 20000, 20001, 99999};
+  constexpr int64_t kNumTargets =
+      sizeof(kTargetSizes) / sizeof(kTargetSizes[0]);
   const AugTree& const_tree = tree;
 
-  for (size_t t_idx = 0; t_idx < kNumTargets; ++t_idx) {
-    const size_t target = kTargetSizes[t_idx];
+  for (int64_t t_idx = 0; t_idx < kNumTargets; ++t_idx) {
+    const int64_t target = kTargetSizes[t_idx];
 
     // Ground-truth linear scan in key order (First -> Next).
     const AugmentedRbTestNode* expected_match = nullptr;
@@ -763,7 +673,7 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
       EXPECT_CALL(subtree_pred, Call)
           .Times(t::Between(1, 40))
           .WillRepeatedly([target](const AugmentedRbTestNode& node) {
-            EXPECT_THAT(node.subtree_count, t::Ge(1u));
+            EXPECT_THAT(node.subtree_count, t::Ge(1));
             return node.subtree_max_size >= target;
           });
       EXPECT_CALL(node_pred, Call)
@@ -773,9 +683,8 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
           });
     }
 
-    const AugmentedRbTestNode* const found_two_pred =
-        tree.FindFirstAugmented(subtree_pred.AsStdFunction(),
-                                node_pred.AsStdFunction());
+    const AugmentedRbTestNode* const found_two_pred = tree.FindFirstAugmented(
+        subtree_pred.AsStdFunction(), node_pred.AsStdFunction());
     EXPECT_THAT(found_two_pred, t::Eq(expected_match));
 
     // Also verify the single-predicate overload on const_tree.
@@ -796,32 +705,26 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
 
 class MockAugmentObserver {
  public:
-  MOCK_METHOD(void,
-              OnUpdateAugment,
-              (uint64_t node_key,            //
-               const uint64_t* left_key,     //
-               const uint64_t* right_key));
+  MOCK_METHOD(void, OnUpdateAugment,
+              (int node_key, const int* left_key, const int* right_key));
 };
 
 struct ObservedRbTestNode {
-  uint64_t key;
+  int key;
   std::shared_ptr<MockAugmentObserver> observer;
   RbNode node;
 };
 
 struct ObservedRbTestTraits {
-  static uint64_t GetKey(const ObservedRbTestNode& item) { return item.key; }
+  static int GetKey(const ObservedRbTestNode& item) { return item.key; }
 
-  static void UpdateAugment(ObservedRbTestNode* const item,        //
-                            const ObservedRbTestNode* const left,  //
+  static void UpdateAugment(ObservedRbTestNode* const item,
+                            const ObservedRbTestNode* const left,
                             const ObservedRbTestNode* const right) {
     if (item->observer != nullptr) {
-      const uint64_t* const left_key = (left != nullptr) ? &left->key : nullptr;
-      const uint64_t* const right_key =
-          (right != nullptr) ? &right->key : nullptr;
-      item->observer->OnUpdateAugment(item->key,  //
-                                      left_key,   //
-                                      right_key);
+      const int* const left_key = (left != nullptr) ? &left->key : nullptr;
+      const int* const right_key = (right != nullptr) ? &right->key : nullptr;
+      item->observer->OnUpdateAugment(item->key, left_key, right_key);
     }
   }
 };
@@ -835,17 +738,17 @@ TEST(RbTreeTest, CustomTraitsInvokeAugmentCallbacksOnInsertAndPropagate) {
   ObservedRbTestNode n20 = {20, observer, {}};
 
   EXPECT_CALL(*observer, OnUpdateAugment)
-      .WillOnce([](const uint64_t node_key,        //
-                   const uint64_t* const left_key,  //
-                   const uint64_t* const right_key) {
-        EXPECT_THAT(node_key, t::Eq(10u));
+      .WillOnce([](const int node_key,         //
+                   const int* const left_key,  //
+                   const int* const right_key) {
+        EXPECT_THAT(node_key, t::Eq(10));
         EXPECT_THAT(left_key, t::IsNull());
         EXPECT_THAT(right_key, t::IsNull());
       })
-      .WillRepeatedly([](const uint64_t node_key,        //
-                         const uint64_t* const left_key,  //
-                         const uint64_t* const right_key) {
-        EXPECT_THAT(node_key, t::AnyOf(t::Eq(10u), t::Eq(20u)));
+      .WillRepeatedly([](const int node_key,         //
+                         const int* const left_key,  //
+                         const int* const right_key) {
+        EXPECT_THAT(node_key, t::AnyOf(t::Eq(10), t::Eq(20)));
         (void)left_key;
         (void)right_key;
       });
@@ -854,20 +757,20 @@ TEST(RbTreeTest, CustomTraitsInvokeAugmentCallbacksOnInsertAndPropagate) {
   ASSERT_TRUE(tree.Insert(&n20));
 
   EXPECT_CALL(*observer, OnUpdateAugment)
-      .WillOnce([](const uint64_t node_key,        //
-                   const uint64_t* const left_key,  //
-                   const uint64_t* const right_key) {
-        EXPECT_THAT(node_key, t::Eq(20u));
+      .WillOnce([](const int node_key,         //
+                   const int* const left_key,  //
+                   const int* const right_key) {
+        EXPECT_THAT(node_key, t::Eq(20));
         EXPECT_THAT(left_key, t::IsNull());
         EXPECT_THAT(right_key, t::IsNull());
       })
-      .WillOnce([](const uint64_t node_key,        //
-                   const uint64_t* const left_key,  //
-                   const uint64_t* const right_key) {
-        EXPECT_THAT(node_key, t::Eq(10u));
+      .WillOnce([](const int node_key,         //
+                   const int* const left_key,  //
+                   const int* const right_key) {
+        EXPECT_THAT(node_key, t::Eq(10));
         EXPECT_THAT(left_key, t::IsNull());
         ASSERT_THAT(right_key, t::NotNull());
-        EXPECT_THAT(*right_key, t::Eq(20u));
+        EXPECT_THAT(*right_key, t::Eq(20));
       });
 
   tree.PropagateAugment(&n20);

@@ -8,6 +8,7 @@
 #include "paging.h"
 #include "pmm.h"
 #include "uart.h"
+#include "vga.h"
 
 namespace protos {
 
@@ -46,13 +47,18 @@ class TestWidget {
   uint64_t checksum_;
 };
 
+static void ConsoleWrite(const char* const str) {
+  UartWrite(str);
+  VgaWrite(str);
+}
+
 static void LogTestResult(const char* const test_name, const bool passed) {
-  UartWrite("[TEST] ");
-  UartWrite(test_name);
+  ConsoleWrite("[TEST] ");
+  ConsoleWrite(test_name);
   if (passed) {
-    UartWrite(": PASS\n");
+    ConsoleWrite(": PASS\n");
   } else {
-    UartWrite(": FAIL\n");
+    ConsoleWrite(": FAIL\n");
   }
 }
 
@@ -60,8 +66,8 @@ static void LogTestResult(const char* const test_name, const bool passed) {
 // identity-mapped usable RAM frames and that the identity map covers all
 // discovered usable physical RAM. Outputs the allocated frame addresses so the
 // subsequent free-and-reuse test can release them.
-static bool TestPmmAllocAndBounds(uintptr_t* const out_first_frame,   //
-                                  uintptr_t* const out_second_frame,  //
+static bool TestPmmAllocAndBounds(uintptr_t* const out_first_frame,
+                                  uintptr_t* const out_second_frame,
                                   uintptr_t* const out_multi_frames) {
   // Verify that usable physical RAM extends beyond the initial 64 MiB
   // bootstrap mapping and that PmmInit extended the identity map all the way
@@ -69,7 +75,8 @@ static bool TestPmmAllocAndBounds(uintptr_t* const out_first_frame,   //
   const uintptr_t max_phys = PmmMaxPhysicalAddress();
   if (max_phys <= kBootstrapIdentityMapSize ||
       PagingIdentityMappedLimit() < max_phys ||
-      !PagingIsIdentityMapped(max_phys - kPageSize)) {
+      !PagingIsIdentityMapped(max_phys - kPageSize) ||
+      !PmmRangeIsValidUsableRam(max_phys - kPageSize, kPageSize)) {
     return false;
   }
 
@@ -109,20 +116,25 @@ static bool TestPmmAllocAndBounds(uintptr_t* const out_first_frame,   //
 
   // Write distinct 64-bit test patterns to the allocated frames (including the
   // last frame of the 4-frame contiguous block) as well as the highest usable
-  // physical page, and verify that they read back identically.
+  // physical page (restoring its prior value afterward), and verify that they
+  // read back identically.
   volatile uint64_t* const p1 = reinterpret_cast<volatile uint64_t*>(frame1);
   volatile uint64_t* const p2 = reinterpret_cast<volatile uint64_t*>(frame2);
   volatile uint64_t* const pm =
       reinterpret_cast<volatile uint64_t*>(multi + 3 * kPageSize);
   volatile uint64_t* const p_top =
       reinterpret_cast<volatile uint64_t*>(max_phys - kPageSize);
+  const uint64_t saved_top = *p_top;
   *p1 = 0xCAFEBABE11112222;
   *p2 = 0xDEADBEEF33334444;
   *pm = 0x0123456789ABCDEF;
   *p_top = 0xFEDCBA9876543210;
 
-  return *p1 == 0xCAFEBABE11112222 && *p2 == 0xDEADBEEF33334444 &&
-         *pm == 0x0123456789ABCDEF && *p_top == 0xFEDCBA9876543210;
+  const bool patterns_ok =
+      *p1 == 0xCAFEBABE11112222 && *p2 == 0xDEADBEEF33334444 &&
+      *pm == 0x0123456789ABCDEF && *p_top == 0xFEDCBA9876543210;
+  *p_top = saved_top;
+  return patterns_ok;
 }
 
 static bool TestPmmFreeAndReuse(const uintptr_t frame1,  //
@@ -159,19 +171,8 @@ static bool TestPmmFreeAndReuse(const uintptr_t frame1,  //
 }
 
 static bool TestHeapVariedSizesAndAlignment() {
-  constexpr size_t kSizes[] = {
-      1,      //
-      7,      //
-      15,     //
-      16,     //
-      31,     //
-      64,     //
-      256,    //
-      1024,   //
-      4096,   //
-      16384,  //
-      65536,  //
-  };
+  constexpr size_t kSizes[] = {1,   7,    15,   16,    31,   64,
+                               256, 1024, 4096, 16384, 65536};
   constexpr size_t kNumSizes = sizeof(kSizes) / sizeof(kSizes[0]);
 
   void* kmalloc_ptrs[kNumSizes];
@@ -202,14 +203,7 @@ static bool TestHeapVariedSizesAndAlignment() {
 }
 
 static bool TestHeapPatternIsolation() {
-  constexpr size_t kSizes[] = {
-      24,     //
-      128,    //
-      512,    //
-      2048,   //
-      8192,   //
-      16384,  //
-  };
+  constexpr size_t kSizes[] = {24, 128, 512, 2048, 8192, 16384};
   constexpr size_t kCount = sizeof(kSizes) / sizeof(kSizes[0]);
 
   uint8_t* buffers[kCount];
@@ -289,12 +283,7 @@ static bool TestHeapStressReuse() {
   const size_t pmm_before = PmmFreeFrameCount();
 
   constexpr size_t kIterations = 256;
-  constexpr size_t kChunkSizes[] = {
-      4096,   //
-      8192,   //
-      16384,  //
-      32768,  //
-  };
+  constexpr size_t kChunkSizes[] = {4096, 8192, 16384, 32768};
   constexpr size_t kNumChunks = sizeof(kChunkSizes) / sizeof(kChunkSizes[0]);
 
   for (size_t iter = 0; iter < kIterations; ++iter) {
@@ -419,21 +408,18 @@ void RunBootVerificationSuite(const uint32_t multiboot_magic,
   const bool pmm_ok = PmmInit(multiboot_magic, multiboot_info_addr);
   LogTestResult("pmm_memory_map_init", pmm_ok);
   if (!pmm_ok) {
-    UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");
+    ConsoleWrite("[TEST] MEMORY VERIFICATION FAILED\n");
     return;
   }
 
   uintptr_t frame1 = 0;
   uintptr_t frame2 = 0;
   uintptr_t multi_frames = 0;
-  const bool alloc_bounds_ok = TestPmmAllocAndBounds(&frame1,  //
-                                                     &frame2,  //
-                                                     &multi_frames);
+  const bool alloc_bounds_ok =
+      TestPmmAllocAndBounds(&frame1, &frame2, &multi_frames);
   LogTestResult("pmm_alloc_and_bounds", alloc_bounds_ok);
 
-  const bool free_reuse_ok = TestPmmFreeAndReuse(frame1,  //
-                                                 frame2,  //
-                                                 multi_frames);
+  const bool free_reuse_ok = TestPmmFreeAndReuse(frame1, frame2, multi_frames);
   LogTestResult("pmm_free_and_reuse", free_reuse_ok);
 
   const bool heap_init_ok = HeapInit();
@@ -454,9 +440,9 @@ void RunBootVerificationSuite(const uint32_t multiboot_magic,
 
   if (pmm_ok && alloc_bounds_ok && free_reuse_ok && varied_ok && pattern_ok &&
       cpp_ok && stress_ok && edge_ok) {
-    UartWrite("[TEST] ALL MEMORY TESTS PASSED\n");
+    ConsoleWrite("[TEST] ALL MEMORY TESTS PASSED\n");
   } else {
-    UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");
+    ConsoleWrite("[TEST] MEMORY VERIFICATION FAILED\n");
   }
 }
 

@@ -10,13 +10,19 @@ namespace protos {
 namespace {
 
 constexpr size_t kEntriesPerPageTable = 512;
+constexpr size_t kMaxBootstrapPageTables = 8;
 constexpr uint64_t kPtePresent = 1 << 0;
 constexpr uint64_t kPteWritable = 1 << 1;
 constexpr uint64_t kPteHugePage = 1 << 7;
 constexpr uint64_t kPteAddressMask = 0x000FFFFFFFFFF000;
 constexpr uint64_t kHugePageAddressMask = 0x000FFFFFFFE00000;
-// Maximum canonical lower-half 48-bit physical/virtual address limit (128 TiB).
-constexpr uintptr_t kMaxCanonicalIdentityAddress = 0x0000800000000000;
+
+// Static fallback pool of 4 KiB-aligned page tables in `.bss` used when
+// mapping high-memory bootloader structures (e.g., UEFI Multiboot2 info,
+// GOP framebuffer, or PMM bitmap above 64 MiB) before `PmmInit` completes.
+alignas(4096) uint64_t
+    g_bootstrap_page_tables[kMaxBootstrapPageTables][kEntriesPerPageTable];
+size_t g_bootstrap_page_tables_used = 0;
 
 uintptr_t g_identity_mapped_limit = kBootstrapIdentityMapSize;
 
@@ -39,12 +45,18 @@ static void WriteCr3(const uintptr_t cr3_phys) {
   asm volatile("mov cr3, %0" : : "r"(value) : "memory");
 }
 
-// Allocates a single 4 KiB frame from the PMM and zeroes all 512 64-bit page
+// Allocates a single 4 KiB frame from the PMM (or from the static bootstrap
+// pool if the PMM is not yet initialized) and zeroes all 512 64-bit page
 // table entries. Returns the physical address of the table, or 0 on OOM.
 static uintptr_t AllocZeroedPageTable() {
-  const uintptr_t frame_phys = PmmAllocFrame();
+  uintptr_t frame_phys = PmmAllocFrame();
   if (frame_phys == 0) {
-    return 0;
+    if (g_bootstrap_page_tables_used >= kMaxBootstrapPageTables) {
+      return 0;
+    }
+    frame_phys = reinterpret_cast<uintptr_t>(
+        g_bootstrap_page_tables[g_bootstrap_page_tables_used]);
+    ++g_bootstrap_page_tables_used;
   }
   uint64_t* const entries = reinterpret_cast<uint64_t*>(frame_phys);
   for (size_t i = 0; i < kEntriesPerPageTable; ++i) {
@@ -55,20 +67,30 @@ static uintptr_t AllocZeroedPageTable() {
 
 }  // namespace
 
-bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
-  if (max_physical_addr == 0 ||
-      max_physical_addr > kMaxCanonicalIdentityAddress - kHugePageSize) {
+bool PagingMapBootstrapRange(const uintptr_t phys_addr, const size_t size) {
+  if (size == 0) {
+    return true;
+  }
+  if (phys_addr >= kMaxCanonicalIdentityAddress ||
+      (kMaxCanonicalIdentityAddress - phys_addr) < size) {
     return false;
   }
 
-  const uintptr_t target_end = AlignUp(max_physical_addr, kHugePageSize);
+  const uintptr_t end_addr = phys_addr + size;
+  if (end_addr > kMaxCanonicalIdentityAddress - kHugePageSize) {
+    return false;
+  }
+  const uintptr_t start_page = phys_addr & ~(kHugePageSize - 1);
+  const uintptr_t end_page = AlignUp(end_addr, kHugePageSize);
+
   const uintptr_t pml4_phys = ReadCr3();
   if (pml4_phys == 0) {
     return false;
   }
   uint64_t* const pml4 = reinterpret_cast<uint64_t*>(pml4_phys);
+  bool tlb_flush_needed = false;
 
-  for (uintptr_t addr = 0; addr < target_end; addr += kHugePageSize) {
+  for (uintptr_t addr = start_page; addr < end_page; addr += kHugePageSize) {
     const size_t pml4_idx = (addr >> 39) & 0x1FF;
     const size_t pdpt_idx = (addr >> 30) & 0x1FF;
     const size_t pd_idx = (addr >> 21) & 0x1FF;
@@ -80,6 +102,7 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
       }
       pml4[pml4_idx] =
           static_cast<uint64_t>(new_pdpt_phys) | kPtePresent | kPteWritable;
+      tlb_flush_needed = true;
     }
 
     uint64_t* const pdpt =
@@ -91,6 +114,7 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
       }
       pdpt[pdpt_idx] =
           static_cast<uint64_t>(new_pd_phys) | kPtePresent | kPteWritable;
+      tlb_flush_needed = true;
     }
 
     uint64_t* const pd =
@@ -98,10 +122,26 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
     if ((pd[pd_idx] & kPtePresent) == 0) {
       pd[pd_idx] = static_cast<uint64_t>(addr) | kPtePresent | kPteWritable |
                    kPteHugePage;
+      tlb_flush_needed = true;
     }
   }
 
-  WriteCr3(pml4_phys);
+  if (tlb_flush_needed) {
+    WriteCr3(pml4_phys);
+  }
+  return true;
+}
+
+bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
+  if (max_physical_addr == 0 ||
+      max_physical_addr > kMaxCanonicalIdentityAddress - kHugePageSize) {
+    return false;
+  }
+
+  const uintptr_t target_end = AlignUp(max_physical_addr, kHugePageSize);
+  if (!PagingMapBootstrapRange(0, target_end)) {
+    return false;
+  }
   if (target_end > g_identity_mapped_limit) {
     g_identity_mapped_limit = target_end;
   }

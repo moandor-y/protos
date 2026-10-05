@@ -6,6 +6,7 @@
 #include "multiboot.h"
 #include "paging.h"
 #include "uart.h"
+#include "vga.h"
 
 extern "C" {
 extern const uint8_t g_kernel_start[];
@@ -83,7 +84,8 @@ static void PmmMarkFrameFree(const size_t frame_idx) {
 
 // Marks only the complete 4 KiB frames strictly inside `[base, base + length)`
 // as free (rounding start UP and end DOWN to page boundaries so partial edge
-// frames are never freed).
+// frames are never freed). Uses 64-frame word-granular updates for large
+// multi-gigabyte RAM regions.
 static void PmmFreeRegionInterior(const uint64_t base, const uint64_t length) {
   if (base >= g_max_managed_phys_addr || length < kPageSize) {
     return;
@@ -96,8 +98,22 @@ static void PmmFreeRegionInterior(const uint64_t base, const uint64_t length) {
   if (start_addr >= end_addr) {
     return;
   }
-  for (uintptr_t addr = start_addr; addr < end_addr; addr += kPageSize) {
-    PmmMarkFrameFree(addr / kPageSize);
+
+  size_t frame_idx = start_addr / kPageSize;
+  const size_t end_frame = end_addr / kPageSize;
+  while (frame_idx < end_frame) {
+    if ((frame_idx % kBitmapWordBits) == 0 &&
+        (end_frame - frame_idx) >= kBitmapWordBits) {
+      const size_t word_idx = frame_idx / kBitmapWordBits;
+      if (g_pmm_bitmap[word_idx] == ~uint64_t{0}) {
+        g_pmm_bitmap[word_idx] = 0;
+        g_pmm_free_frames += kBitmapWordBits;
+        frame_idx += kBitmapWordBits;
+        continue;
+      }
+    }
+    PmmMarkFrameFree(frame_idx);
+    ++frame_idx;
   }
 }
 
@@ -121,13 +137,13 @@ static void PmmReserveRegionOutward(const uint64_t base,
 }
 
 // Checks whether `[addr, addr + size)` lies inside a usable RAM region within
-// the initial bootstrap identity map (`[kLowerMemoryLimit,
-// kBootstrapIdentityMapSize)`) and does not overlap the kernel image or
+// `[kLowerMemoryLimit, search_limit)` and does not overlap the kernel image or
 // Multiboot structures.
-static bool IsRangeUsableForBitmap(const uintptr_t addr, const size_t size) {
-  if (size == 0 || addr < kLowerMemoryLimit ||
-      addr >= kBootstrapIdentityMapSize ||
-      (kBootstrapIdentityMapSize - addr) < size) {
+static bool IsRangeUsableForBitmap(const uintptr_t addr,  //
+                                   const size_t size,     //
+                                   const uintptr_t search_limit) {
+  if (size == 0 || addr < kLowerMemoryLimit || addr >= search_limit ||
+      (search_limit - addr) < size) {
     return false;
   }
 
@@ -149,6 +165,16 @@ static bool IsRangeUsableForBitmap(const uintptr_t addr, const size_t size) {
       end_addr > g_memory_map.mb1_mmap_reserved_start) {
     return false;
   }
+  if (g_memory_map.fb_addr != 0 && g_memory_map.fb_pitch != 0 &&
+      g_memory_map.fb_height != 0) {
+    const uintptr_t fb_start = g_memory_map.fb_addr;
+    const uintptr_t fb_end =
+        fb_start +
+        static_cast<uintptr_t>(g_memory_map.fb_pitch) * g_memory_map.fb_height;
+    if (addr < fb_end && end_addr > fb_start) {
+      return false;
+    }
+  }
 
   bool inside_available = false;
   for (size_t i = 0; i < g_memory_map.region_count; ++i) {
@@ -167,24 +193,21 @@ static bool IsRangeUsableForBitmap(const uintptr_t addr, const size_t size) {
   return inside_available;
 }
 
-// Finds a page-aligned physical address range of `bitmap_bytes` bytes within
-// the bootstrap-mapped low memory to store `g_pmm_bitmap`.
-static uintptr_t FindBitmapPhysicalAddress(const size_t bitmap_bytes) {
+static uintptr_t FindBitmapInLimit(const size_t bitmap_bytes,
+                                   const uintptr_t search_limit) {
   for (size_t i = 0; i < g_memory_map.region_count; ++i) {
     if (g_memory_map.regions[i].type != kMemoryTypeAvailable) {
       continue;
     }
     const uint64_t raw_start = g_memory_map.regions[i].base;
     const uint64_t raw_end = raw_start + g_memory_map.regions[i].length;
-    if (raw_end <= kLowerMemoryLimit ||
-        raw_start >= kBootstrapIdentityMapSize) {
+    if (raw_end <= kLowerMemoryLimit || raw_start >= search_limit) {
       continue;
     }
     const uintptr_t clamped_start = static_cast<uintptr_t>(
         (raw_start < kLowerMemoryLimit) ? kLowerMemoryLimit : raw_start);
     const uintptr_t clamped_end = static_cast<uintptr_t>(
-        (raw_end > kBootstrapIdentityMapSize) ? kBootstrapIdentityMapSize
-                                              : raw_end);
+        (raw_end > search_limit) ? search_limit : raw_end);
     const uintptr_t aligned_start = AlignUp(clamped_start, kPageSize);
     const uintptr_t aligned_end = AlignDown(clamped_end, kPageSize);
     if (aligned_start >= aligned_end ||
@@ -193,7 +216,7 @@ static uintptr_t FindBitmapPhysicalAddress(const size_t bitmap_bytes) {
     }
     for (uintptr_t cand = aligned_start; cand <= aligned_end - bitmap_bytes;
          cand += kPageSize) {
-      if (IsRangeUsableForBitmap(cand, bitmap_bytes)) {
+      if (IsRangeUsableForBitmap(cand, bitmap_bytes, search_limit)) {
         return cand;
       }
     }
@@ -201,16 +224,37 @@ static uintptr_t FindBitmapPhysicalAddress(const size_t bitmap_bytes) {
   return 0;
 }
 
+// Finds a page-aligned physical address range of `bitmap_bytes` bytes to store
+// `g_pmm_bitmap`, preferring the initial 64 MiB bootstrap window and falling
+// back to higher usable RAM if low memory is fragmented or too small.
+static uintptr_t FindBitmapPhysicalAddress(const size_t bitmap_bytes) {
+  const uintptr_t low_cand =
+      FindBitmapInLimit(bitmap_bytes, kBootstrapIdentityMapSize);
+  if (low_cand != 0) {
+    return low_cand;
+  }
+  return FindBitmapInLimit(bitmap_bytes, g_max_managed_phys_addr);
+}
+
 }  // namespace
 
 bool PmmInit(const uint32_t multiboot_magic,
              const uint64_t multiboot_info_addr) {
-  const bool parsed_ok = MultibootParseMemoryMap(multiboot_magic,            //
-                                                 multiboot_info_addr,        //
-                                                 kBootstrapIdentityMapSize,  //
-                                                 &g_memory_map);
+  const bool parsed_ok =
+      MultibootParseMemoryMap(multiboot_magic,               //
+                              multiboot_info_addr,           //
+                              kMaxCanonicalIdentityAddress,  //
+                              &g_memory_map);
   if (!parsed_ok) {
     return false;
+  }
+
+  if (g_memory_map.fb_addr != 0) {
+    VgaAttachFramebuffer(g_memory_map.fb_addr,    //
+                         g_memory_map.fb_pitch,   //
+                         g_memory_map.fb_width,   //
+                         g_memory_map.fb_height,  //
+                         g_memory_map.fb_bpp);
   }
 
   uintptr_t highest_usable_addr = 0;
@@ -236,7 +280,7 @@ bool PmmInit(const uint32_t multiboot_magic,
       AlignUp(g_bitmap_words * sizeof(uint64_t), kPageSize);
 
   const uintptr_t bitmap_phys = FindBitmapPhysicalAddress(bitmap_bytes);
-  if (bitmap_phys == 0) {
+  if (bitmap_phys == 0 || !PagingMapBootstrapRange(bitmap_phys, bitmap_bytes)) {
     return false;
   }
 
@@ -281,6 +325,24 @@ bool PmmInit(const uint32_t multiboot_magic,
     PmmReserveRegionOutward(g_memory_map.mb1_mmap_reserved_start,
                             g_memory_map.mb1_mmap_reserved_end -
                                 g_memory_map.mb1_mmap_reserved_start);
+  }
+  if (g_memory_map.fb_addr != 0 && g_memory_map.fb_pitch != 0 &&
+      g_memory_map.fb_height != 0) {
+    const uint64_t fb_bytes =
+        static_cast<uint64_t>(g_memory_map.fb_pitch) * g_memory_map.fb_height;
+    PmmReserveRegionOutward(g_memory_map.fb_addr, fb_bytes);
+  }
+
+  // Clamp g_max_managed_phys_addr to the highest genuinely free usable frame
+  // so that PmmMaxPhysicalAddress() - kPageSize never lands on an overlapping
+  // reserved/ACPI/bootloader page at the tail of an available region.
+  while (g_max_frames > (kLowerMemoryLimit / kPageSize) &&
+         PmmIsFrameUsed(g_max_frames - 1)) {
+    --g_max_frames;
+  }
+  g_max_managed_phys_addr = g_max_frames * kPageSize;
+  if (g_max_managed_phys_addr <= kLowerMemoryLimit || g_pmm_free_frames == 0) {
+    return false;
   }
 
   if (!PagingExtendIdentityMap(g_max_managed_phys_addr)) {
@@ -375,8 +437,7 @@ bool PmmRangeIsValidUsableRam(const uintptr_t addr, const size_t size) {
     return false;
   }
   // Reject ranges overlapping the PMM frame bitmap itself.
-  if (g_bitmap_phys_end > g_bitmap_phys_start &&  //
-      addr < g_bitmap_phys_end &&                 //
+  if (g_bitmap_phys_end > g_bitmap_phys_start && addr < g_bitmap_phys_end &&
       end_addr > g_bitmap_phys_start) {
     return false;
   }
@@ -392,6 +453,16 @@ bool PmmRangeIsValidUsableRam(const uintptr_t addr, const size_t size) {
       addr < g_memory_map.mb1_mmap_reserved_end &&
       end_addr > g_memory_map.mb1_mmap_reserved_start) {
     return false;
+  }
+  if (g_memory_map.fb_addr != 0 && g_memory_map.fb_pitch != 0 &&
+      g_memory_map.fb_height != 0) {
+    const uintptr_t fb_start = g_memory_map.fb_addr;
+    const uintptr_t fb_end =
+        fb_start +
+        static_cast<uintptr_t>(g_memory_map.fb_pitch) * g_memory_map.fb_height;
+    if (addr < fb_end && end_addr > fb_start) {
+      return false;
+    }
   }
 
   // Scan the parsed Multiboot memory map to verify that `[addr, end_addr)` is

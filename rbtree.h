@@ -317,9 +317,7 @@ class RbTree {
   template <typename SubtreePred, typename NodePred>
   const T* FindFirstAugmented(const SubtreePred& subtree_pred,
                               const NodePred& node_pred) const {
-    return FindFirstAugmentedTwoPred(root_,         //
-                                     subtree_pred,  //
-                                     node_pred);
+    return FindFirstAugmentedTwoPred(root_, subtree_pred, node_pred);
   }
 
   template <typename SubtreePred>
@@ -333,16 +331,12 @@ class RbTree {
     const auto node_pred = [&subtree_pred](const T* const item) -> bool {
       if constexpr (std::is_copy_constructible_v<T>) {
         T single = *item;
-        InvokeUpdateAugmentOnItem(&single,  //
-                                  nullptr,  //
-                                  nullptr);
+        InvokeUpdateAugmentOnItem(&single, nullptr, nullptr);
         return InvokePred(subtree_pred, &single);
       } else {
         T* const mutable_item = const_cast<T*>(item);
         const RbNode* const node = ItemToNode(item);
-        InvokeUpdateAugmentOnItem(mutable_item,  //
-                                  nullptr,       //
-                                  nullptr);
+        InvokeUpdateAugmentOnItem(mutable_item, nullptr, nullptr);
         const bool matched = InvokePred(subtree_pred, mutable_item);
         InvokeUpdateAugmentOnItem(mutable_item,            //
                                   NodeToItem(node->left),  //
@@ -350,9 +344,7 @@ class RbTree {
         return matched;
       }
     };
-    return FindFirstAugmentedTwoPred(root_,         //
-                                     subtree_pred,  //
-                                     node_pred);
+    return FindFirstAugmentedTwoPred(root_, subtree_pred, node_pred);
   }
 
  private:
@@ -510,13 +502,9 @@ class RbTree {
                                                                   left,   //
                                                                   right)),
                                    bool>) {
-        return Traits::UpdateAugment(*item,  //
-                                     left,   //
-                                     right);
+        return Traits::UpdateAugment(*item, left, right);
       } else {
-        Traits::UpdateAugment(*item,  //
-                              left,   //
-                              right);
+        Traits::UpdateAugment(*item, left, right);
         return true;
       }
     } else if constexpr (requires {
@@ -526,13 +514,9 @@ class RbTree {
                                                                   left,  //
                                                                   right)),
                                    bool>) {
-        return Traits::UpdateAugment(item,  //
-                                     left,  //
-                                     right);
+        return Traits::UpdateAugment(item, left, right);
       } else {
-        Traits::UpdateAugment(item,  //
-                              left,  //
-                              right);
+        Traits::UpdateAugment(item, left, right);
         return true;
       }
     } else if constexpr (requires { Traits::UpdateAugment(*item); }) {
@@ -758,8 +742,8 @@ class RbTree {
   }
 
   template <typename SubtreePred, typename NodePred>
-  static const T* FindFirstAugmentedTwoPred(const RbNode* const node,         //
-                                            const SubtreePred& subtree_pred,  //
+  static const T* FindFirstAugmentedTwoPred(const RbNode* const node,
+                                            const SubtreePred& subtree_pred,
                                             const NodePred& node_pred) {
     if (node == nullptr) {
       return nullptr;
@@ -769,9 +753,8 @@ class RbTree {
       return nullptr;
     }
     if (node->left != nullptr) {
-      const T* const left_match = FindFirstAugmentedTwoPred(node->left,    //
-                                                            subtree_pred,  //
-                                                            node_pred);
+      const T* const left_match =
+          FindFirstAugmentedTwoPred(node->left, subtree_pred, node_pred);
       if (left_match != nullptr) {
         return left_match;
       }
@@ -779,9 +762,7 @@ class RbTree {
     if (InvokePred(node_pred, item)) {
       return item;
     }
-    return FindFirstAugmentedTwoPred(node->right,   //
-                                     subtree_pred,  //
-                                     node_pred);
+    return FindFirstAugmentedTwoPred(node->right, subtree_pred, node_pred);
   }
 };
 

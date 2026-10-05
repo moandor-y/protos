@@ -54,11 +54,20 @@ _start:
     /* Preserve Multiboot magic (eax) in ebp; ebx holds Multiboot info physical address */
     mov ebp, eax
 
-    /* Zero the 3 page tables (PML4, PDPT, PD = 3 * 4096 = 12288 bytes) */
+    /* Zero the entire .bss section (page tables, IDT, stack, and C++ globals) */
+    .extern g_bss_start
+    .extern g_bss_end
     xor eax, eax
-    mov edi, offset pml4_table
-    mov ecx, 3072               /* 12288 / 4 = 3072 dwords */
+    mov edi, offset g_bss_start
+    mov ecx, offset g_bss_end
+    sub ecx, edi
+    shr ecx, 2
     rep stosd
+
+    /* Mask all legacy 8259 PIC interrupts (master 0x21, slave 0xA1) */
+    mov al, 0xFF
+    out 0x21, al
+    out 0xA1, al
 
     /* Set up bootstrap identity paging using 2 MiB huge pages for first 64 MiB
      * PML4[0] -> PDPT
@@ -130,6 +139,39 @@ long_mode_start:
     /* Set up 64-bit stack pointer (16-byte aligned) */
     mov rsp, offset stack_top
 
+    /* Populate 32-entry 64-bit IDT (vectors 0..31) so bare-metal NMIs do not
+     * cause a double/triple fault reset. */
+    lea rdi, [idt64]
+    mov ecx, 32
+    lea rdx, [exception_halt_stub]
+.Lidt_init_loop:
+    mov eax, edx
+    and eax, 0xFFFF
+    or  eax, (0x08 << 16)       /* Selector 0x08 (64-bit Kernel Code) */
+    mov dword ptr [rdi], eax
+    mov eax, edx
+    and eax, 0xFFFF0000
+    or  eax, 0x8E00             /* Present=1, DPL=0, 64-bit Interrupt Gate */
+    mov dword ptr [rdi + 4], eax
+    mov qword ptr [rdi + 8], 0
+    add rdi, 16
+    dec ecx
+    jnz .Lidt_init_loop
+
+    /* Override Vector 2 (NMI) to return cleanly via iretq */
+    lea rdx, [nmi_isr_stub]
+    lea rdi, [idt64 + 2 * 16]
+    mov eax, edx
+    and eax, 0xFFFF
+    or  eax, (0x08 << 16)
+    mov dword ptr [rdi], eax
+    mov eax, edx
+    and eax, 0xFFFF0000
+    or  eax, 0x8E00
+    mov dword ptr [rdi + 4], eax
+
+    lidt [idt64_pointer]
+
     /* Pass (uint32_t magic, uint64_t mb_info_phys) in (edi, rsi) per System V AMD64 ABI */
     mov edi, ebp
     mov esi, ebx
@@ -145,9 +187,19 @@ long_mode_start:
     hlt
     jmp .Lhalt_loop
 
+.align 16
+nmi_isr_stub:
+    iretq
+
+.align 16
+exception_halt_stub:
+    cli
+    hlt
+    jmp exception_halt_stub
+
 
 /* =========================================================================
- * 64-Bit Global Descriptor Table (Read-Only Data)
+ * 64-Bit Global Descriptor Table & IDT Pointer (Read-Only Data)
  * ========================================================================= */
 .section .rodata
 .align 16
@@ -162,9 +214,14 @@ gdt64_pointer:
     .word gdt64_end - gdt64 - 1 /* 16-bit Limit */
     .quad gdt64                 /* 64-bit Base Address */
 
+.align 16
+idt64_pointer:
+    .word 32 * 16 - 1           /* 16-bit Limit (32 gate descriptors) */
+    .quad idt64                 /* 64-bit Base Address */
+
 
 /* =========================================================================
- * BSS Section: Page Tables (4 KiB aligned) and Kernel Stack (16-byte aligned)
+ * BSS Section: Page Tables (4 KiB aligned), IDT, and Kernel Stack
  * ========================================================================= */
 .section .bss
 .align 4096
@@ -174,6 +231,10 @@ pdpt_table:
     .skip 4096
 pd_table:
     .skip 4096
+
+.align 16
+idt64:
+    .skip 32 * 16
 
 .align 16
 stack_bottom:

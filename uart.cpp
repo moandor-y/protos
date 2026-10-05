@@ -8,6 +8,9 @@ namespace protos {
 namespace {
 
 constexpr uint16_t kCom1Port = 0x3F8;
+constexpr uint32_t kMaxTransmitPollIterations = 100000;
+
+bool g_uart_present = false;
 
 static inline void Outb(const uint16_t port, const uint8_t value) {
   asm volatile("out %1, %0" : : "a"(value), "Nd"(port) : "memory");
@@ -29,12 +32,25 @@ void UartInit() {
   Outb(kCom1Port + 3, 0x03);
   Outb(kCom1Port + 2, 0xC7);
   Outb(kCom1Port + 4, 0x0B);
+
+  // If the Line Status Register floats high (0xFF), no UART is decoding 0x3F8.
+  g_uart_present = (Inb(kCom1Port + 5) != 0xFF);
 }
 
 void UartPutc(const char c) {
-  while ((Inb(kCom1Port + 5) & 0x20) == 0) {
+  if (!g_uart_present) {
+    return;
   }
-  Outb(kCom1Port, static_cast<uint8_t>(c));
+  for (uint32_t spin = 0; spin < kMaxTransmitPollIterations; ++spin) {
+    if ((Inb(kCom1Port + 5) & 0x20) != 0) {
+      Outb(kCom1Port, static_cast<uint8_t>(c));
+      return;
+    }
+    asm volatile("pause");
+  }
+  // Transmit holding register never became ready (e.g., unclocked Super I/O
+  // UART); disable subsequent UART polling to avoid stalling boot.
+  g_uart_present = false;
 }
 
 void UartWrite(const char* const str) {
