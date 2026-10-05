@@ -109,24 +109,31 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
 }
 
 bool PagingIsIdentityMapped(const uintptr_t addr) {
+  // Reject non-canonical lower-half addresses beyond the 48-bit identity limit.
   if (addr >= kMaxCanonicalIdentityAddress) {
     return false;
   }
+  // Locate the active top-level PML4 table from CR3.
   const uintptr_t pml4_phys = ReadCr3();
   if (pml4_phys == 0) {
     return false;
   }
 
+  // Extract the 9-bit page table indices for PML4 (bits 47:39), PDPT (bits
+  // 38:30), and PD (bits 29:21) from the virtual address.
   const size_t pml4_idx = (addr >> 39) & 0x1FF;
   const size_t pdpt_idx = (addr >> 30) & 0x1FF;
   const size_t pd_idx = (addr >> 21) & 0x1FF;
 
+  // Check that the PML4 entry is present and writable.
   const uint64_t* const pml4 = reinterpret_cast<const uint64_t*>(pml4_phys);
   const uint64_t pml4e = pml4[pml4_idx];
   if ((pml4e & (kPtePresent | kPteWritable)) != (kPtePresent | kPteWritable)) {
     return false;
   }
 
+  // Follow the PML4 entry to the PDPT and check that the PDPT entry is present
+  // and writable.
   const uint64_t* const pdpt =
       reinterpret_cast<const uint64_t*>(pml4e & kPteAddressMask);
   const uint64_t pdpte = pdpt[pdpt_idx];
@@ -134,14 +141,22 @@ bool PagingIsIdentityMapped(const uintptr_t addr) {
     return false;
   }
 
+  // Follow the PDPT entry to the Page Directory (PD) and verify that the PD
+  // entry is a present, writable 2 MiB huge page (PS=1).
   const uint64_t* const pd =
       reinterpret_cast<const uint64_t*>(pdpte & kPteAddressMask);
   const uint64_t pde = pd[pd_idx];
-  const uint64_t required_flags = kPtePresent | kPteWritable | kPteHugePage;
-  if ((pde & required_flags) != required_flags) {
-    return false;
+  {
+    constexpr uint64_t kRequiredFlags =
+        kPtePresent | kPteWritable | kPteHugePage;
+    if ((pde & kRequiredFlags) != kRequiredFlags) {
+      return false;
+    }
   }
 
+  // Confirm identity mapping by checking that the physical 2 MiB huge-page
+  // base address encoded in the PD entry matches the 2 MiB-aligned virtual
+  // address.
   const uintptr_t mapped_base =
       static_cast<uintptr_t>(pde & kHugePageAddressMask);
   const uintptr_t expected_base = addr & ~(kHugePageSize - 1);

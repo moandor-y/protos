@@ -6,7 +6,7 @@ SECTIONS
 {
     /* Load kernel at physical address 1 MiB (0x100000) */
     . = 1M;
-    _kernel_start = .;
+    g_kernel_start = .;
 
     /* Ensure Multiboot headers appear at the very start of the binary (within first 8 KiB) */
     .text ALIGN(4K) : AT(ADDR(.text))
@@ -27,15 +27,15 @@ SECTIONS
 
     .bss ALIGN(4K) : AT(ADDR(.bss))
     {
-        _bss_start = .;
+        g_bss_start = .;
         *(COMMON)
         *(.bss .bss.*)
         . = ALIGN(4K);
-        _bss_end = .;
+        g_bss_end = .;
     }
 
     . = ALIGN(4K);
-    _kernel_end = .;
+    g_kernel_end = .;
 
     /DISCARD/ :
     {

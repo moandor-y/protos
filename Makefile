@@ -28,6 +28,7 @@ CXX_HDRS := \
     paging.h \
     pmm.h \
     heap.h \
+    rbtree.h \
     memory_tests.h
 
 CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))

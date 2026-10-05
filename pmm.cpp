@@ -8,8 +8,8 @@
 #include "uart.h"
 
 extern "C" {
-extern const uint8_t _kernel_start[];
-extern const uint8_t _kernel_end[];
+extern const uint8_t g_kernel_start[];
+extern const uint8_t g_kernel_end[];
 }
 
 namespace protos {
@@ -132,8 +132,8 @@ static bool IsRangeUsableForBitmap(const uintptr_t addr, const size_t size) {
   }
 
   const uintptr_t end_addr = addr + size;
-  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(_kernel_start);
-  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(_kernel_end);
+  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(g_kernel_start);
+  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(g_kernel_end);
 
   if (addr < kernel_end && end_addr > kernel_start) {
     return false;
@@ -264,8 +264,8 @@ bool PmmInit(const uint32_t multiboot_magic,
 
   PmmReserveRegionOutward(0, kLowerMemoryLimit);
 
-  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(_kernel_start);
-  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(_kernel_end);
+  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(g_kernel_start);
+  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(g_kernel_end);
   PmmReserveRegionOutward(kernel_start, kernel_end - kernel_start);
 
   PmmReserveRegionOutward(g_bitmap_phys_start,
@@ -357,6 +357,9 @@ uintptr_t PmmAllocFrames(const size_t count) {
 uintptr_t PmmAllocFrame() { return PmmAllocFrames(1); }
 
 bool PmmRangeIsValidUsableRam(const uintptr_t addr, const size_t size) {
+  // Reject empty ranges, ranges starting in reserved lower memory (< 1 MiB),
+  // or ranges extending beyond the highest managed physical address (checking
+  // via subtraction to avoid overflow).
   if (size == 0 || addr < kLowerMemoryLimit ||
       addr >= g_max_managed_phys_addr ||
       (g_max_managed_phys_addr - addr) < size) {
@@ -364,16 +367,21 @@ bool PmmRangeIsValidUsableRam(const uintptr_t addr, const size_t size) {
   }
 
   const uintptr_t end_addr = addr + size;
-  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(_kernel_start);
-  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(_kernel_end);
+  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(g_kernel_start);
+  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(g_kernel_end);
 
+  // Reject ranges overlapping the loaded kernel image.
   if (addr < kernel_end && end_addr > kernel_start) {
     return false;
   }
-  if (g_bitmap_phys_end > g_bitmap_phys_start && addr < g_bitmap_phys_end &&
+  // Reject ranges overlapping the PMM frame bitmap itself.
+  if (g_bitmap_phys_end > g_bitmap_phys_start &&  //
+      addr < g_bitmap_phys_end &&                 //
       end_addr > g_bitmap_phys_start) {
     return false;
   }
+  // Reject ranges overlapping the Multiboot info structure or the Multiboot1
+  // memory map buffer.
   if (g_memory_map.mb_reserved_end > g_memory_map.mb_reserved_start &&
       addr < g_memory_map.mb_reserved_end &&
       end_addr > g_memory_map.mb_reserved_start) {
@@ -386,6 +394,9 @@ bool PmmRangeIsValidUsableRam(const uintptr_t addr, const size_t size) {
     return false;
   }
 
+  // Scan the parsed Multiboot memory map to verify that `[addr, end_addr)` is
+  // completely contained within at least one available RAM region and does not
+  // overlap any non-available (reserved/ACPI/defective) region.
   bool inside_available = false;
   for (size_t i = 0; i < g_memory_map.region_count; ++i) {
     const uint64_t reg_start = g_memory_map.regions[i].base;
