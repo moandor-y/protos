@@ -59,19 +59,15 @@ struct [[gnu::packed]] Multiboot2MmapEntry {
   uint32_t reserved;
 };
 
-static constexpr uintptr_t AlignUp(
-    const uintptr_t value,     //
-    const uintptr_t alignment  //
-) {
+static constexpr uintptr_t AlignUp(const uintptr_t value,
+                                   const uintptr_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
-static void RecordMmapEntry(
-    MultibootMemoryMap* const out_map,  //
-    const uint64_t base,                //
-    const uint64_t length,              //
-    const uint32_t type                 //
-) {
+static void RecordMmapEntry(MultibootMemoryMap* const out_map,  //
+                            const uint64_t base,                //
+                            const uint64_t length,              //
+                            const uint32_t type) {
   if (out_map == nullptr || length == 0) {
     return;
   }
@@ -98,12 +94,10 @@ static void RecordMmapEntry(
 
 }  // namespace
 
-bool MultibootParseMemoryMap(
-    const uint32_t multiboot_magic,      //
-    const uint64_t multiboot_info_addr,  //
-    const uintptr_t max_physical_addr,   //
-    MultibootMemoryMap* const out_map    //
-) {
+bool MultibootParseMemoryMap(const uint32_t multiboot_magic,      //
+                             const uint64_t multiboot_info_addr,  //
+                             const uintptr_t max_physical_addr,   //
+                             MultibootMemoryMap* const out_map) {
   if (out_map == nullptr) {
     return false;
   }
@@ -123,8 +117,7 @@ bool MultibootParseMemoryMap(
   UartWriteHex(multiboot_info_addr);
   UartWrite("\n");
 
-  if (multiboot_info_addr == 0 ||
-      multiboot_info_addr >= max_physical_addr) {
+  if (multiboot_info_addr == 0 || multiboot_info_addr >= max_physical_addr) {
     return false;
   }
 
@@ -141,8 +134,8 @@ bool MultibootParseMemoryMap(
 
     uintptr_t offset = sizeof(Multiboot2InfoHeader);
     while (offset + sizeof(Multiboot2Tag) <= total_size) {
-      const Multiboot2Tag* const tag = reinterpret_cast<const Multiboot2Tag*>(
-          multiboot_info_addr + offset);
+      const Multiboot2Tag* const tag =
+          reinterpret_cast<const Multiboot2Tag*>(multiboot_info_addr + offset);
       if (tag->type == kMultiboot2TagEnd || tag->size < sizeof(Multiboot2Tag)) {
         break;
       }
@@ -156,20 +149,15 @@ bool MultibootParseMemoryMap(
             const Multiboot2MmapEntry* const entry =
                 reinterpret_cast<const Multiboot2MmapEntry*>(
                     reinterpret_cast<uintptr_t>(mmap_tag) + entry_offset);
-            RecordMmapEntry(
-                out_map,      //
-                entry->addr,  //
-                entry->len,   //
-                entry->type   //
-            );
+            RecordMmapEntry(out_map,      //
+                            entry->addr,  //
+                            entry->len,   //
+                            entry->type);
             entry_offset += mmap_tag->entry_size;
           }
         }
       }
-      offset = AlignUp(
-          offset + tag->size,  //
-          8                    //
-      );
+      offset = AlignUp(offset + tag->size, 8);
     }
   } else if (multiboot_magic == kMultiboot1Magic) {
     const Multiboot1Info* const info =
@@ -192,12 +180,10 @@ bool MultibootParseMemoryMap(
       if (entry->size < 20) {
         break;
       }
-      RecordMmapEntry(
-          out_map,      //
-          entry->addr,  //
-          entry->len,   //
-          entry->type   //
-      );
+      RecordMmapEntry(out_map,      //
+                      entry->addr,  //
+                      entry->len,   //
+                      entry->type);
       entry_offset += entry->size + sizeof(uint32_t);
     }
   } else {

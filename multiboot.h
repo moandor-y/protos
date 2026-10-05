@@ -35,12 +35,10 @@ struct MultibootMemoryMap {
 // Parses the Multiboot1 (`0x2BADB002`) or Multiboot2 (`0x36D76289`) memory map
 // at `multiboot_info_addr` (must lie below `max_physical_addr`) and populates
 // `*out_map`. Returns true if a valid memory map with usable RAM was found.
-bool MultibootParseMemoryMap(
-    uint32_t multiboot_magic,      //
-    uint64_t multiboot_info_addr,  //
-    uintptr_t max_physical_addr,   //
-    MultibootMemoryMap* out_map    //
-);
+bool MultibootParseMemoryMap(uint32_t multiboot_magic,      //
+                             uint64_t multiboot_info_addr,  //
+                             uintptr_t max_physical_addr,   //
+                             MultibootMemoryMap* out_map);
 
 }  // namespace protos
 

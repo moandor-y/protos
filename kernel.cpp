@@ -6,10 +6,8 @@
 
 namespace protos {
 
-extern "C" [[noreturn]] void kernel_main(
-    const uint32_t multiboot_magic,     //
-    const uint64_t multiboot_info_addr  //
-) {
+extern "C" [[noreturn]] void kernel_main(const uint32_t multiboot_magic,
+                                         const uint64_t multiboot_info_addr) {
   constexpr const char* kGreeting = "Hello, x86-64 Kernel World!\n";
 
   VgaClear();
@@ -18,10 +16,7 @@ extern "C" [[noreturn]] void kernel_main(
   UartInit();
   UartWrite(kGreeting);
 
-  RunBootVerificationSuite(
-      multiboot_magic,     //
-      multiboot_info_addr  //
-  );
+  RunBootVerificationSuite(multiboot_magic, multiboot_info_addr);
 
   for (;;) {
     asm volatile("cli; hlt");

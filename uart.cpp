@@ -9,10 +9,7 @@ namespace {
 
 constexpr uint16_t kCom1Port = 0x3F8;
 
-static inline void Outb(
-    const uint16_t port,  //
-    const uint8_t value   //
-) {
+static inline void Outb(const uint16_t port, const uint8_t value) {
   asm volatile("out %1, %0" : : "a"(value), "Nd"(port) : "memory");
 }
 
@@ -25,43 +22,19 @@ static inline uint8_t Inb(const uint16_t port) {
 }  // namespace
 
 void UartInit() {
-  Outb(
-      kCom1Port + 1,  //
-      0x00            //
-  );
-  Outb(
-      kCom1Port + 3,  //
-      0x80            //
-  );
-  Outb(
-      kCom1Port + 0,  //
-      0x03            //
-  );
-  Outb(
-      kCom1Port + 1,  //
-      0x00            //
-  );
-  Outb(
-      kCom1Port + 3,  //
-      0x03            //
-  );
-  Outb(
-      kCom1Port + 2,  //
-      0xC7            //
-  );
-  Outb(
-      kCom1Port + 4,  //
-      0x0B            //
-  );
+  Outb(kCom1Port + 1, 0x00);
+  Outb(kCom1Port + 3, 0x80);
+  Outb(kCom1Port + 0, 0x03);
+  Outb(kCom1Port + 1, 0x00);
+  Outb(kCom1Port + 3, 0x03);
+  Outb(kCom1Port + 2, 0xC7);
+  Outb(kCom1Port + 4, 0x0B);
 }
 
 void UartPutc(const char c) {
   while ((Inb(kCom1Port + 5) & 0x20) == 0) {
   }
-  Outb(
-      kCom1Port,               //
-      static_cast<uint8_t>(c)  //
-  );
+  Outb(kCom1Port, static_cast<uint8_t>(c));
 }
 
 void UartWrite(const char* const str) {

@@ -19,16 +19,13 @@ size_t g_widget_dtor_count = 0;
 class TestWidget {
  public:
   TestWidget()
-      : id_(g_widget_ctor_count + 1),                             //
-        checksum_((g_widget_ctor_count + 1) ^ 0x5A5A5A5A5A5A5A5A)  //
-  {
+      : id_(g_widget_ctor_count + 1),
+        checksum_((g_widget_ctor_count + 1) ^ 0x5A5A5A5A5A5A5A5A) {
     ++g_widget_ctor_count;
   }
 
   explicit TestWidget(const uint64_t seed)
-      : id_(seed),                            //
-        checksum_(seed ^ 0x5A5A5A5A5A5A5A5A)  //
-  {
+      : id_(seed), checksum_(seed ^ 0x5A5A5A5A5A5A5A5A) {
     ++g_widget_ctor_count;
   }
 
@@ -40,23 +37,16 @@ class TestWidget {
     checksum_ = 0;
   }
 
-  bool IsValid() const {
-    return (id_ ^ 0x5A5A5A5A5A5A5A5A) == checksum_;
-  }
+  bool IsValid() const { return (id_ ^ 0x5A5A5A5A5A5A5A5A) == checksum_; }
 
-  uint64_t id() const {
-    return id_;
-  }
+  uint64_t id() const { return id_; }
 
  private:
   uint64_t id_;
   uint64_t checksum_;
 };
 
-static void LogTestResult(
-    const char* const test_name,  //
-    const bool passed             //
-) {
+static void LogTestResult(const char* const test_name, const bool passed) {
   UartWrite("[TEST] ");
   UartWrite(test_name);
   if (passed) {
@@ -66,11 +56,9 @@ static void LogTestResult(
   }
 }
 
-static bool TestPmmAllocAndBounds(
-    uintptr_t* const out_first_frame,   //
-    uintptr_t* const out_second_frame,  //
-    uintptr_t* const out_multi_frames   //
-) {
+static bool TestPmmAllocAndBounds(uintptr_t* const out_first_frame,   //
+                                  uintptr_t* const out_second_frame,  //
+                                  uintptr_t* const out_multi_frames) {
   const uintptr_t max_phys = PmmMaxPhysicalAddress();
   if (max_phys <= kBootstrapIdentityMapSize ||
       PagingIdentityMappedLimit() < max_phys ||
@@ -92,26 +80,15 @@ static bool TestPmmAllocAndBounds(
   if (frame1 == frame2 || frame1 == multi || frame2 == multi) {
     return false;
   }
-  if ((frame1 & (kPageSize - 1)) != 0 ||
-      (frame2 & (kPageSize - 1)) != 0 ||
+  if ((frame1 & (kPageSize - 1)) != 0 || (frame2 & (kPageSize - 1)) != 0 ||
       (multi & (kPageSize - 1)) != 0) {
     return false;
   }
-  if (!PagingIsIdentityMapped(frame1) ||
-      !PagingIsIdentityMapped(frame2) ||
+  if (!PagingIsIdentityMapped(frame1) || !PagingIsIdentityMapped(frame2) ||
       !PagingIsIdentityMapped(multi) ||
-      !PmmRangeIsValidUsableRam(
-          frame1,    //
-          kPageSize  //
-      ) ||
-      !PmmRangeIsValidUsableRam(
-          frame2,    //
-          kPageSize  //
-      ) ||
-      !PmmRangeIsValidUsableRam(
-          multi,         //
-          4 * kPageSize  //
-      )) {
+      !PmmRangeIsValidUsableRam(frame1, kPageSize) ||
+      !PmmRangeIsValidUsableRam(frame2, kPageSize) ||
+      !PmmRangeIsValidUsableRam(multi, 4 * kPageSize)) {
     return false;
   }
 
@@ -126,17 +103,13 @@ static bool TestPmmAllocAndBounds(
   *pm = 0x0123456789ABCDEF;
   *p_top = 0xFEDCBA9876543210;
 
-  return *p1 == 0xCAFEBABE11112222 &&
-         *p2 == 0xDEADBEEF33334444 &&
-         *pm == 0x0123456789ABCDEF &&
-         *p_top == 0xFEDCBA9876543210;
+  return *p1 == 0xCAFEBABE11112222 && *p2 == 0xDEADBEEF33334444 &&
+         *pm == 0x0123456789ABCDEF && *p_top == 0xFEDCBA9876543210;
 }
 
-static bool TestPmmFreeAndReuse(
-    const uintptr_t frame1,       //
-    const uintptr_t frame2,       //
-    const uintptr_t multi_frames  //
-) {
+static bool TestPmmFreeAndReuse(const uintptr_t frame1,  //
+                                const uintptr_t frame2,  //
+                                const uintptr_t multi_frames) {
   const size_t free_with_allocs = PmmFreeFrameCount();
   const size_t total_usable = PmmTotalUsableFrameCount();
   if (total_usable == 0 || free_with_allocs + 6 != total_usable) {
@@ -145,10 +118,7 @@ static bool TestPmmFreeAndReuse(
 
   PmmFreeFrame(frame1);
   PmmFreeFrame(frame2);
-  PmmFreeFrames(
-      multi_frames,  //
-      4              //
-  );
+  PmmFreeFrames(multi_frames, 4);
 
   if (PmmFreeFrameCount() != free_with_allocs + 6) {
     return false;
@@ -196,18 +166,11 @@ static bool TestHeapVariedSizesAndAlignment() {
 
     const uintptr_t k_addr = reinterpret_cast<uintptr_t>(kmalloc_ptrs[i]);
     const uintptr_t n_addr = reinterpret_cast<uintptr_t>(new_ptrs[i]);
-    if (kmalloc_ptrs[i] == nullptr ||
-        new_ptrs[i] == nullptr ||
+    if (kmalloc_ptrs[i] == nullptr || new_ptrs[i] == nullptr ||
         (k_addr & (kHeapAlignment - 1)) != 0 ||
         (n_addr & (kHeapAlignment - 1)) != 0 ||
-        !PmmRangeIsValidUsableRam(
-            k_addr,   //
-            req_size  //
-        ) ||
-        !PmmRangeIsValidUsableRam(
-            n_addr,   //
-            req_size  //
-        )) {
+        !PmmRangeIsValidUsableRam(k_addr, req_size) ||
+        !PmmRangeIsValidUsableRam(n_addr, req_size)) {
       return false;
     }
   }
@@ -275,11 +238,8 @@ static bool TestCppNewDeleteLifecycle() {
   const size_t free_before = HeapTotalFreeBytes();
 
   TestWidget* const single = new TestWidget(0x13572468);
-  if (single == nullptr ||
-      !single->IsValid() ||
-      single->id() != 0x13572468 ||
-      g_widget_ctor_count != 1 ||
-      g_widget_dtor_count != 0) {
+  if (single == nullptr || !single->IsValid() || single->id() != 0x13572468 ||
+      g_widget_ctor_count != 1 || g_widget_dtor_count != 0) {
     return false;
   }
   delete single;
@@ -436,18 +396,10 @@ static bool TestEdgeCasesAndOom() {
 
 }  // namespace
 
-void RunBootVerificationSuite(
-    const uint32_t multiboot_magic,     //
-    const uint64_t multiboot_info_addr  //
-) {
-  const bool pmm_ok = PmmInit(
-      multiboot_magic,     //
-      multiboot_info_addr  //
-  );
-  LogTestResult(
-      "pmm_memory_map_init",  //
-      pmm_ok                  //
-  );
+void RunBootVerificationSuite(const uint32_t multiboot_magic,
+                              const uint64_t multiboot_info_addr) {
+  const bool pmm_ok = PmmInit(multiboot_magic, multiboot_info_addr);
+  LogTestResult("pmm_memory_map_init", pmm_ok);
   if (!pmm_ok) {
     UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");
     return;
@@ -456,66 +408,34 @@ void RunBootVerificationSuite(
   uintptr_t frame1 = 0;
   uintptr_t frame2 = 0;
   uintptr_t multi_frames = 0;
-  const bool alloc_bounds_ok = TestPmmAllocAndBounds(
-      &frame1,       //
-      &frame2,       //
-      &multi_frames  //
-  );
-  LogTestResult(
-      "pmm_alloc_and_bounds",  //
-      alloc_bounds_ok          //
-  );
+  const bool alloc_bounds_ok = TestPmmAllocAndBounds(&frame1,  //
+                                                     &frame2,  //
+                                                     &multi_frames);
+  LogTestResult("pmm_alloc_and_bounds", alloc_bounds_ok);
 
-  const bool free_reuse_ok = TestPmmFreeAndReuse(
-      frame1,       //
-      frame2,       //
-      multi_frames  //
-  );
-  LogTestResult(
-      "pmm_free_and_reuse",  //
-      free_reuse_ok          //
-  );
+  const bool free_reuse_ok = TestPmmFreeAndReuse(frame1,  //
+                                                 frame2,  //
+                                                 multi_frames);
+  LogTestResult("pmm_free_and_reuse", free_reuse_ok);
 
   const bool heap_init_ok = HeapInit();
-  const bool varied_ok =
-      heap_init_ok && TestHeapVariedSizesAndAlignment();
-  LogTestResult(
-      "heap_varied_sizes_and_alignment",  //
-      varied_ok                           //
-  );
+  const bool varied_ok = heap_init_ok && TestHeapVariedSizesAndAlignment();
+  LogTestResult("heap_varied_sizes_and_alignment", varied_ok);
 
   const bool pattern_ok = TestHeapPatternIsolation();
-  LogTestResult(
-      "heap_pattern_isolation",  //
-      pattern_ok                 //
-  );
+  LogTestResult("heap_pattern_isolation", pattern_ok);
 
   const bool cpp_ok = TestCppNewDeleteLifecycle();
-  LogTestResult(
-      "cpp_new_delete_lifecycle",  //
-      cpp_ok                       //
-  );
+  LogTestResult("cpp_new_delete_lifecycle", cpp_ok);
 
   const bool stress_ok = TestHeapStressReuse();
-  LogTestResult(
-      "heap_stress_reuse",  //
-      stress_ok             //
-  );
+  LogTestResult("heap_stress_reuse", stress_ok);
 
   const bool edge_ok = TestEdgeCasesAndOom();
-  LogTestResult(
-      "edge_cases_and_oom",  //
-      edge_ok                //
-  );
+  LogTestResult("edge_cases_and_oom", edge_ok);
 
-  if (pmm_ok &&
-      alloc_bounds_ok &&
-      free_reuse_ok &&
-      varied_ok &&
-      pattern_ok &&
-      cpp_ok &&
-      stress_ok &&
-      edge_ok) {
+  if (pmm_ok && alloc_bounds_ok && free_reuse_ok && varied_ok && pattern_ok &&
+      cpp_ok && stress_ok && edge_ok) {
     UartWrite("[TEST] ALL MEMORY TESTS PASSED\n");
   } else {
     UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");

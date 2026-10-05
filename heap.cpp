@@ -48,25 +48,21 @@ HeapBlockHeader* g_heap_head = nullptr;
 
 // Rounds `value` up to the nearest multiple of `alignment` (must be a power
 // of two).
-static constexpr uintptr_t AlignUp(
-    const uintptr_t value,     //
-    const uintptr_t alignment  //
-) {
+static constexpr uintptr_t AlignUp(const uintptr_t value,
+                                   const uintptr_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
 // Returns true if `second` starts at the exact byte immediately following the
 // end of `first`'s payload in physical memory (i.e. both blocks belong to the
 // same contiguous arena with no gap between them).
-static bool HeapBlocksAreAdjacent(
-    const HeapBlockHeader* const first,  //
-    const HeapBlockHeader* const second  //
-) {
+static bool HeapBlocksAreAdjacent(const HeapBlockHeader* const first,
+                                  const HeapBlockHeader* const second) {
   if (first == nullptr || second == nullptr) {
     return false;
   }
-  const uintptr_t first_end =
-      reinterpret_cast<uintptr_t>(first) + sizeof(HeapBlockHeader) + first->size;
+  const uintptr_t first_end = reinterpret_cast<uintptr_t>(first) +
+                              sizeof(HeapBlockHeader) + first->size;
   const uintptr_t second_start = reinterpret_cast<uintptr_t>(second);
   return first_end == second_start;
 }
@@ -81,12 +77,8 @@ static HeapBlockHeader* HeapCoalesceBlock(
     return nullptr;
   }
   HeapBlockHeader* block = initial_block;
-  if (block->prev != nullptr &&
-      block->prev->is_free == 1 &&
-      HeapBlocksAreAdjacent(
-          block->prev,  //
-          block         //
-      )) {
+  if (block->prev != nullptr && block->prev->is_free == 1 &&
+      HeapBlocksAreAdjacent(block->prev, block)) {
     HeapBlockHeader* const prev_block = block->prev;
     prev_block->size += sizeof(HeapBlockHeader) + block->size;
     prev_block->next = block->next;
@@ -97,12 +89,8 @@ static HeapBlockHeader* HeapCoalesceBlock(
     block = prev_block;
   }
 
-  while (block->next != nullptr &&
-         block->next->is_free == 1 &&
-         HeapBlocksAreAdjacent(
-             block,       //
-             block->next  //
-         )) {
+  while (block->next != nullptr && block->next->is_free == 1 &&
+         HeapBlocksAreAdjacent(block, block->next)) {
     HeapBlockHeader* const next_block = block->next;
     block->size += sizeof(HeapBlockHeader) + next_block->size;
     block->next = next_block->next;
@@ -126,14 +114,13 @@ static HeapBlockHeader* HeapCoalesceBlock(
 //   After split (at `block + sizeof(HeapBlockHeader) + aligned_size`):
 //   [ Header | aligned_size bytes ][ New Header | remainder bytes    ]
 //   ^                              ^
-//   block (shrunk to aligned_size) new_block (marked free, linked as block->next)
+//   block (shrunk to aligned_size) new_block (marked free, linked as
+//   block->next)
 //
 // If the remainder is smaller than `sizeof(HeapBlockHeader) + kHeapAlignment`,
 // `block` is left unsplit to avoid creating unusable fragments.
-static void HeapSplitBlock(
-    HeapBlockHeader* const block,  //
-    const size_t aligned_size      //
-) {
+static void HeapSplitBlock(HeapBlockHeader* const block,
+                           const size_t aligned_size) {
   if (block == nullptr) {
     return;
   }
@@ -143,8 +130,8 @@ static void HeapSplitBlock(
     return;
   }
 
-  const uintptr_t new_block_addr =
-      reinterpret_cast<uintptr_t>(block) + sizeof(HeapBlockHeader) + aligned_size;
+  const uintptr_t new_block_addr = reinterpret_cast<uintptr_t>(block) +
+                                   sizeof(HeapBlockHeader) + aligned_size;
   HeapBlockHeader* const new_block =
       reinterpret_cast<HeapBlockHeader*>(new_block_addr);
   new_block->magic = kHeapBlockMagic;
@@ -160,13 +147,12 @@ static void HeapSplitBlock(
   block->size = aligned_size;
 }
 
-// Initializes a newly allocated PMM frame range `[arena_addr, arena_addr + arena_bytes)`
-// as a free heap block, inserts it into `g_heap_head` in ascending physical
-// address order, and coalesces it with adjacent free blocks if contiguous.
-static HeapBlockHeader* HeapInsertArena(
-    const uintptr_t arena_addr,  //
-    const size_t arena_bytes     //
-) {
+// Initializes a newly allocated PMM frame range `[arena_addr, arena_addr +
+// arena_bytes)` as a free heap block, inserts it into `g_heap_head` in
+// ascending physical address order, and coalesces it with adjacent free blocks
+// if contiguous.
+static HeapBlockHeader* HeapInsertArena(const uintptr_t arena_addr,
+                                        const size_t arena_bytes) {
   HeapBlockHeader* const new_block =
       reinterpret_cast<HeapBlockHeader*>(arena_addr);
   new_block->magic = kHeapBlockMagic;
@@ -228,18 +214,12 @@ static HeapBlockHeader* HeapExpand(const size_t aligned_size) {
     return nullptr;
   }
 
-  return HeapInsertArena(
-      arena_addr,               //
-      alloc_frames * kPageSize  //
-  );
+  return HeapInsertArena(arena_addr, alloc_frames * kPageSize);
 }
 
 // Helper for C++ aligned `operator new` overloads; supports alignments up to
 // `kHeapAlignment` (16 bytes).
-static void* KmallocAligned(
-    const size_t size,      //
-    const size_t alignment  //
-) {
+static void* KmallocAligned(const size_t size, const size_t alignment) {
   if (alignment > kHeapAlignment) {
     return nullptr;
   }
@@ -255,10 +235,7 @@ bool HeapInit() {
   }
   const size_t arena_bytes = kInitialHeapFrames * kPageSize;
   g_heap_head = nullptr;
-  HeapInsertArena(
-      arena_addr,  //
-      arena_bytes  //
-  );
+  HeapInsertArena(arena_addr, arena_bytes);
   return g_heap_head != nullptr;
 }
 
@@ -293,18 +270,12 @@ void* Kmalloc(const size_t size) {
   }
 
   const size_t raw_size = (size == 0) ? kHeapAlignment : size;
-  const size_t aligned_size = AlignUp(
-      raw_size,       //
-      kHeapAlignment  //
-  );
+  const size_t aligned_size = AlignUp(raw_size, kHeapAlignment);
 
   HeapBlockHeader* curr = g_heap_head;
   while (curr != nullptr) {
     if (curr->is_free == 1 && curr->size >= aligned_size) {
-      HeapSplitBlock(
-          curr,         //
-          aligned_size  //
-      );
+      HeapSplitBlock(curr, aligned_size);
       curr->is_free = 0;
       return reinterpret_cast<void*>(curr + 1);
     }
@@ -315,10 +286,7 @@ void* Kmalloc(const size_t size) {
   if (expanded == nullptr || expanded->size < aligned_size) {
     return nullptr;
   }
-  HeapSplitBlock(
-      expanded,     //
-      aligned_size  //
-  );
+  HeapSplitBlock(expanded, aligned_size);
   expanded->is_free = 0;
   return reinterpret_cast<void*>(expanded + 1);
 }
@@ -348,89 +316,55 @@ void Kfree(void* const ptr) {
 
 }  // namespace protos
 
-void* operator new(const size_t size) {
-  return protos::Kmalloc(size);
+void* operator new(const size_t size) { return protos::Kmalloc(size); }
+
+void* operator new[](const size_t size) { return protos::Kmalloc(size); }
+
+void* operator new(const size_t size, const std::align_val_t alignment) {
+  return protos::KmallocAligned(size, static_cast<size_t>(alignment));
 }
 
-void* operator new[](const size_t size) {
-  return protos::Kmalloc(size);
+void* operator new[](const size_t size, const std::align_val_t alignment) {
+  return protos::KmallocAligned(size, static_cast<size_t>(alignment));
 }
 
-void* operator new(
-    const size_t size,                //
-    const std::align_val_t alignment  //
-) {
-  return protos::KmallocAligned(
-      size,                           //
-      static_cast<size_t>(alignment)  //
-  );
-}
+void operator delete(void* const ptr) noexcept { protos::Kfree(ptr); }
 
-void* operator new[](
-    const size_t size,                //
-    const std::align_val_t alignment  //
-) {
-  return protos::KmallocAligned(
-      size,                           //
-      static_cast<size_t>(alignment)  //
-  );
-}
+void operator delete[](void* const ptr) noexcept { protos::Kfree(ptr); }
 
-void operator delete(void* const ptr) noexcept {
-  protos::Kfree(ptr);
-}
-
-void operator delete[](void* const ptr) noexcept {
-  protos::Kfree(ptr);
-}
-
-void operator delete(
-    void* const ptr,   //
-    const size_t size  //
-) noexcept {
+void operator delete(void* const ptr, const size_t size) noexcept {
   (void)size;
   protos::Kfree(ptr);
 }
 
-void operator delete[](
-    void* const ptr,   //
-    const size_t size  //
-) noexcept {
+void operator delete[](void* const ptr, const size_t size) noexcept {
   (void)size;
   protos::Kfree(ptr);
 }
 
-void operator delete(
-    void* const ptr,                  //
-    const std::align_val_t alignment  //
-) noexcept {
+void operator delete(void* const ptr,
+                     const std::align_val_t alignment) noexcept {
   (void)alignment;
   protos::Kfree(ptr);
 }
 
-void operator delete[](
-    void* const ptr,                  //
-    const std::align_val_t alignment  //
-) noexcept {
+void operator delete[](void* const ptr,
+                       const std::align_val_t alignment) noexcept {
   (void)alignment;
   protos::Kfree(ptr);
 }
 
-void operator delete(
-    void* const ptr,                  //
-    const size_t size,                //
-    const std::align_val_t alignment  //
-) noexcept {
+void operator delete(void* const ptr,    //
+                     const size_t size,  //
+                     const std::align_val_t alignment) noexcept {
   (void)size;
   (void)alignment;
   protos::Kfree(ptr);
 }
 
-void operator delete[](
-    void* const ptr,                  //
-    const size_t size,                //
-    const std::align_val_t alignment  //
-) noexcept {
+void operator delete[](void* const ptr,    //
+                       const size_t size,  //
+                       const std::align_val_t alignment) noexcept {
   (void)size;
   (void)alignment;
   protos::Kfree(ptr);

@@ -17,9 +17,8 @@ constexpr uint8_t kVgaColorWhiteOnBlack = 0x0F;
 void VgaClear() {
   volatile uint16_t* const vga =
       reinterpret_cast<volatile uint16_t*>(kVgaBufferAddress);
-  const uint16_t blank =
-      (static_cast<uint16_t>(kVgaColorWhiteOnBlack) << 8) |
-      static_cast<uint8_t>(' ');
+  const uint16_t blank = (static_cast<uint16_t>(kVgaColorWhiteOnBlack) << 8) |
+                         static_cast<uint8_t>(' ');
   for (size_t i = 0; i < kVgaWidth * kVgaHeight; ++i) {
     vga[i] = blank;
   }
@@ -35,9 +34,8 @@ void VgaWrite(const char* const str) {
       continue;
     }
     if (index < kVgaWidth * kVgaHeight) {
-      vga[index] =
-          (static_cast<uint16_t>(kVgaColorWhiteOnBlack) << 8) |
-          static_cast<uint8_t>(str[i]);
+      vga[index] = (static_cast<uint16_t>(kVgaColorWhiteOnBlack) << 8) |
+                   static_cast<uint8_t>(str[i]);
       ++index;
     }
   }

@@ -21,10 +21,8 @@ constexpr uintptr_t kMaxCanonicalIdentityAddress = 0x0000800000000000;
 uintptr_t g_identity_mapped_limit = kBootstrapIdentityMapSize;
 
 // Rounds `value` up to the nearest multiple of `alignment` (power of two).
-static constexpr uintptr_t AlignUp(
-    const uintptr_t value,     //
-    const uintptr_t alignment  //
-) {
+static constexpr uintptr_t AlignUp(const uintptr_t value,
+                                   const uintptr_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
@@ -63,10 +61,7 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
     return false;
   }
 
-  const uintptr_t target_end = AlignUp(
-      max_physical_addr,  //
-      kHugePageSize       //
-  );
+  const uintptr_t target_end = AlignUp(max_physical_addr, kHugePageSize);
   const uintptr_t pml4_phys = ReadCr3();
   if (pml4_phys == 0) {
     return false;
@@ -101,9 +96,7 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
     uint64_t* const pd =
         reinterpret_cast<uint64_t*>(pdpt[pdpt_idx] & kPteAddressMask);
     if ((pd[pd_idx] & kPtePresent) == 0) {
-      pd[pd_idx] = static_cast<uint64_t>(addr) |
-                   kPtePresent |
-                   kPteWritable |
+      pd[pd_idx] = static_cast<uint64_t>(addr) | kPtePresent | kPteWritable |
                    kPteHugePage;
     }
   }
@@ -155,8 +148,6 @@ bool PagingIsIdentityMapped(const uintptr_t addr) {
   return mapped_base == expected_base;
 }
 
-uintptr_t PagingIdentityMappedLimit() {
-  return g_identity_mapped_limit;
-}
+uintptr_t PagingIdentityMappedLimit() { return g_identity_mapped_limit; }
 
 }  // namespace protos
