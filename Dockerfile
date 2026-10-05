@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     grub-efi-amd64-bin \
     grub-pc-bin \
     grub2-common \
+    libgmock-dev \
+    libgtest-dev \
     make \
     mtools \
     python3 \

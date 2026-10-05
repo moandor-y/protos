@@ -81,10 +81,6 @@ REQUIRED_MARKERS=(
   "[TEST] cpp_new_delete_lifecycle: PASS"
   "[TEST] heap_stress_reuse: PASS"
   "[TEST] edge_cases_and_oom: PASS"
-  "[TEST] rbtree_unaugmented_insert_and_rotations: PASS"
-  "[TEST] rbtree_queries_and_iteration: PASS"
-  "[TEST] rbtree_augmented_bulk_insert_erase: PASS"
-  "[TEST] rbtree_propagate_augment_and_search: PASS"
   "[TEST] ALL MEMORY TESTS PASSED"
 )
 

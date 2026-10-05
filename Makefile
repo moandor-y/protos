@@ -9,6 +9,9 @@ CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra -Werror \
             -fno-stack-protector -fno-pie
 LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 --no-warn-rwx-segments -T linker.ld
 
+TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror
+TEST_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
+
 BUILD_DIR := build
 
 CXX_SRCS := \
@@ -48,7 +51,7 @@ DOCKER_RUN := $(DOCKER) run --rm --platform=$(DOCKER_PLATFORM) \
               -w /workspace \
               $(DOCKER_IMAGE)
 
-.PHONY: all clean test
+.PHONY: all clean test test-rbtree
 
 all: $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/kernel.iso
 
@@ -57,6 +60,8 @@ $(BUILD_DIR):
 
 $(DOCKER_STAMP): Dockerfile | $(BUILD_DIR)
 	$(DOCKER) build --platform=$(DOCKER_PLATFORM) -t $(DOCKER_IMAGE) .
+	mkdir -p $(BUILD_DIR)/include
+	$(DOCKER_RUN) cp -r /usr/include/gmock /usr/include/gtest $(BUILD_DIR)/include/
 	touch $(DOCKER_STAMP)
 
 $(BUILD_DIR)/boot.o: boot.S $(DOCKER_STAMP) | $(BUILD_DIR)
@@ -76,7 +81,13 @@ $(BUILD_DIR)/kernel.iso: $(BUILD_DIR)/kernel.bin $(DOCKER_STAMP) | $(BUILD_DIR)
 	$(DOCKER_RUN) grub-mkrescue -o $@ $(BUILD_DIR)/isodir
 	rm -rf $(BUILD_DIR)/isodir
 
-test: $(BUILD_DIR)/kernel.iso $(DOCKER_STAMP)
+$(BUILD_DIR)/rbtree_test: rbtree_test.cpp rbtree.h $(DOCKER_STAMP) | $(BUILD_DIR)
+	$(DOCKER_RUN) $(CXX) $(TEST_CXXFLAGS) $< $(TEST_LDFLAGS) -o $@
+
+test-rbtree: $(BUILD_DIR)/rbtree_test
+	$(DOCKER_RUN) ./$(BUILD_DIR)/rbtree_test
+
+test: test-rbtree $(BUILD_DIR)/kernel.iso $(DOCKER_STAMP)
 	$(DOCKER_RUN) ./test_boot.sh $(BUILD_DIR)/kernel.iso
 
 clean:
