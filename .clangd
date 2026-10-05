@@ -7,7 +7,7 @@ CompileFlags:
 
 ---
 If:
-  PathExclude: rbtree_test\.cpp
+  PathExclude: .*_test\.cpp
 CompileFlags:
   Add:
     - -masm=intel
@@ -21,7 +21,7 @@ CompileFlags:
 
 ---
 If:
-  PathMatch: rbtree_test\.cpp
+  PathMatch: .*_test\.cpp
 CompileFlags:
   Add:
     - -isystem
