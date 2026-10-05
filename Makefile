@@ -33,6 +33,7 @@ TEST_SAN_ENV_tsan := TSAN_OPTIONS=halt_on_error=1
 
 HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp))
 HOST_TESTS := $(patsubst %.cpp,%,$(HOST_TEST_SRCS))
+TEST_EXTRA_SRCS_heap_test := heap.cpp
 
 BUILD_DIR := build
 
@@ -47,6 +48,7 @@ CXX_SRCS := \
     kernel.cpp
 
 CXX_HDRS := \
+    check.h \
     uart.h \
     vga.h \
     multiboot.h \
@@ -80,7 +82,7 @@ DOCKER_RUN :=
 DOCKER_DEPS :=
 endif
 
-.PHONY: all clean test test-host test-rbtree
+.PHONY: all clean test test-host test-rbtree test-heap
 
 all: $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/kernel.iso
 
@@ -141,6 +143,7 @@ endef
 $(foreach t,$(HOST_TESTS),$(eval $(call DEFINE_HOST_TEST_SUITE,$(t))))
 
 test-rbtree: test-rbtree_test
+test-heap: test-heap_test
 
 ifeq ($(IN_DOCKER),)
 test-host: $(DOCKER_STAMP)

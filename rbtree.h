@@ -238,6 +238,17 @@ class RbTree {
     }
   }
 
+  // Recomputes and propagates subtree augmentation data from `item` up to the
+  // root.
+  //
+  // NOTE: `Insert` and `Erase` automatically maintain and propagate subtree
+  // augmentation across all affected ancestors and rotations, so callers do NOT
+  // need to call `PropagateAugment` after `Insert` or `Erase`.
+  //
+  // Call `PropagateAugment` manually ONLY after mutating an already-inserted
+  // node's augmented/payload fields in place (without changing its ordering
+  // key) while the node remains in the tree. If a node's ordering key changes,
+  // it must instead be removed via `Erase` and re-inserted via `Insert`.
   void PropagateAugment(T& item) { PropagateAugment(&item); }
 
   void PropagateAugment(T* const item) {

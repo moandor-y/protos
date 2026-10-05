@@ -5,6 +5,7 @@
 
 #include "paging.h"
 #include "uart.h"
+#include "vga.h"
 
 namespace protos {
 
@@ -80,6 +81,21 @@ static constexpr uintptr_t AlignUp(const uintptr_t value,
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
+static void ConsoleWrite(const char* const str) {
+  UartWrite(str);
+  VgaWrite(str);
+}
+
+static void ConsoleWriteHex(const uint64_t value) {
+  UartWriteHex(value);
+  VgaWriteHex(value);
+}
+
+static void ConsoleWriteDec(const uint64_t value) {
+  UartWriteDec(value);
+  VgaWriteDec(value);
+}
+
 static void RecordMmapEntry(MultibootMemoryMap* const out_map,  //
                             const uint64_t base,                //
                             const uint64_t length,              //
@@ -99,13 +115,13 @@ static void RecordMmapEntry(MultibootMemoryMap* const out_map,  //
   } else {
     out_map->reserved_ram_bytes += length;
   }
-  UartWrite("[PMM] mmap entry: base=");
-  UartWriteHex(base);
-  UartWrite(" len=");
-  UartWriteHex(length);
-  UartWrite(" type=");
-  UartWriteDec(type);
-  UartWrite("\n");
+  ConsoleWrite("[PMM] mmap entry: base=");
+  ConsoleWriteHex(base);
+  ConsoleWrite(" len=");
+  ConsoleWriteHex(length);
+  ConsoleWrite(" type=");
+  ConsoleWriteDec(type);
+  ConsoleWrite("\n");
 }
 
 }  // namespace
@@ -133,11 +149,11 @@ bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
   out_map->fb_bpp = 0;
   out_map->fb_type = 0;
 
-  UartWrite("[PMM] Multiboot magic=");
-  UartWriteHex(multiboot_magic);
-  UartWrite(" info_addr=");
-  UartWriteHex(multiboot_info_addr);
-  UartWrite("\n");
+  ConsoleWrite("[PMM] Multiboot magic=");
+  ConsoleWriteHex(multiboot_magic);
+  ConsoleWrite(" info_addr=");
+  ConsoleWriteHex(multiboot_info_addr);
+  ConsoleWrite("\n");
 
   if (multiboot_info_addr == 0 || multiboot_info_addr >= max_physical_addr) {
     return false;

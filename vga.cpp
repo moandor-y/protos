@@ -199,35 +199,78 @@ void VgaClear() {
   }
 }
 
+void VgaPutc(const char ch) {
+  if (ch == '\r') {
+    g_cursor_col = 0;
+    return;
+  }
+  if (ch == '\n') {
+    g_cursor_col = 0;
+    ++g_cursor_row;
+    if (g_cursor_row >= kVgaHeight) {
+      ScrollUpOneRow();
+      g_cursor_row = kVgaHeight - 1;
+    }
+    return;
+  }
+  WriteCell(g_cursor_row, g_cursor_col, ch);
+  ++g_cursor_col;
+  if (g_cursor_col >= kVgaWidth) {
+    g_cursor_col = 0;
+    ++g_cursor_row;
+    if (g_cursor_row >= kVgaHeight) {
+      ScrollUpOneRow();
+      g_cursor_row = kVgaHeight - 1;
+    }
+  }
+}
+
 void VgaWrite(const char* const str) {
   if (str == nullptr) {
     return;
   }
   for (size_t i = 0; str[i] != '\0'; ++i) {
-    const char ch = str[i];
-    if (ch == '\r') {
-      g_cursor_col = 0;
-      continue;
-    }
-    if (ch == '\n') {
-      g_cursor_col = 0;
-      ++g_cursor_row;
-      if (g_cursor_row >= kVgaHeight) {
-        ScrollUpOneRow();
-        g_cursor_row = kVgaHeight - 1;
-      }
-      continue;
-    }
-    WriteCell(g_cursor_row, g_cursor_col, ch);
-    ++g_cursor_col;
-    if (g_cursor_col >= kVgaWidth) {
-      g_cursor_col = 0;
-      ++g_cursor_row;
-      if (g_cursor_row >= kVgaHeight) {
-        ScrollUpOneRow();
-        g_cursor_row = kVgaHeight - 1;
-      }
-    }
+    VgaPutc(str[i]);
+  }
+}
+
+void VgaWriteHex(const uint64_t value) {
+  constexpr const char* kHexDigits = "0123456789ABCDEF";
+  VgaWrite("0x");
+  if (value == 0) {
+    VgaPutc('0');
+    return;
+  }
+  char buffer[16];
+  size_t count = 0;
+  uint64_t remaining = value;
+  while (remaining > 0) {
+    buffer[count] = kHexDigits[remaining & 0xF];
+    remaining >>= 4;
+    ++count;
+  }
+  while (count > 0) {
+    --count;
+    VgaPutc(buffer[count]);
+  }
+}
+
+void VgaWriteDec(const uint64_t value) {
+  if (value == 0) {
+    VgaPutc('0');
+    return;
+  }
+  char buffer[20];
+  size_t count = 0;
+  uint64_t remaining = value;
+  while (remaining > 0) {
+    buffer[count] = static_cast<char>('0' + (remaining % 10));
+    remaining /= 10;
+    ++count;
+  }
+  while (count > 0) {
+    --count;
+    VgaPutc(buffer[count]);
   }
 }
 

@@ -236,6 +236,21 @@ static uintptr_t FindBitmapPhysicalAddress(const size_t bitmap_bytes) {
   return FindBitmapInLimit(bitmap_bytes, g_max_managed_phys_addr);
 }
 
+static void ConsoleWrite(const char* const str) {
+  UartWrite(str);
+  VgaWrite(str);
+}
+
+static void ConsoleWriteHex(const uint64_t value) {
+  UartWriteHex(value);
+  VgaWriteHex(value);
+}
+
+static void ConsoleWriteDec(const uint64_t value) {
+  UartWriteDec(value);
+  VgaWriteDec(value);
+}
+
 }  // namespace
 
 bool PmmInit(const uint32_t multiboot_magic,
@@ -255,15 +270,15 @@ bool PmmInit(const uint32_t multiboot_magic,
                          g_memory_map.fb_width,   //
                          g_memory_map.fb_height,  //
                          g_memory_map.fb_bpp);
-    UartWrite("[PMM] Framebuffer: addr=");
-    UartWriteHex(g_memory_map.fb_addr);
-    UartWrite(" width=");
-    UartWriteDec(g_memory_map.fb_width);
-    UartWrite(" height=");
-    UartWriteDec(g_memory_map.fb_height);
-    UartWrite(" bpp=");
-    UartWriteDec(g_memory_map.fb_bpp);
-    UartWrite("\n");
+    ConsoleWrite("[PMM] Framebuffer: addr=");
+    ConsoleWriteHex(g_memory_map.fb_addr);
+    ConsoleWrite(" width=");
+    ConsoleWriteDec(g_memory_map.fb_width);
+    ConsoleWrite(" height=");
+    ConsoleWriteDec(g_memory_map.fb_height);
+    ConsoleWrite(" bpp=");
+    ConsoleWriteDec(g_memory_map.fb_bpp);
+    ConsoleWrite("\n");
   }
 
   uintptr_t highest_usable_addr = 0;
@@ -360,27 +375,27 @@ bool PmmInit(const uint32_t multiboot_magic,
 
   g_pmm_total_usable_frames = g_pmm_free_frames;
 
-  UartWrite("[PMM] Kernel range: ");
-  UartWriteHex(kernel_start);
-  UartWrite(" .. ");
-  UartWriteHex(kernel_end);
-  UartWrite(", Bitmap: ");
-  UartWriteHex(g_bitmap_phys_start);
-  UartWrite(" .. ");
-  UartWriteHex(g_bitmap_phys_end);
-  UartWrite(", Identity-mapped: 0x0 .. ");
-  UartWriteHex(PagingIdentityMappedLimit());
-  UartWrite("\n");
+  ConsoleWrite("[PMM] Kernel range: ");
+  ConsoleWriteHex(kernel_start);
+  ConsoleWrite(" .. ");
+  ConsoleWriteHex(kernel_end);
+  ConsoleWrite(", Bitmap: ");
+  ConsoleWriteHex(g_bitmap_phys_start);
+  ConsoleWrite(" .. ");
+  ConsoleWriteHex(g_bitmap_phys_end);
+  ConsoleWrite(", Identity-mapped: 0x0 .. ");
+  ConsoleWriteHex(PagingIdentityMappedLimit());
+  ConsoleWrite("\n");
 
-  UartWrite("[PMM] Total RAM: ");
-  UartWriteDec(g_memory_map.total_ram_bytes / 1024);
-  UartWrite(" KiB, Usable RAM: ");
-  UartWriteDec(g_memory_map.usable_ram_bytes / 1024);
-  UartWrite(" KiB, Reserved RAM: ");
-  UartWriteDec(g_memory_map.reserved_ram_bytes / 1024);
-  UartWrite(" KiB, Free 4KiB frames: ");
-  UartWriteDec(g_pmm_free_frames);
-  UartWrite("\n");
+  ConsoleWrite("[PMM] Total RAM: ");
+  ConsoleWriteDec(g_memory_map.total_ram_bytes / 1024);
+  ConsoleWrite(" KiB, Usable RAM: ");
+  ConsoleWriteDec(g_memory_map.usable_ram_bytes / 1024);
+  ConsoleWrite(" KiB, Reserved RAM: ");
+  ConsoleWriteDec(g_memory_map.reserved_ram_bytes / 1024);
+  ConsoleWrite(" KiB, Free 4KiB frames: ");
+  ConsoleWriteDec(g_pmm_free_frames);
+  ConsoleWrite("\n");
 
   return g_pmm_free_frames > 0;
 }
