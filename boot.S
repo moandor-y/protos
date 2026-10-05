@@ -15,6 +15,17 @@ multiboot2_header_start:
     .long multiboot2_header_end - multiboot2_header_start /* Header length */
     .long -(0xE85250D6 + 0 + (multiboot2_header_end - multiboot2_header_start)) /* Checksum */
 
+    /* Framebuffer tag (type = 5, flags = 1 [optional], size = 20)
+     * Allows UEFI GRUB to hand off a GOP linear pixel framebuffer while
+     * permitting BIOS GRUB (with gfxpayload=text) to stay in 0xB8000 text mode. */
+    .align 8
+    .word 5
+    .word 1
+    .long 20
+    .long 0                                               /* Preferred width (0 = bootloader default) */
+    .long 0                                               /* Preferred height (0 = bootloader default) */
+    .long 0                                               /* Preferred depth (0 = bootloader default) */
+
     /* End tag (type = 0, flags = 0, size = 8) */
     .align 8
     .word 0

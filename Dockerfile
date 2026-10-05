@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtest-dev \
     make \
     mtools \
+    ovmf \
     python3 \
     qemu-system-x86 \
     xorriso \

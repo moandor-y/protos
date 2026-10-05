@@ -5,7 +5,7 @@ LD := ld
 ASFLAGS := --64
 CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra -Werror \
             -ffreestanding -nostdlib -fno-builtin \
-            -fno-exceptions -fno-rtti -mno-red-zone \
+            -fno-exceptions -fcheck-new -fno-rtti -mno-red-zone \
             -fno-stack-protector -fno-pie
 LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 --no-warn-rwx-segments -T linker.ld
 
@@ -102,11 +102,11 @@ $(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(DOCKER_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(LD) $(LDFLAGS) $(OBJS) -o $@
 
-$(BUILD_DIR)/kernel.iso: $(BUILD_DIR)/kernel.bin $(DOCKER_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/kernel.iso: $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
 	rm -rf $(BUILD_DIR)/isodir
 	mkdir -p $(BUILD_DIR)/isodir/boot/grub
 	cp $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/isodir/boot/kernel.bin
-	printf 'set timeout=0\nset default=0\n\nmenuentry "x86-64 Kernel" {\n    multiboot2 /boot/kernel.bin\n    boot\n}\n' > $(BUILD_DIR)/isodir/boot/grub/grub.cfg
+	printf 'set timeout=0\nset default=0\n\nmenuentry "x86-64 Kernel" {\n    if [ "$${grub_platform}" = "efi" ]; then\n        insmod all_video\n    fi\n    multiboot2 /boot/kernel.bin\n    if [ "$${grub_platform}" = "pc" ]; then\n        set gfxpayload=text\n    fi\n    boot\n}\n' > $(BUILD_DIR)/isodir/boot/grub/grub.cfg
 	$(DOCKER_RUN) grub-mkrescue -o $@ $(BUILD_DIR)/isodir
 	rm -rf $(BUILD_DIR)/isodir
 

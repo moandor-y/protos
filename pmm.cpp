@@ -255,6 +255,15 @@ bool PmmInit(const uint32_t multiboot_magic,
                          g_memory_map.fb_width,   //
                          g_memory_map.fb_height,  //
                          g_memory_map.fb_bpp);
+    UartWrite("[PMM] Framebuffer: addr=");
+    UartWriteHex(g_memory_map.fb_addr);
+    UartWrite(" width=");
+    UartWriteDec(g_memory_map.fb_width);
+    UartWrite(" height=");
+    UartWriteDec(g_memory_map.fb_height);
+    UartWrite(" bpp=");
+    UartWriteDec(g_memory_map.fb_bpp);
+    UartWrite("\n");
   }
 
   uintptr_t highest_usable_addr = 0;
