@@ -35,6 +35,7 @@ HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp))
 HOST_TESTS := $(patsubst %.cpp,%,$(HOST_TEST_SRCS))
 TEST_EXTRA_SRCS_heap_test := heap.cpp
 TEST_EXTRA_SRCS_pmm_test := pmm.cpp
+TEST_EXTRA_SRCS_smp_test := smp.cpp
 
 BUILD_DIR := build
 
@@ -45,6 +46,7 @@ CXX_SRCS := \
     paging.cpp \
     pmm.cpp \
     heap.cpp \
+    smp.cpp \
     memory_tests.cpp \
     kernel.cpp
 
@@ -56,6 +58,7 @@ CXX_HDRS := \
     paging.h \
     pmm.h \
     heap.h \
+    smp.h \
     rbtree.h \
     memory_tests.h
 
@@ -83,7 +86,7 @@ DOCKER_RUN :=
 DOCKER_DEPS :=
 endif
 
-.PHONY: all clean test test-host test-rbtree test-heap test-pmm run-boot-test
+.PHONY: all clean test test-host test-rbtree test-heap test-pmm test-smp run-boot-test
 
 ifeq ($(IN_DOCKER),)
 all: $(DOCKER_STAMP)
@@ -151,6 +154,7 @@ $(foreach t,$(HOST_TESTS),$(eval $(call DEFINE_HOST_TEST_SUITE,$(t))))
 test-rbtree: test-rbtree_test
 test-heap: test-heap_test
 test-pmm: test-pmm_test
+test-smp: test-smp_test
 
 ifeq ($(IN_DOCKER),)
 test-host: $(DOCKER_STAMP)

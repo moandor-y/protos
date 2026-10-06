@@ -39,6 +39,12 @@ cleanup
 REQUIRED_MARKERS=(
   "[PMM] mmap entry:"
   "[PMM] Total RAM:"
+  "[SMP] Discovered CPUs: 4"
+  "[SMP] CPU 0 (APIC ID 0, BSP): online"
+  "[SMP] CPU 1 (APIC ID 1, AP): online"
+  "[SMP] CPU 2 (APIC ID 2, AP): online"
+  "[SMP] CPU 3 (APIC ID 3, AP): online"
+  "[SMP] Online CPUs: 4/4"
   "[TEST] pmm_memory_map_init: PASS"
   "[TEST] pmm_alloc_and_bounds: PASS"
   "[TEST] pmm_free_and_reuse: PASS"
@@ -47,6 +53,7 @@ REQUIRED_MARKERS=(
   "[TEST] cpp_new_delete_lifecycle: PASS"
   "[TEST] heap_stress_reuse: PASS"
   "[TEST] edge_cases_and_oom: PASS"
+  "[TEST] smp_discovery_and_ap_bringup: PASS"
   "[TEST] ALL MEMORY TESTS PASSED"
 )
 
@@ -60,6 +67,7 @@ run_bios_pass() {
   # Launch QEMU headlessly with COM1 redirected to file and -no-reboot to catch triple faults.
   # Note: Do NOT pass -no-shutdown so that QEMU exits immediately if a triple fault occurs.
   qemu-system-x86_64 \
+    -smp 4 \
     -cdrom "${ISO_FILE}" \
     -display none \
     -serial "file:${BIOS_SERIAL_LOG}" \
@@ -173,6 +181,7 @@ run_uefi_pass() {
   echo "Running 64-bit UEFI (OVMF) + 4 GiB RAM boot verification..."
   qemu-system-x86_64 \
     -bios "${ovmf_bios}" \
+    -smp 4 \
     -m 4G \
     -cdrom "${ISO_FILE}" \
     -display none \

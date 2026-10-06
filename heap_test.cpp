@@ -85,7 +85,7 @@ namespace {
 TEST(HeapTest, InitZeroSizeAndAlignment) {
   // Verify explicit HeapInit() and Kmalloc(0) minimum 16-byte allocation.
   ResetFakePmm();
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
   EXPECT_THAT(g_pmm.alloc_call_count, t::Eq(1));
   ASSERT_THAT(g_pmm.requested_counts, t::ElementsAre(kInitialHeapFrames));
 
@@ -141,7 +141,7 @@ TEST(HeapTest, InitZeroSizeAndAlignment) {
 
 TEST(HeapTest, BlockSplittingThresholds) {
   ResetFakePmm();
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
   const int64_t initial_free = HeapTotalFreeBytes();
   const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
 
@@ -197,7 +197,7 @@ TEST(HeapTest, BlockSplittingThresholds) {
 
 TEST(HeapTest, AddressOrderedFirstFitSelectionViaFindFirstAugmented) {
   ResetFakePmm();
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
   const int64_t initial_free = HeapTotalFreeBytes();
   const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
 
@@ -266,7 +266,7 @@ TEST(HeapTest, AddressOrderedFirstFitSelectionViaFindFirstAugmented) {
 
 TEST(HeapTest, CoalescingForwardBackwardAndThreeWay) {
   ResetFakePmm();
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
   const int64_t initial_free = HeapTotalFreeBytes();
   const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
 
@@ -354,7 +354,7 @@ TEST(HeapTest, MultiArenaExpansionContiguousAndNonContiguousIsolation) {
   // rather than re-running HeapInit().
   ResetFakePmm(1024);
   g_pmm.gap_frames = 1;
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
 
   const int64_t arena1_payload = HeapTotalFreeBytes();
   const int64_t header_size = kInitialHeapFrames * kPageSize - arena1_payload;
@@ -388,7 +388,7 @@ TEST(HeapTest, MultiArenaExpansionContiguousAndNonContiguousIsolation) {
   // (frame 512, then frame 100, then frame 300).
   ResetFakePmm(1024);
   g_pmm.scripted_start_frames = {512, 100, 300};
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
 
   void* const high_arena = Kmalloc(arena1_payload);
   ASSERT_THAT(high_arena, t::NotNull());
@@ -422,7 +422,7 @@ TEST(HeapTest, MultiArenaExpansionContiguousAndNonContiguousIsolation) {
   // `exact_frames` (1) when PMM has only 4 frames remaining.
   ResetFakePmm(512);
   g_pmm.limit_frame = kInitialHeapFrames + 4;
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
 
   void* const p1 = Kmalloc(arena1_payload);
   ASSERT_THAT(p1, t::NotNull());
@@ -449,15 +449,14 @@ TEST(HeapTest, MultiArenaExpansionContiguousAndNonContiguousIsolation) {
 }
 
 TEST(HeapTest, OomAndNullFreeResilience) {
-  // OOM during HeapInit().
+  // OOM during HeapInit() panics via CHECK.
   ResetFakePmm();
   g_pmm.force_oom = true;
-  EXPECT_FALSE(HeapInit());
-  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(0));
+  EXPECT_DEATH(HeapInit(), "Check failed");
 
-  // Recovery once PMM frames are available.
+  // Initialization succeeds once PMM frames are available.
   g_pmm.force_oom = false;
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
   void* const recovered = Kmalloc(64);
   ASSERT_THAT(recovered, t::NotNull());
   Kfree(recovered);
@@ -487,7 +486,7 @@ TEST(HeapTest, OomAndNullFreeResilience) {
 
 TEST(HeapDeathTest, InvalidOrDoubleFreeTriggersDcheck) {
   ResetFakePmm();
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
 
   uint8_t* const a = static_cast<uint8_t*>(Kmalloc(128));
   uint8_t* const b = static_cast<uint8_t*>(Kmalloc(128));
@@ -518,7 +517,7 @@ TEST(HeapDeathTest, InvalidOrDoubleFreeTriggersDcheck) {
 
 TEST(HeapTest, HighFragmentationStressAndFullCoalescence) {
   ResetFakePmm(kFakeRamFrames);
-  ASSERT_TRUE(HeapInit());
+  HeapInit();
   const int64_t initial_free = HeapTotalFreeBytes();
 
   constexpr int kNumBlocks = 512;

@@ -9,7 +9,7 @@ namespace protos {
 namespace {
 
 constexpr int kEntriesPerPageTable = 512;
-constexpr int kMaxBootstrapPageTables = 8;
+constexpr int kMaxBootstrapPageTables = 16;
 constexpr uint64_t kPtePresent = 1 << 0;
 constexpr uint64_t kPteWritable = 1 << 1;
 constexpr uint64_t kPteHugePage = 1 << 7;

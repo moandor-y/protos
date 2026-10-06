@@ -277,19 +277,17 @@ static void* KmallocAligned(const int64_t size, const int64_t alignment) {
 
 }  // namespace
 
-bool HeapInit() {
+void HeapInit() {
   g_free_tree.Clear();
   g_total_free_bytes = 0;
   g_heap_initialized = false;
 
   const uintptr_t arena_addr = PmmAllocFrames(kInitialHeapFrames);
-  if (arena_addr == 0) {
-    return false;
-  }
+  CHECK(arena_addr != 0);
   const int64_t arena_bytes = kInitialHeapFrames * kPageSize;
   const HeapBlockHeader* const block = HeapInsertArena(arena_addr, arena_bytes);
-  g_heap_initialized = (block != nullptr);
-  return g_heap_initialized;
+  CHECK(block != nullptr);
+  g_heap_initialized = true;
 }
 
 int64_t HeapTotalFreeBytes() { return g_total_free_bytes; }

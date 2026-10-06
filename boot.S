@@ -210,6 +210,120 @@ exception_halt_stub:
 
 
 /* =========================================================================
+ * SMP Application Processor (AP) Real-Mode Trampoline
+ * Copied to physical address 0x8000 (SIPI vector 0x08) by the BSP.
+ * Transitions each AP from 16-bit Real Mode -> 32-bit Protected Mode ->
+ * 64-bit Long Mode using the kernel's PML4 page table and a per-AP stack.
+ * ========================================================================= */
+.align 16
+.global ap_trampoline_start
+.global ap_trampoline_end
+
+.code16
+ap_trampoline_start:
+    cli
+    cld
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+
+    /* Load temporary GDT from inside the 0x8000 trampoline page */
+    mov bx, 0x8000 + (ap_trampoline_gdtr - ap_trampoline_start)
+    lgdt [bx]
+
+    /* Enable Protected Mode (CR0.PE = bit 0) */
+    mov eax, cr0
+    or  al, 1
+    mov cr0, eax
+
+    /* Far jump to 32-bit Protected Mode entry (selector 0x18) */
+    jmp 0x18:(0x8000 + ap_pm32_entry - ap_trampoline_start)
+
+.align 8
+.code32
+ap_pm32_entry:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    /* Signal to the BSP that this AP has started executing the trampoline */
+    .extern g_ap_boot_started
+    mov dword ptr [g_ap_boot_started], 1
+
+    /* Enable PAE (bit 5), OSFXSR (bit 9), and OSXMMEXCPT (bit 10) in CR4 */
+    mov eax, cr4
+    or  eax, ((1 << 5) | (1 << 9) | (1 << 10))
+    mov cr4, eax
+
+    /* Load CR3 with physical base address of the shared kernel PML4 table */
+    mov eax, offset pml4_table
+    mov cr3, eax
+
+    /* Enable Long Mode in IA32_EFER MSR (0xC0000080, bit 8 = LME) */
+    mov ecx, 0xC0000080
+    rdmsr
+    or  eax, (1 << 8)
+    wrmsr
+
+    /* Enable Paging (bit 31 = PG), Monitor Coprocessor (bit 1 = MP),
+     * and Protected Mode (bit 0 = PE) while clearing Emulation (bit 2 = EM) in CR0 */
+    mov eax, cr0
+    and eax, ~(1 << 2)
+    or  eax, ((1 << 31) | (1 << 1) | (1 << 0))
+    mov cr0, eax
+
+    /* Far jump to 64-bit Long Mode entry in kernel .text (selector 0x08) */
+    jmp 0x08:ap_long_mode_entry
+
+.align 16
+ap_trampoline_gdt:
+    .quad 0x0000000000000000    /* 0x00: Null Descriptor */
+    .quad 0x00AF9A000000FFFF    /* 0x08: 64-bit Kernel Code */
+    .quad 0x00CF92000000FFFF    /* 0x10: 32/64-bit Kernel Data */
+    .quad 0x00CF9A000000FFFF    /* 0x18: 32-bit Protected Mode Code */
+ap_trampoline_gdt_end:
+
+.align 8
+ap_trampoline_gdtr:
+    .word ap_trampoline_gdt_end - ap_trampoline_gdt - 1
+    .long 0x8000 + (ap_trampoline_gdt - ap_trampoline_start)
+ap_trampoline_end:
+
+.align 16
+.code64
+ap_long_mode_entry:
+    /* Switch to the permanent 64-bit GDT and IDT in kernel memory */
+    lgdt [gdt64_pointer]
+    lidt [idt64_pointer]
+
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    /* Load this AP's dedicated 64-bit stack pointer and CPU slot index */
+    .extern g_ap_boot_stack
+    .extern g_ap_boot_cpu_index
+    mov rsp, qword ptr [g_ap_boot_stack]
+    mov edi, dword ptr [g_ap_boot_cpu_index]
+    xor rbp, rbp
+
+    .extern ApKernelEntry
+    call ApKernelEntry
+
+.Lap_halt_loop:
+    cli
+    hlt
+    jmp .Lap_halt_loop
+
+
+/* =========================================================================
  * 64-Bit Global Descriptor Table & IDT Pointer (Read-Only Data)
  * ========================================================================= */
 .section .rodata
@@ -248,6 +362,8 @@ idt64:
     .skip 32 * 16
 
 .align 16
+.global stack_bottom
+.global stack_top
 stack_bottom:
     .skip 16384                 /* 16 KiB Kernel Stack */
 stack_top:

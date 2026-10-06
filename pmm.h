@@ -14,8 +14,9 @@ constexpr uintptr_t kLowerMemoryLimit = 0x100000;
 // Parses the Multiboot memory map, carves out lower memory, the kernel image,
 // the framebuffer, and bootloader structures, extends the identity mapping
 // across usable physical RAM, and populates the intrusive Red-Black Tree of
-// free frame runs. Returns true if at least one usable frame is available.
-bool PmmInit(uint32_t multiboot_magic, uint64_t multiboot_info_addr);
+// free frame runs. Panics via `CHECK` if no usable physical frames are
+// available or identity mapping fails.
+void PmmInit(uint32_t multiboot_magic, uint64_t multiboot_info_addr);
 
 // Allocates `count` contiguous 4 KiB physical frames (`count > 0`) and returns
 // the base physical address, or 0 if no contiguous run of `count` frames is

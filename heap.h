@@ -9,8 +9,9 @@ namespace protos {
 constexpr int64_t kHeapAlignment = 16;
 
 // Initializes the kernel heap with an initial arena of physical frames from
-// the PMM. Returns true if the initial arena was allocated and linked.
-bool HeapInit();
+// the PMM. Panics via `CHECK` if the initial arena cannot be allocated and
+// linked.
+void HeapInit();
 
 // Returns the sum of payload bytes across all free blocks currently in the
 // heap block list.

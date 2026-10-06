@@ -5,11 +5,10 @@
 
 namespace protos {
 
-// Initializes the physical memory manager and kernel heap from the Multiboot
-// info at `multiboot_info_addr`, runs all PMM and heap self-tests, and logs
-// pass/fail markers over UART COM1 and the display console.
-void RunBootVerificationSuite(uint32_t multiboot_magic,
-                              uint64_t multiboot_info_addr);
+// Runs non-destructive self-tests for the physical memory manager, kernel heap,
+// and multiprocessor (SMP) state after kernel subsystems have been initialized,
+// logging pass/fail markers over UART COM1 and the display console.
+void RunBootVerificationSuite();
 
 }  // namespace protos
 

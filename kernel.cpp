@@ -1,6 +1,10 @@
 #include <cstdint>
 
+#include "check.h"
+#include "heap.h"
 #include "memory_tests.h"
+#include "pmm.h"
+#include "smp.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -16,7 +20,11 @@ extern "C" [[noreturn]] void kernel_main(const uint32_t multiboot_magic,
   UartInit();
   UartWrite(kGreeting);
 
-  RunBootVerificationSuite(multiboot_magic, multiboot_info_addr);
+  PmmInit(multiboot_magic, multiboot_info_addr);
+  HeapInit();
+  SmpInit(multiboot_magic, multiboot_info_addr);
+
+  RunBootVerificationSuite();
 
   for (;;) {
     asm volatile("cli; hlt");

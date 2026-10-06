@@ -194,50 +194,39 @@ void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
 namespace {
 
 TEST(PmmTest, InitFailureModesAndEmptyRegions) {
-  // MultibootParseMemoryMap failure must cause PmmInit to fail cleanly.
+  // Calling PmmAllocFrame before PmmInit succeeds must trigger DCHECK.
+  ResetFakeEnv();
+  EXPECT_DEATH(PmmAllocFrame(), "Check failed");
+
+  // MultibootParseMemoryMap failure must cause PmmInit to panic via CHECK.
   ResetFakeEnv();
   g_env.parse_ok = false;
-  EXPECT_FALSE(PmmInit(0, 0));
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
-  EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(0));
-  EXPECT_THAT(PmmMaxPhysicalAddress(), t::Eq(0));
-  EXPECT_THAT(PmmMaxFrameCount(), t::Eq(0));
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
 
   // Available RAM strictly below kLowerMemoryLimit (1 MiB) is completely
-  // excluded and must cause PmmInit to return false.
+  // excluded and must cause PmmInit to panic via CHECK.
   ResetFakeEnv();
   AddRegion(0, kLowerMemoryLimit, kMemoryTypeAvailable);
-  EXPECT_FALSE(PmmInit(0, 0));
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
 
   // Sub-page available fragments (< kPageSize) or unaligned fragments that
-  // contain no complete page must be rejected.
+  // contain no complete page must be rejected via CHECK.
   ResetFakeEnv();
   AddRegion(FrameAddr(20) + 1024, 2048, kMemoryTypeAvailable);
-  EXPECT_FALSE(PmmInit(0, 0));
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
 
   // Available region completely covered by a non-available reserved region
-  // leaves zero usable frames.
+  // leaves zero usable frames and must panic via CHECK.
   ResetFakeEnv();
   AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
   AddRegion(FrameAddr(20), 8 * kPageSize, 2);
-  EXPECT_FALSE(PmmInit(0, 0));
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
 
-  // Failure in PagingExtendIdentityMap must abort PmmInit before any intrusive
-  // FreeRunNode is written into high memory and reset all PMM state.
+  // Failure in PagingExtendIdentityMap must cause PmmInit to panic via CHECK.
   ResetFakeEnv(64);
   g_env.fail_extend_map = true;
-  g_env.check_clean_frames = 64;
   AddRegion(FrameAddr(20), 16 * kPageSize, kMemoryTypeAvailable);
-  EXPECT_FALSE(PmmInit(0, 0));
-  EXPECT_THAT(g_env.extend_map_calls, t::Eq(1));
-  EXPECT_TRUE(g_env.fake_ram_clean_during_extend);
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
-  EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(0));
-  EXPECT_THAT(PmmMaxPhysicalAddress(), t::Eq(0));
-  EXPECT_DEATH(PmmAllocFrame(), "Check failed");
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
 }
 
 TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
@@ -271,7 +260,7 @@ TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
   g_env.map.fb_height = 6;
   g_env.map.fb_bpp = 32;
 
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
 
   // Verify framebuffer attachment and dual UART + VGA console logging.
   EXPECT_TRUE(g_env.fb_attached);
@@ -337,7 +326,7 @@ TEST(PmmTest, InitNormalizesOverlappingAndUnsortedAvailableRegions) {
   AddRegion(FrameAddr(30), 10 * kPageSize, kMemoryTypeAvailable);
   AddRegion(FrameAddr(20), 4 * kPageSize, kMemoryTypeAvailable);
 
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
   EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(40));
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(40));
   EXPECT_THAT(PmmMaxPhysicalAddress(), t::Eq(FrameAddr(60)));
@@ -354,7 +343,7 @@ TEST(PmmTest, InitNormalizesOverlappingAndUnsortedAvailableRegions) {
 TEST(PmmTest, LowestAddressFirstFitAndFindFirstAugmentedSelection) {
   ResetFakeEnv(120);
   AddRegion(FrameAddr(20), 60 * kPageSize, kMemoryTypeAvailable);
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
 
   // Carve 4 free holes at ascending addresses separated by 1-frame barriers:
   //   run0 (2 frames) < run1 (8 frames) < run2 (32 frames) < run3 (8 frames)
@@ -435,7 +424,7 @@ TEST(PmmTest, LowestAddressFirstFitAndFindFirstAugmentedSelection) {
 TEST(PmmTest, RunSplittingAndExactFitWithoutPerFrameLoops) {
   ResetFakeEnv(64);
   AddRegion(FrameAddr(20), 20 * kPageSize, kMemoryTypeAvailable);
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(20));
 
   const uintptr_t a1 = PmmAllocFrame();
@@ -477,7 +466,7 @@ TEST(PmmTest, RunSplittingAndExactFitWithoutPerFrameLoops) {
 TEST(PmmTest, CoalescingForwardBackwardAndThreeWay) {
   ResetFakeEnv(64);
   AddRegion(FrameAddr(20), 10 * kPageSize, kMemoryTypeAvailable);
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
 
   const uintptr_t a = PmmAllocFrames(2);
   const uintptr_t b = PmmAllocFrames(3);
@@ -549,7 +538,7 @@ TEST(PmmTest, NonContiguousRegionsNeverCoalesceAcrossReservedHoles) {
   //   [12, 16) (4 frames), [20, 24) (4 frames), [25, 30) (5 frames).
   AddRegion(FrameAddr(12), 18 * kPageSize, kMemoryTypeAvailable);
   AddRegion(FrameAddr(24), kPageSize, 2);
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
   EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(13));
 
   const uintptr_t r1 = PmmAllocFrames(4);
@@ -572,7 +561,7 @@ TEST(PmmTest, NonContiguousRegionsNeverCoalesceAcrossReservedHoles) {
 TEST(PmmTest, OomHandling) {
   ResetFakeEnv(64);
   AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
 
   // Request exceeding total free frames must return 0 immediately.
   EXPECT_THAT(PmmAllocFrames(9), t::Eq(0));
@@ -621,7 +610,7 @@ TEST(PmmTest, RangeIsValidUsableRamValidation) {
   g_env.map.fb_width = 64;
   g_env.map.fb_height = 2;
   g_env.map.fb_bpp = 32;
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
 
   // Valid ranges strictly inside usable intervals.
   EXPECT_TRUE(PmmRangeIsValidUsableRam(FrameAddr(10), 6 * kPageSize));
@@ -658,7 +647,7 @@ TEST(PmmTest, HighFragmentationStressAndFullCoalescence) {
   AddRegion(FrameAddr(kArenaStartFrame),  //
             kArenaFrames * kPageSize,     //
             kMemoryTypeAvailable);
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kArenaFrames));
 
   constexpr int kNumRuns = 256;
@@ -727,7 +716,7 @@ TEST(PmmTest, HighFragmentationStressAndFullCoalescence) {
 TEST(PmmTest, InvalidAndDoubleFreeTriggerDcheck) {
   ResetFakeEnv(64);
   AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
-  ASSERT_TRUE(PmmInit(0, 0));
+  PmmInit(0, 0);
 
   const uintptr_t allocated = PmmAllocFrames(4);
   ASSERT_THAT(allocated, t::Eq(FrameAddr(20)));

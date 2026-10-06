@@ -7,6 +7,7 @@
 #include "heap.h"
 #include "paging.h"
 #include "pmm.h"
+#include "smp.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -202,12 +203,14 @@ static bool TestPmmAllocAndBounds(uintptr_t* const out_first_frame,
   return patterns_ok;
 }
 
-static bool TestPmmFreeAndReuse(const uintptr_t frame1,  //
-                                const uintptr_t frame2,  //
+static bool TestPmmFreeAndReuse(const int64_t free_before_allocs,  //
+                                const uintptr_t frame1,            //
+                                const uintptr_t frame2,            //
                                 const uintptr_t multi_frames) {
   const int64_t free_with_allocs = PmmFreeFrameCount();
   const int64_t total_usable = PmmTotalUsableFrameCount();
-  if (total_usable == 0 || free_with_allocs + 6 != total_usable) {
+  if (total_usable == 0 || free_with_allocs + 6 != free_before_allocs ||
+      free_before_allocs > total_usable) {
     return false;
   }
 
@@ -215,7 +218,7 @@ static bool TestPmmFreeAndReuse(const uintptr_t frame1,  //
   PmmFreeFrame(frame2);
   PmmFreeFrames(multi_frames, 4);
 
-  if (PmmFreeFrameCount() != free_with_allocs + 6) {
+  if (PmmFreeFrameCount() != free_before_allocs) {
     return false;
   }
 
@@ -232,7 +235,7 @@ static bool TestPmmFreeAndReuse(const uintptr_t frame1,  //
     return false;
   }
 
-  return reused_match && (PmmFreeFrameCount() == free_with_allocs + 6);
+  return reused_match && (PmmFreeFrameCount() == free_before_allocs);
 }
 
 static bool TestHeapVariedSizesAndAlignment() {
@@ -495,17 +498,62 @@ static bool TestEdgeCasesAndOom() {
   return free_after == free_before;
 }
 
+static bool TestSmpDiscoveryAndApBringup() {
+  const int cpu_count = SmpCpuCount();
+  const int online_count = SmpOnlineCpuCount();
+  if (cpu_count < 1 || online_count != cpu_count ||
+      SmpLocalApicPhysAddr() == 0 ||
+      !PagingIsIdentityMapped(SmpLocalApicPhysAddr())) {
+    return false;
+  }
+
+  const CpuInfo* const bsp = SmpGetCpuInfo(0);
+  if (bsp == nullptr || !bsp->is_bsp || !bsp->online ||
+      !bsp->long_mode_active || bsp->observed_apic_id != bsp->apic_id ||
+      bsp->stack_base == 0 || bsp->stack_top <= bsp->stack_base ||
+      (bsp->stack_top & 0xF) != 0 || bsp->observed_rsp <= bsp->stack_base ||
+      bsp->observed_rsp > bsp->stack_top || bsp->observed_cr3 == 0) {
+    return false;
+  }
+
+  for (int i = 1; i < cpu_count; ++i) {
+    const CpuInfo* const ap = SmpGetCpuInfo(i);
+    if (ap == nullptr || ap->is_bsp || !ap->online || !ap->long_mode_active ||
+        ap->observed_apic_id != ap->apic_id || ap->stack_base == 0 ||
+        ap->stack_top != ap->stack_base + kApStackSize ||
+        (ap->stack_top & 0xF) != 0 || ap->observed_rsp <= ap->stack_base ||
+        ap->observed_rsp > ap->stack_top ||
+        ap->observed_cr3 != bsp->observed_cr3 ||
+        !PmmRangeIsValidUsableRam(ap->stack_base, kApStackSize)) {
+      return false;
+    }
+
+    for (int j = 0; j < i; ++j) {
+      const CpuInfo* const other = SmpGetCpuInfo(j);
+      if (other == nullptr || ap->apic_id == other->apic_id ||
+          (ap->stack_base < other->stack_top &&
+           ap->stack_top > other->stack_base)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 }  // namespace
 
-void RunBootVerificationSuite(const uint32_t multiboot_magic,
-                              const uint64_t multiboot_info_addr) {
-  const bool pmm_ok = PmmInit(multiboot_magic, multiboot_info_addr);
+void RunBootVerificationSuite() {
+  const bool pmm_ok = PmmTotalUsableFrameCount() > 0 &&
+                      PmmFreeFrameCount() > 0 &&
+                      PmmMaxPhysicalAddress() > kBootstrapIdentityMapSize;
   LogTestResult("pmm_memory_map_init", pmm_ok);
   if (!pmm_ok) {
     ConsoleWrite("[TEST] MEMORY VERIFICATION FAILED\n");
     return;
   }
 
+  const int64_t free_before_allocs = PmmFreeFrameCount();
   uintptr_t frame1 = 0;
   uintptr_t frame2 = 0;
   uintptr_t multi_frames = 0;
@@ -513,11 +561,12 @@ void RunBootVerificationSuite(const uint32_t multiboot_magic,
       TestPmmAllocAndBounds(&frame1, &frame2, &multi_frames);
   LogTestResult("pmm_alloc_and_bounds", alloc_bounds_ok);
 
-  const bool free_reuse_ok = TestPmmFreeAndReuse(frame1, frame2, multi_frames);
+  const bool free_reuse_ok =
+      TestPmmFreeAndReuse(free_before_allocs, frame1, frame2, multi_frames);
   LogTestResult("pmm_free_and_reuse", free_reuse_ok);
 
-  const bool heap_init_ok = HeapInit();
-  const bool varied_ok = heap_init_ok && TestHeapVariedSizesAndAlignment();
+  const bool varied_ok =
+      HeapTotalFreeBytes() > 0 && TestHeapVariedSizesAndAlignment();
   LogTestResult("heap_varied_sizes_and_alignment", varied_ok);
 
   const bool pattern_ok = TestHeapPatternIsolation();
@@ -532,8 +581,11 @@ void RunBootVerificationSuite(const uint32_t multiboot_magic,
   const bool edge_ok = TestEdgeCasesAndOom();
   LogTestResult("edge_cases_and_oom", edge_ok);
 
+  const bool smp_ok = TestSmpDiscoveryAndApBringup();
+  LogTestResult("smp_discovery_and_ap_bringup", smp_ok);
+
   if (pmm_ok && alloc_bounds_ok && free_reuse_ok && varied_ok && pattern_ok &&
-      cpp_ok && stress_ok && edge_ok) {
+      cpp_ok && stress_ok && edge_ok && smp_ok) {
     ConsoleWrite("[TEST] ALL MEMORY TESTS PASSED\n");
   } else {
     ConsoleWrite("[TEST] MEMORY VERIFICATION FAILED\n");

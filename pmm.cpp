@@ -358,18 +358,14 @@ static void ConsoleWriteDec(const uint64_t value) {
 
 }  // namespace
 
-bool PmmInit(const uint32_t multiboot_magic,
+void PmmInit(const uint32_t multiboot_magic,
              const uint64_t multiboot_info_addr) {
   ResetPmmState();
 
-  const bool parsed_ok =
-      MultibootParseMemoryMap(multiboot_magic,               //
-                              multiboot_info_addr,           //
-                              kMaxCanonicalIdentityAddress,  //
-                              &g_memory_map);
-  if (!parsed_ok) {
-    return false;
-  }
+  CHECK(MultibootParseMemoryMap(multiboot_magic,               //
+                                multiboot_info_addr,           //
+                                kMaxCanonicalIdentityAddress,  //
+                                &g_memory_map));
 
   if (g_memory_map.fb_addr != 0) {
     VgaAttachFramebuffer(g_memory_map.fb_addr,    //
@@ -428,17 +424,11 @@ bool PmmInit(const uint32_t multiboot_magic,
     CarveExcludedRange(g_memory_map.fb_addr, fb_bytes);
   }
 
-  if (g_usable_interval_count <= 0) {
-    ResetPmmState();
-    return false;
-  }
+  CHECK(g_usable_interval_count > 0);
 
   const uintptr_t highest_usable_addr =
       g_usable_intervals[g_usable_interval_count - 1].end;
-  if (highest_usable_addr <= kLowerMemoryLimit) {
-    ResetPmmState();
-    return false;
-  }
+  CHECK(highest_usable_addr > kLowerMemoryLimit);
 
   g_max_managed_phys_addr = highest_usable_addr;
   g_max_frames = g_max_managed_phys_addr / kPageSize;
@@ -461,10 +451,7 @@ bool PmmInit(const uint32_t multiboot_magic,
     }
   }
 
-  if (!PagingExtendIdentityMap(g_max_managed_phys_addr)) {
-    ResetPmmState();
-    return false;
-  }
+  CHECK(PagingExtendIdentityMap(g_max_managed_phys_addr));
 
   // Now that the identity mapping covers all usable physical RAM up to
   // `g_max_managed_phys_addr`, insert intervals at or above 64 MiB and
@@ -484,10 +471,7 @@ bool PmmInit(const uint32_t multiboot_magic,
     }
   }
 
-  if (g_free_run_tree.Empty() || g_pmm_free_frames == 0) {
-    ResetPmmState();
-    return false;
-  }
+  CHECK(!g_free_run_tree.Empty() && g_pmm_free_frames > 0);
 
   g_max_managed_phys_addr = RunEndAddress(g_free_run_tree.Last());
   g_max_frames = g_max_managed_phys_addr / kPageSize;
@@ -510,8 +494,6 @@ bool PmmInit(const uint32_t multiboot_magic,
   ConsoleWrite(" KiB, Free 4KiB frames: ");
   ConsoleWriteDec(g_pmm_free_frames);
   ConsoleWrite("\n");
-
-  return true;
 }
 
 uintptr_t PmmAllocFrames(const int64_t count) {
