@@ -295,7 +295,7 @@ static std::vector<int> CollectKeysReverse(const Tree& tree) {
 
 static void InitAugmentedTestNode(AugmentedRbTestNode* const item,
                                   const int64_t index) {
-  const int key = static_cast<int>(index + 1) * 16;
+  const int key = (index + 1) * 16;
   const int64_t payload_size = ((index * 97 + 31) % 500) + 16;
   item->key = key;
   item->payload_size = payload_size;
@@ -465,7 +465,7 @@ TEST(RbTreeTest, QueriesAndBidirectionalIteration) {
 
   // Exact keys (10, 20, ..., 160) and missing odd midpoint keys (15, 25, ...).
   for (int64_t idx = 1; idx <= kCount; ++idx) {
-    const int exact_key = static_cast<int>(idx) * 10;
+    const int exact_key = idx * 10;
     const BasicRbTestNode* const found = tree.Find(exact_key);
     const BasicRbTestNode* const cfound = const_tree.Find(exact_key);
     const BasicRbTestNode* const lb = tree.LowerBound(exact_key);

@@ -1,6 +1,5 @@
 #include "uart.h"
 
-#include <cstddef>
 #include <cstdint>
 
 namespace protos {
@@ -8,7 +7,7 @@ namespace protos {
 namespace {
 
 constexpr uint16_t kCom1Port = 0x3F8;
-constexpr uint32_t kMaxTransmitPollIterations = 100000;
+constexpr int kMaxTransmitPollIterations = 100000;
 
 bool g_uart_present = false;
 
@@ -41,9 +40,9 @@ void UartPutc(const char c) {
   if (!g_uart_present) {
     return;
   }
-  for (uint32_t spin = 0; spin < kMaxTransmitPollIterations; ++spin) {
+  for (int spin = 0; spin < kMaxTransmitPollIterations; ++spin) {
     if ((Inb(kCom1Port + 5) & 0x20) != 0) {
-      Outb(kCom1Port, static_cast<uint8_t>(c));
+      Outb(kCom1Port, c);
       return;
     }
     asm volatile("pause");
@@ -54,7 +53,7 @@ void UartPutc(const char c) {
 }
 
 void UartWrite(const char* const str) {
-  for (size_t i = 0; str[i] != '\0'; ++i) {
+  for (int i = 0; str[i] != '\0'; ++i) {
     if (str[i] == '\n') {
       UartPutc('\r');
     }
@@ -70,7 +69,7 @@ void UartWriteHex(const uint64_t value) {
     return;
   }
   char buffer[16];
-  size_t count = 0;
+  int count = 0;
   uint64_t remaining = value;
   while (remaining > 0) {
     buffer[count] = kHexDigits[remaining & 0xF];
@@ -89,10 +88,10 @@ void UartWriteDec(const uint64_t value) {
     return;
   }
   char buffer[20];
-  size_t count = 0;
+  int count = 0;
   uint64_t remaining = value;
   while (remaining > 0) {
-    buffer[count] = static_cast<char>('0' + (remaining % 10));
+    buffer[count] = '0' + (remaining % 10);
     remaining /= 10;
     ++count;
   }

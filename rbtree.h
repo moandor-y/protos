@@ -1,7 +1,6 @@
 #ifndef PROTOS_RBTREE_H_
 #define PROTOS_RBTREE_H_
 
-#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 

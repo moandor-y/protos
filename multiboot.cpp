@@ -1,6 +1,5 @@
 #include "multiboot.h"
 
-#include <cstddef>
 #include <cstdint>
 
 #include "paging.h"
@@ -18,7 +17,7 @@ constexpr uint32_t kMultiboot2TagEnd = 0;
 constexpr uint32_t kMultiboot2TagMmap = 6;
 constexpr uint32_t kMultiboot2TagFramebuffer = 8;
 constexpr uint8_t kMultiboot2FramebufferTypeRgb = 1;
-constexpr uint32_t kMaxMultibootStructureBytes = 4 * 1024 * 1024;
+constexpr int64_t kMaxMultibootStructureBytes = 4 * 1024 * 1024;
 
 struct [[gnu::packed]] Multiboot1Info {
   uint32_t flags;
@@ -76,8 +75,7 @@ struct [[gnu::packed]] Multiboot2TagFramebuffer {
   uint16_t reserved;
 };
 
-static constexpr uintptr_t AlignUp(const uintptr_t value,
-                                   const uintptr_t alignment) {
+static constexpr int64_t AlignUp(const int64_t value, const int64_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
@@ -97,10 +95,12 @@ static void ConsoleWriteDec(const uint64_t value) {
 }
 
 static void RecordMmapEntry(MultibootMemoryMap* const out_map,  //
-                            const uint64_t base,                //
-                            const uint64_t length,              //
+                            const uint64_t raw_base,            //
+                            const uint64_t raw_length,          //
                             const uint32_t type) {
-  if (out_map == nullptr || length == 0) {
+  const uintptr_t base = raw_base;
+  const int64_t length = raw_length;
+  if (out_map == nullptr || length <= 0) {
     return;
   }
   if (out_map->region_count < kMaxMemoryRegions) {
@@ -158,18 +158,18 @@ bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
   if (multiboot_info_addr == 0 || multiboot_info_addr >= max_physical_addr) {
     return false;
   }
-  const uintptr_t info_phys = static_cast<uintptr_t>(multiboot_info_addr);
+  const uintptr_t info_phys = multiboot_info_addr;
 
   if (multiboot_magic == kMultiboot2Magic) {
-    if (!PagingMapBootstrapRange(info_phys, sizeof(Multiboot2InfoHeader))) {
+    constexpr int64_t kHeaderSize = sizeof(Multiboot2InfoHeader);
+    if (!PagingMapBootstrapRange(info_phys, kHeaderSize)) {
       return false;
     }
     const Multiboot2InfoHeader* const header =
         reinterpret_cast<const Multiboot2InfoHeader*>(info_phys);
-    const uint32_t total_size = header->total_size;
-    if (total_size < sizeof(Multiboot2InfoHeader) ||
-        total_size > kMaxMultibootStructureBytes ||
-        (max_physical_addr - info_phys) < total_size) {
+    const int64_t total_size = header->total_size;
+    if (total_size < kHeaderSize || total_size > kMaxMultibootStructureBytes ||
+        (max_physical_addr - info_phys) < static_cast<uintptr_t>(total_size)) {
       return false;
     }
     if (!PagingMapBootstrapRange(info_phys, total_size)) {
@@ -178,34 +178,39 @@ bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
     out_map->mb_reserved_start = info_phys;
     out_map->mb_reserved_end = info_phys + total_size;
 
-    uintptr_t offset = sizeof(Multiboot2InfoHeader);
-    while (offset + sizeof(Multiboot2Tag) <= total_size) {
+    int64_t offset = kHeaderSize;
+    constexpr int64_t kTagHeaderSize = sizeof(Multiboot2Tag);
+    constexpr int64_t kMmapTagSize = sizeof(Multiboot2TagMmap);
+    constexpr int64_t kMmapEntrySize = sizeof(Multiboot2MmapEntry);
+    constexpr int64_t kFbTagSize = sizeof(Multiboot2TagFramebuffer);
+    while (offset + kTagHeaderSize <= total_size) {
       const Multiboot2Tag* const tag =
           reinterpret_cast<const Multiboot2Tag*>(info_phys + offset);
-      if (tag->type == kMultiboot2TagEnd || tag->size < sizeof(Multiboot2Tag)) {
+      const int64_t tag_size = tag->size;
+      if (tag->type == kMultiboot2TagEnd || tag_size < kTagHeaderSize) {
         break;
       }
-      if (tag->type == kMultiboot2TagMmap &&
-          tag->size >= sizeof(Multiboot2TagMmap)) {
+      if (tag->type == kMultiboot2TagMmap && tag_size >= kMmapTagSize) {
         const Multiboot2TagMmap* const mmap_tag =
             reinterpret_cast<const Multiboot2TagMmap*>(tag);
-        if (mmap_tag->entry_size >= sizeof(Multiboot2MmapEntry)) {
-          uintptr_t entry_offset = sizeof(Multiboot2TagMmap);
-          while (entry_offset + mmap_tag->entry_size <= mmap_tag->size) {
+        const int64_t entry_size = mmap_tag->entry_size;
+        if (entry_size >= kMmapEntrySize) {
+          int64_t entry_offset = kMmapTagSize;
+          while (entry_offset + entry_size <= tag_size) {
             const Multiboot2MmapEntry* const entry =
                 reinterpret_cast<const Multiboot2MmapEntry*>(
                     reinterpret_cast<uintptr_t>(mmap_tag) + entry_offset);
             RecordMmapEntry(out_map, entry->addr, entry->len, entry->type);
-            entry_offset += mmap_tag->entry_size;
+            entry_offset += entry_size;
           }
         }
       } else if (tag->type == kMultiboot2TagFramebuffer &&
-                 tag->size >= sizeof(Multiboot2TagFramebuffer)) {
+                 tag_size >= kFbTagSize) {
         const Multiboot2TagFramebuffer* const fb_tag =
             reinterpret_cast<const Multiboot2TagFramebuffer*>(tag);
         if (fb_tag->framebuffer_type == kMultiboot2FramebufferTypeRgb &&
             fb_tag->framebuffer_addr < kMaxCanonicalIdentityAddress) {
-          out_map->fb_addr = static_cast<uintptr_t>(fb_tag->framebuffer_addr);
+          out_map->fb_addr = fb_tag->framebuffer_addr;
           out_map->fb_pitch = fb_tag->framebuffer_pitch;
           out_map->fb_width = fb_tag->framebuffer_width;
           out_map->fb_height = fb_tag->framebuffer_height;
@@ -213,33 +218,36 @@ bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
           out_map->fb_type = fb_tag->framebuffer_type;
         }
       }
-      offset = AlignUp(offset + tag->size, 8);
+      offset = AlignUp(offset + tag_size, 8);
     }
   } else if (multiboot_magic == kMultiboot1Magic) {
-    if ((max_physical_addr - info_phys) < sizeof(Multiboot1Info) ||
-        !PagingMapBootstrapRange(info_phys, sizeof(Multiboot1Info))) {
+    constexpr int64_t kInfoSize = sizeof(Multiboot1Info);
+    if ((max_physical_addr - info_phys) < kInfoSize ||
+        !PagingMapBootstrapRange(info_phys, kInfoSize)) {
       return false;
     }
     const Multiboot1Info* const info =
         reinterpret_cast<const Multiboot1Info*>(info_phys);
+    const int64_t mmap_length = info->mmap_length;
     if ((info->flags & kMultiboot1FlagMmap) == 0 || info->mmap_addr == 0 ||
-        info->mmap_length == 0 ||
-        info->mmap_length > kMaxMultibootStructureBytes) {
+        mmap_length <= 0 || mmap_length > kMaxMultibootStructureBytes) {
       return false;
     }
-    const uintptr_t mmap_phys = static_cast<uintptr_t>(info->mmap_addr);
+    const uintptr_t mmap_phys = info->mmap_addr;
     if (mmap_phys >= max_physical_addr ||
-        (max_physical_addr - mmap_phys) < info->mmap_length ||
-        !PagingMapBootstrapRange(mmap_phys, info->mmap_length)) {
+        (max_physical_addr - mmap_phys) < static_cast<uintptr_t>(mmap_length) ||
+        !PagingMapBootstrapRange(mmap_phys, mmap_length)) {
       return false;
     }
     out_map->mb_reserved_start = info_phys;
-    out_map->mb_reserved_end = info_phys + sizeof(Multiboot1Info);
+    out_map->mb_reserved_end = info_phys + kInfoSize;
     out_map->mb1_mmap_reserved_start = mmap_phys;
-    out_map->mb1_mmap_reserved_end = mmap_phys + info->mmap_length;
+    out_map->mb1_mmap_reserved_end = mmap_phys + mmap_length;
 
-    uintptr_t entry_offset = 0;
-    while (entry_offset + sizeof(Multiboot1MmapEntry) <= info->mmap_length) {
+    int64_t entry_offset = 0;
+    constexpr int64_t kMinEntryStructSize = sizeof(Multiboot1MmapEntry);
+    constexpr int64_t kSizeFieldBytes = sizeof(uint32_t);
+    while (entry_offset + kMinEntryStructSize <= mmap_length) {
       const Multiboot1MmapEntry* const entry =
           reinterpret_cast<const Multiboot1MmapEntry*>(mmap_phys +
                                                        entry_offset);
@@ -247,7 +255,7 @@ bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
         break;
       }
       RecordMmapEntry(out_map, entry->addr, entry->len, entry->type);
-      entry_offset += entry->size + sizeof(uint32_t);
+      entry_offset += entry->size + kSizeFieldBytes;
     }
   } else {
     return false;

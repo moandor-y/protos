@@ -34,6 +34,7 @@ TEST_SAN_ENV_tsan := TSAN_OPTIONS=halt_on_error=1
 HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp))
 HOST_TESTS := $(patsubst %.cpp,%,$(HOST_TEST_SRCS))
 TEST_EXTRA_SRCS_heap_test := heap.cpp
+TEST_EXTRA_SRCS_pmm_test := pmm.cpp
 
 BUILD_DIR := build
 
@@ -82,9 +83,14 @@ DOCKER_RUN :=
 DOCKER_DEPS :=
 endif
 
-.PHONY: all clean test test-host test-rbtree test-heap
+.PHONY: all clean test test-host test-rbtree test-heap test-pmm run-boot-test
 
+ifeq ($(IN_DOCKER),)
+all: $(DOCKER_STAMP)
+	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/kernel.iso'
+else
 all: $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/kernel.iso
+endif
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -134,7 +140,7 @@ $(foreach b,$(TEST_BUILD_MODES),$(foreach s,$(TEST_SAN_MODES),$(eval $(call DEFI
 .PHONY: test-$(1)
 ifeq ($(IN_DOCKER),)
 test-$(1): $(DOCKER_STAMP)
-	$$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$$$(nproc) $$(HOST_TEST_BINS_$(1)) && make --no-print-directory $$(HOST_TEST_RUNS_$(1))'
+	$$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$$$(nproc) -Otarget $$(HOST_TEST_RUNS_$(1))'
 else
 test-$(1): $$(HOST_TEST_RUNS_$(1))
 endif
@@ -144,16 +150,24 @@ $(foreach t,$(HOST_TESTS),$(eval $(call DEFINE_HOST_TEST_SUITE,$(t))))
 
 test-rbtree: test-rbtree_test
 test-heap: test-heap_test
+test-pmm: test-pmm_test
 
 ifeq ($(IN_DOCKER),)
 test-host: $(DOCKER_STAMP)
-	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) $(HOST_TEST_ALL_BINS) && make --no-print-directory $(HOST_TEST_ALL_RUNS)'
+	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(HOST_TEST_ALL_RUNS)'
 else
 test-host: $(HOST_TEST_ALL_RUNS)
 endif
 
-test: test-host $(BUILD_DIR)/kernel.iso $(DOCKER_DEPS)
+run-boot-test: $(BUILD_DIR)/kernel.iso $(DOCKER_DEPS)
 	$(DOCKER_RUN) ./test_boot.sh $(BUILD_DIR)/kernel.iso
+
+ifeq ($(IN_DOCKER),)
+test: $(DOCKER_STAMP)
+	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(HOST_TEST_ALL_RUNS) run-boot-test'
+else
+test: $(HOST_TEST_ALL_RUNS) run-boot-test
+endif
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -1,6 +1,5 @@
 #include "vga.h"
 
-#include <cstddef>
 #include <cstdint>
 
 #include "paging.h"
@@ -10,21 +9,21 @@ namespace protos {
 namespace {
 
 constexpr uintptr_t kVgaBufferAddress = 0xB8000;
-constexpr size_t kVgaWidth = 80;
-constexpr size_t kVgaHeight = 25;
+constexpr int kVgaWidth = 80;
+constexpr int kVgaHeight = 25;
 constexpr uint8_t kVgaColorWhiteOnBlack = 0x0F;
-constexpr uint32_t kGlyphWidth = 8;
-constexpr uint32_t kGlyphHeight = 16;
+constexpr int kGlyphWidth = 8;
+constexpr int kGlyphHeight = 16;
 
-size_t g_cursor_row = 0;
-size_t g_cursor_col = 0;
+int g_cursor_row = 0;
+int g_cursor_col = 0;
 char g_text_shadow[kVgaHeight][kVgaWidth];
 
 uintptr_t g_fb_addr = 0;
-uint32_t g_fb_pitch = 0;
-uint32_t g_fb_width = 0;
-uint32_t g_fb_height = 0;
-uint8_t g_fb_bpp = 0;
+int g_fb_pitch = 0;
+int g_fb_width = 0;
+int g_fb_height = 0;
+int g_fb_bpp = 0;
 
 // Compact 8x8 bitmap font for ASCII 0x20..0x7E (each uint64_t packs 8 rows of
 // 8 horizontal pixels, byte 0 on top, bit 0 on the left; rendered at 2x
@@ -127,14 +126,14 @@ constexpr uint64_t kAsciiFont8x8[95] = {
     0x0000003B6E000000ULL,  // '~'
 };
 
-static void RenderCellToFramebuffer(const size_t row,  //
-                                    const size_t col,  //
+static void RenderCellToFramebuffer(const int row,  //
+                                    const int col,  //
                                     const char ch) {
   if (g_fb_addr == 0 || (g_fb_bpp != 32 && g_fb_bpp != 24)) {
     return;
   }
-  const uint32_t base_x = static_cast<uint32_t>(col) * kGlyphWidth;
-  const uint32_t base_y = static_cast<uint32_t>(row) * kGlyphHeight;
+  const int base_x = col * kGlyphWidth;
+  const int base_y = row * kGlyphHeight;
   if (base_x + kGlyphWidth > g_fb_width ||
       base_y + kGlyphHeight > g_fb_height) {
     return;
@@ -146,13 +145,13 @@ static void RenderCellToFramebuffer(const size_t row,  //
 
   volatile uint8_t* const fb_base =
       reinterpret_cast<volatile uint8_t*>(g_fb_addr);
-  const uint32_t bytes_per_pixel = g_fb_bpp / 8;
+  const int bytes_per_pixel = g_fb_bpp / 8;
 
-  for (uint32_t py = 0; py < kGlyphHeight; ++py) {
-    const uint8_t row_bits =
-        static_cast<uint8_t>((glyph >> ((py / 2) * 8)) & 0xFF);
-    volatile uint8_t* const line = fb_base + (base_y + py) * g_fb_pitch;
-    for (uint32_t px = 0; px < kGlyphWidth; ++px) {
+  for (int py = 0; py < kGlyphHeight; ++py) {
+    const uint8_t row_bits = (glyph >> ((py / 2) * 8)) & 0xFF;
+    volatile uint8_t* const line =
+        fb_base + static_cast<int64_t>(base_y + py) * g_fb_pitch;
+    for (int px = 0; px < kGlyphWidth; ++px) {
       const bool lit = (row_bits & (1U << px)) != 0;
       const uint8_t intensity = lit ? 0xFF : 0x00;
       volatile uint8_t* const pixel = line + (base_x + px) * bytes_per_pixel;
@@ -166,7 +165,7 @@ static void RenderCellToFramebuffer(const size_t row,  //
   }
 }
 
-static void WriteCell(const size_t row, const size_t col, const char ch) {
+static void WriteCell(const int row, const int col, const char ch) {
   g_text_shadow[row][col] = ch;
   volatile uint16_t* const vga =
       reinterpret_cast<volatile uint16_t*>(kVgaBufferAddress);
@@ -177,12 +176,12 @@ static void WriteCell(const size_t row, const size_t col, const char ch) {
 }
 
 static void ScrollUpOneRow() {
-  for (size_t r = 0; r + 1 < kVgaHeight; ++r) {
-    for (size_t c = 0; c < kVgaWidth; ++c) {
+  for (int r = 0; r + 1 < kVgaHeight; ++r) {
+    for (int c = 0; c < kVgaWidth; ++c) {
       WriteCell(r, c, g_text_shadow[r + 1][c]);
     }
   }
-  for (size_t c = 0; c < kVgaWidth; ++c) {
+  for (int c = 0; c < kVgaWidth; ++c) {
     WriteCell(kVgaHeight - 1, c, ' ');
   }
 }
@@ -192,8 +191,8 @@ static void ScrollUpOneRow() {
 void VgaClear() {
   g_cursor_row = 0;
   g_cursor_col = 0;
-  for (size_t r = 0; r < kVgaHeight; ++r) {
-    for (size_t c = 0; c < kVgaWidth; ++c) {
+  for (int r = 0; r < kVgaHeight; ++r) {
+    for (int c = 0; c < kVgaWidth; ++c) {
       WriteCell(r, c, ' ');
     }
   }
@@ -229,7 +228,7 @@ void VgaWrite(const char* const str) {
   if (str == nullptr) {
     return;
   }
-  for (size_t i = 0; str[i] != '\0'; ++i) {
+  for (int i = 0; str[i] != '\0'; ++i) {
     VgaPutc(str[i]);
   }
 }
@@ -242,7 +241,7 @@ void VgaWriteHex(const uint64_t value) {
     return;
   }
   char buffer[16];
-  size_t count = 0;
+  int count = 0;
   uint64_t remaining = value;
   while (remaining > 0) {
     buffer[count] = kHexDigits[remaining & 0xF];
@@ -261,10 +260,10 @@ void VgaWriteDec(const uint64_t value) {
     return;
   }
   char buffer[20];
-  size_t count = 0;
+  int count = 0;
   uint64_t remaining = value;
   while (remaining > 0) {
-    buffer[count] = static_cast<char>('0' + (remaining % 10));
+    buffer[count] = '0' + (remaining % 10);
     remaining /= 10;
     ++count;
   }
@@ -275,15 +274,15 @@ void VgaWriteDec(const uint64_t value) {
 }
 
 void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
-                          const uint32_t pitch,          //
-                          const uint32_t width,          //
-                          const uint32_t height,         //
-                          const uint8_t bpp) {
-  if (fb_phys_addr == 0 || pitch == 0 || width < kVgaWidth * kGlyphWidth ||
+                          const int pitch,               //
+                          const int width,               //
+                          const int height,              //
+                          const int bpp) {
+  if (fb_phys_addr == 0 || pitch <= 0 || width < kVgaWidth * kGlyphWidth ||
       height < kVgaHeight * kGlyphHeight || (bpp != 32 && bpp != 24)) {
     return;
   }
-  const size_t fb_bytes = static_cast<size_t>(pitch) * height;
+  const int64_t fb_bytes = static_cast<int64_t>(pitch) * height;
   if (!PagingMapBootstrapRange(fb_phys_addr, fb_bytes)) {
     return;
   }
@@ -293,8 +292,8 @@ void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
   g_fb_height = height;
   g_fb_bpp = bpp;
 
-  for (size_t r = 0; r < kVgaHeight; ++r) {
-    for (size_t c = 0; c < kVgaWidth; ++c) {
+  for (int r = 0; r < kVgaHeight; ++r) {
+    for (int c = 0; c < kVgaWidth; ++c) {
       const char ch = (g_text_shadow[r][c] != '\0') ? g_text_shadow[r][c] : ' ';
       RenderCellToFramebuffer(r, c, ch);
     }

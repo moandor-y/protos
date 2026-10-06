@@ -1,6 +1,5 @@
 #include "paging.h"
 
-#include <cstddef>
 #include <cstdint>
 
 #include "pmm.h"
@@ -9,8 +8,8 @@ namespace protos {
 
 namespace {
 
-constexpr size_t kEntriesPerPageTable = 512;
-constexpr size_t kMaxBootstrapPageTables = 8;
+constexpr int kEntriesPerPageTable = 512;
+constexpr int kMaxBootstrapPageTables = 8;
 constexpr uint64_t kPtePresent = 1 << 0;
 constexpr uint64_t kPteWritable = 1 << 1;
 constexpr uint64_t kPteHugePage = 1 << 7;
@@ -22,7 +21,7 @@ constexpr uint64_t kHugePageAddressMask = 0x000FFFFFFFE00000;
 // GOP framebuffer, or PMM bitmap above 64 MiB) before `PmmInit` completes.
 alignas(4096) uint64_t
     g_bootstrap_page_tables[kMaxBootstrapPageTables][kEntriesPerPageTable];
-size_t g_bootstrap_page_tables_used = 0;
+int g_bootstrap_page_tables_used = 0;
 
 uintptr_t g_identity_mapped_limit = kBootstrapIdentityMapSize;
 
@@ -36,20 +35,21 @@ static constexpr uintptr_t AlignUp(const uintptr_t value,
 static uintptr_t ReadCr3() {
   uint64_t cr3 = 0;
   asm volatile("mov %0, cr3" : "=r"(cr3));
-  return static_cast<uintptr_t>(cr3 & kPteAddressMask);
+  return cr3 & kPteAddressMask;
 }
 
 // Writes `cr3_phys` to CR3, flushing non-global TLB entries.
 static void WriteCr3(const uintptr_t cr3_phys) {
-  const uint64_t value = static_cast<uint64_t>(cr3_phys);
+  const uint64_t value = cr3_phys;
   asm volatile("mov cr3, %0" : : "r"(value) : "memory");
 }
 
-// Allocates a single 4 KiB frame from the PMM (or from the static bootstrap
-// pool if the PMM is not yet initialized) and zeroes all 512 64-bit page
-// table entries. Returns the physical address of the table, or 0 on OOM.
-static uintptr_t AllocZeroedPageTable() {
-  uintptr_t frame_phys = PmmAllocFrame();
+// Allocates a single 4 KiB page-table frame (from the PMM when `use_pmm` is
+// true, falling back to the static bootstrap pool in `.bss` when `use_pmm` is
+// false or the PMM has no free low-memory frames) and zeroes all 512 64-bit
+// page-table entries. Returns the physical address of the table, or 0 on OOM.
+static uintptr_t AllocZeroedPageTable(const bool use_pmm) {
+  uintptr_t frame_phys = use_pmm ? PmmAllocFrame() : 0;
   if (frame_phys == 0) {
     if (g_bootstrap_page_tables_used >= kMaxBootstrapPageTables) {
       return 0;
@@ -59,20 +59,21 @@ static uintptr_t AllocZeroedPageTable() {
     ++g_bootstrap_page_tables_used;
   }
   uint64_t* const entries = reinterpret_cast<uint64_t*>(frame_phys);
-  for (size_t i = 0; i < kEntriesPerPageTable; ++i) {
+  for (int i = 0; i < kEntriesPerPageTable; ++i) {
     entries[i] = 0;
   }
   return frame_phys;
 }
 
-}  // namespace
-
-bool PagingMapBootstrapRange(const uintptr_t phys_addr, const size_t size) {
-  if (size == 0) {
-    return true;
+static bool MapHugePageRange(const uintptr_t phys_addr,  //
+                             const int64_t size,         //
+                             const bool use_pmm) {
+  if (size <= 0) {
+    return size == 0;
   }
   if (phys_addr >= kMaxCanonicalIdentityAddress ||
-      (kMaxCanonicalIdentityAddress - phys_addr) < size) {
+      (kMaxCanonicalIdentityAddress - phys_addr) <
+          static_cast<uintptr_t>(size)) {
     return false;
   }
 
@@ -91,37 +92,34 @@ bool PagingMapBootstrapRange(const uintptr_t phys_addr, const size_t size) {
   bool tlb_flush_needed = false;
 
   for (uintptr_t addr = start_page; addr < end_page; addr += kHugePageSize) {
-    const size_t pml4_idx = (addr >> 39) & 0x1FF;
-    const size_t pdpt_idx = (addr >> 30) & 0x1FF;
-    const size_t pd_idx = (addr >> 21) & 0x1FF;
+    const int pml4_idx = (addr >> 39) & 0x1FF;
+    const int pdpt_idx = (addr >> 30) & 0x1FF;
+    const int pd_idx = (addr >> 21) & 0x1FF;
 
     if ((pml4[pml4_idx] & kPtePresent) == 0) {
-      const uintptr_t new_pdpt_phys = AllocZeroedPageTable();
+      const uintptr_t new_pdpt_phys = AllocZeroedPageTable(use_pmm);
       if (new_pdpt_phys == 0) {
         return false;
       }
-      pml4[pml4_idx] =
-          static_cast<uint64_t>(new_pdpt_phys) | kPtePresent | kPteWritable;
+      pml4[pml4_idx] = new_pdpt_phys | kPtePresent | kPteWritable;
       tlb_flush_needed = true;
     }
 
     uint64_t* const pdpt =
         reinterpret_cast<uint64_t*>(pml4[pml4_idx] & kPteAddressMask);
     if ((pdpt[pdpt_idx] & kPtePresent) == 0) {
-      const uintptr_t new_pd_phys = AllocZeroedPageTable();
+      const uintptr_t new_pd_phys = AllocZeroedPageTable(use_pmm);
       if (new_pd_phys == 0) {
         return false;
       }
-      pdpt[pdpt_idx] =
-          static_cast<uint64_t>(new_pd_phys) | kPtePresent | kPteWritable;
+      pdpt[pdpt_idx] = new_pd_phys | kPtePresent | kPteWritable;
       tlb_flush_needed = true;
     }
 
     uint64_t* const pd =
         reinterpret_cast<uint64_t*>(pdpt[pdpt_idx] & kPteAddressMask);
     if ((pd[pd_idx] & kPtePresent) == 0) {
-      pd[pd_idx] = static_cast<uint64_t>(addr) | kPtePresent | kPteWritable |
-                   kPteHugePage;
+      pd[pd_idx] = addr | kPtePresent | kPteWritable | kPteHugePage;
       tlb_flush_needed = true;
     }
   }
@@ -132,6 +130,12 @@ bool PagingMapBootstrapRange(const uintptr_t phys_addr, const size_t size) {
   return true;
 }
 
+}  // namespace
+
+bool PagingMapBootstrapRange(const uintptr_t phys_addr, const int64_t size) {
+  return MapHugePageRange(phys_addr, size, false);
+}
+
 bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
   if (max_physical_addr == 0 ||
       max_physical_addr > kMaxCanonicalIdentityAddress - kHugePageSize) {
@@ -139,7 +143,7 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
   }
 
   const uintptr_t target_end = AlignUp(max_physical_addr, kHugePageSize);
-  if (!PagingMapBootstrapRange(0, target_end)) {
+  if (!MapHugePageRange(0, target_end, true)) {
     return false;
   }
   if (target_end > g_identity_mapped_limit) {
@@ -161,9 +165,9 @@ bool PagingIsIdentityMapped(const uintptr_t addr) {
 
   // Extract the 9-bit page table indices for PML4 (bits 47:39), PDPT (bits
   // 38:30), and PD (bits 29:21) from the virtual address.
-  const size_t pml4_idx = (addr >> 39) & 0x1FF;
-  const size_t pdpt_idx = (addr >> 30) & 0x1FF;
-  const size_t pd_idx = (addr >> 21) & 0x1FF;
+  const int pml4_idx = (addr >> 39) & 0x1FF;
+  const int pdpt_idx = (addr >> 30) & 0x1FF;
+  const int pd_idx = (addr >> 21) & 0x1FF;
 
   // Check that the PML4 entry is present and writable.
   const uint64_t* const pml4 = reinterpret_cast<const uint64_t*>(pml4_phys);
@@ -197,8 +201,7 @@ bool PagingIsIdentityMapped(const uintptr_t addr) {
   // Confirm identity mapping by checking that the physical 2 MiB huge-page
   // base address encoded in the PD entry matches the 2 MiB-aligned virtual
   // address.
-  const uintptr_t mapped_base =
-      static_cast<uintptr_t>(pde & kHugePageAddressMask);
+  const uintptr_t mapped_base = pde & kHugePageAddressMask;
   const uintptr_t expected_base = addr & ~(kHugePageSize - 1);
   return mapped_base == expected_base;
 }

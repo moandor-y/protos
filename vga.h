@@ -27,10 +27,10 @@ void VgaWriteDec(uint64_t value);
 // GOP on pure-UEFI machines without legacy 0xB8000 VGA text mode) and renders
 // the current 80x25 text buffer onto it.
 void VgaAttachFramebuffer(uintptr_t fb_phys_addr,  //
-                          uint32_t pitch,          //
-                          uint32_t width,          //
-                          uint32_t height,         //
-                          uint8_t bpp);
+                          int pitch,               //
+                          int width,               //
+                          int height,              //
+                          int bpp);
 
 }  // namespace protos
 

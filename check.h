@@ -19,14 +19,15 @@ namespace internal {
                                       const int line) {
 #if __STDC_HOSTED__
   std::fprintf(stderr, "[FATAL] Check failed: %s at %s:%d\n", expr, file, line);
-  std::abort();
+  std::fflush(stderr);
+  std::_Exit(134);
 #else
   UartWrite("[FATAL] Check failed: ");
   UartWrite(expr);
   UartWrite(" at ");
   UartWrite(file);
   UartWrite(":");
-  UartWriteDec(static_cast<uint64_t>(line));
+  UartWriteDec(line);
   UartWrite("\n");
 
   VgaWrite("[FATAL] Check failed: ");
@@ -34,7 +35,7 @@ namespace internal {
   VgaWrite(" at ");
   VgaWrite(file);
   VgaWrite(":");
-  VgaWriteDec(static_cast<uint64_t>(line));
+  VgaWriteDec(line);
   VgaWrite("\n");
 
   for (;;) {

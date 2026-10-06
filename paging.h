@@ -1,7 +1,6 @@
 #ifndef PROTOS_PAGING_H_
 #define PROTOS_PAGING_H_
 
-#include <cstddef>
 #include <cstdint>
 
 namespace protos {
@@ -15,9 +14,10 @@ constexpr uintptr_t kBootstrapIdentityMapSize = 0x04000000;
 constexpr uintptr_t kMaxCanonicalIdentityAddress = 0x0000800000000000ULL;
 
 // Identity-maps all 2 MiB huge pages overlapping `[phys_addr, phys_addr +
-// size)`, falling back to a pre-reserved bootstrap page-table pool if the PMM
-// is not yet initialized. Does not advance `PagingIdentityMappedLimit()`.
-bool PagingMapBootstrapRange(uintptr_t phys_addr, size_t size);
+// size)` using the pre-reserved bootstrap page-table pool in `.bss` (safe to
+// call before `PmmInit` completes). Does not advance
+// `PagingIdentityMappedLimit()`.
+bool PagingMapBootstrapRange(uintptr_t phys_addr, int64_t size);
 
 // Extends the active 4-level identity mapping (`virtual_addr == physical_addr`)
 // from `0` up to `max_physical_addr` (rounded up to `kHugePageSize`),

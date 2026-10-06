@@ -3,7 +3,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -15,22 +14,22 @@ namespace {
 
 namespace t = ::testing;
 
-constexpr size_t kInitialHeapFrames = 256;
-constexpr size_t kMinExpandFrames = 16;
-constexpr size_t kFakeRamFrames = 4096;  // 16 MiB
-constexpr size_t kFakeRamBytes = kFakeRamFrames * kPageSize;
+constexpr int64_t kInitialHeapFrames = 256;
+constexpr int64_t kMinExpandFrames = 16;
+constexpr int64_t kFakeRamFrames = 4096;  // 16 MiB
+constexpr int64_t kFakeRamBytes = kFakeRamFrames * kPageSize;
 
 alignas(kPageSize) uint8_t g_fake_ram[kFakeRamBytes];
 
 struct FakePmmState {
-  size_t next_frame = 0;
-  size_t limit_frame = kFakeRamFrames;
-  size_t gap_frames = 0;
+  int64_t next_frame = 0;
+  int64_t limit_frame = kFakeRamFrames;
+  int64_t gap_frames = 0;
   bool force_oom = false;
   uintptr_t max_phys_override = 0;
-  std::vector<size_t> scripted_start_frames;
+  std::vector<int64_t> scripted_start_frames;
   int alloc_call_count = 0;
-  std::vector<size_t> requested_counts;
+  std::vector<int64_t> requested_counts;
 };
 
 FakePmmState g_pmm;
@@ -39,11 +38,11 @@ static uintptr_t FakeRamBase() {
   return reinterpret_cast<uintptr_t>(g_fake_ram);
 }
 
-static void ResetFakePmm(const size_t zero_frames = 512) {
+static void ResetFakePmm(const int64_t zero_frames = 512) {
   g_pmm = FakePmmState{};
-  const size_t bytes_to_zero = (zero_frames <= kFakeRamFrames)
-                                   ? (zero_frames * kPageSize)
-                                   : kFakeRamBytes;
+  const int64_t bytes_to_zero = (zero_frames <= kFakeRamFrames)
+                                    ? (zero_frames * kPageSize)
+                                    : kFakeRamBytes;
   std::memset(g_fake_ram, 0, bytes_to_zero);
 }
 
@@ -56,24 +55,24 @@ uintptr_t PmmMaxPhysicalAddress() {
   return FakeRamBase() + kFakeRamBytes;
 }
 
-uintptr_t PmmAllocFrames(const size_t count) {
+uintptr_t PmmAllocFrames(const int64_t count) {
   ++g_pmm.alloc_call_count;
   g_pmm.requested_counts.push_back(count);
-  if (g_pmm.force_oom || count == 0) {
+  if (g_pmm.force_oom || count <= 0) {
     return 0;
   }
   if (!g_pmm.scripted_start_frames.empty()) {
-    const size_t start_frame = g_pmm.scripted_start_frames.front();
-    if (start_frame > g_pmm.limit_frame ||
+    const int64_t start_frame = g_pmm.scripted_start_frames.front();
+    if (start_frame < 0 || start_frame > g_pmm.limit_frame ||
         count > g_pmm.limit_frame - start_frame) {
       return 0;
     }
     g_pmm.scripted_start_frames.erase(g_pmm.scripted_start_frames.begin());
     return FakeRamBase() + start_frame * kPageSize;
   }
-  const size_t start_frame =
+  const int64_t start_frame =
       (g_pmm.next_frame == 0) ? 0 : (g_pmm.next_frame + g_pmm.gap_frames);
-  if (start_frame > g_pmm.limit_frame ||
+  if (start_frame < 0 || start_frame > g_pmm.limit_frame ||
       count > g_pmm.limit_frame - start_frame) {
     return 0;
   }
@@ -90,8 +89,8 @@ TEST(HeapTest, InitZeroSizeAndAlignment) {
   EXPECT_THAT(g_pmm.alloc_call_count, t::Eq(1));
   ASSERT_THAT(g_pmm.requested_counts, t::ElementsAre(kInitialHeapFrames));
 
-  const size_t initial_free = HeapTotalFreeBytes();
-  const size_t header_size = kInitialHeapFrames * kPageSize - initial_free;
+  const int64_t initial_free = HeapTotalFreeBytes();
+  const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
   EXPECT_THAT(header_size, t::Eq(64));
   EXPECT_THAT(header_size % kHeapAlignment, t::Eq(0));
 
@@ -106,19 +105,18 @@ TEST(HeapTest, InitZeroSizeAndAlignment) {
 
   // Verify varied allocation sizes, 16-byte alignment, payload isolation, and
   // full free-byte restoration.
-  constexpr size_t kSizes[] = {1,  7,  15, 16,  17,  31,   32,
-                               33, 48, 64, 127, 256, 1024, 4096};
-  constexpr int kNumSizes =
-      static_cast<int>(sizeof(kSizes) / sizeof(kSizes[0]));
+  constexpr int64_t kSizes[] = {1,  7,  15, 16,  17,  31,   32,
+                                33, 48, 64, 127, 256, 1024, 4096};
+  constexpr int kNumSizes = sizeof(kSizes) / sizeof(kSizes[0]);
   uint8_t* ptrs[kNumSizes];
 
   for (int i = 0; i < kNumSizes; ++i) {
-    const size_t req_size = kSizes[i];
+    const int64_t req_size = kSizes[i];
     ptrs[i] = static_cast<uint8_t*>(Kmalloc(req_size));
     ASSERT_THAT(ptrs[i], t::NotNull());
     const uintptr_t addr = reinterpret_cast<uintptr_t>(ptrs[i]);
     EXPECT_THAT(addr & (kHeapAlignment - 1), t::Eq(0));
-    std::memset(ptrs[i], static_cast<int>((i + 1) * 19), req_size);
+    std::memset(ptrs[i], (i + 1) * 19, req_size);
   }
 
   for (int i = 0; i < kNumSizes; ++i) {
@@ -129,8 +127,8 @@ TEST(HeapTest, InitZeroSizeAndAlignment) {
       const uintptr_t end_j = start_j + kSizes[j];
       EXPECT_TRUE(end_i <= start_j || end_j <= start_i);
     }
-    const uint8_t expected_byte = static_cast<uint8_t>((i + 1) * 19);
-    for (size_t b = 0; b < kSizes[i]; ++b) {
+    const uint8_t expected_byte = (i + 1) * 19;
+    for (int64_t b = 0; b < kSizes[i]; ++b) {
       ASSERT_THAT(ptrs[i][b], t::Eq(expected_byte));
     }
   }
@@ -144,17 +142,17 @@ TEST(HeapTest, InitZeroSizeAndAlignment) {
 TEST(HeapTest, BlockSplittingThresholds) {
   ResetFakePmm();
   ASSERT_TRUE(HeapInit());
-  const size_t initial_free = HeapTotalFreeBytes();
-  const size_t header_size = kInitialHeapFrames * kPageSize - initial_free;
+  const int64_t initial_free = HeapTotalFreeBytes();
+  const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
 
-  constexpr size_t kTargetBlockSize = 256;
+  constexpr int64_t kTargetBlockSize = 256;
   void* const front_block = Kmalloc(kTargetBlockSize);
   void* const barrier = Kmalloc(64);
   ASSERT_THAT(front_block, t::NotNull());
   ASSERT_THAT(barrier, t::NotNull());
 
   Kfree(front_block);
-  const size_t free_with_hole = HeapTotalFreeBytes();
+  const int64_t free_with_hole = HeapTotalFreeBytes();
 
   // Exact fit (256 bytes) does not split.
   void* const exact_fit = Kmalloc(kTargetBlockSize);
@@ -166,7 +164,7 @@ TEST(HeapTest, BlockSplittingThresholds) {
   // Remainder is `header_size` (64 bytes), which is 16 bytes below the minimum
   // split threshold (`header_size + kHeapAlignment = 80` bytes). Must NOT
   // split; the full 256-byte block is consumed and later restored.
-  const size_t no_split_req = kTargetBlockSize - header_size;
+  const int64_t no_split_req = kTargetBlockSize - header_size;
   void* const unsplit = Kmalloc(no_split_req);
   EXPECT_THAT(unsplit, t::Eq(front_block));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_with_hole - kTargetBlockSize));
@@ -175,7 +173,7 @@ TEST(HeapTest, BlockSplittingThresholds) {
 
   // Remainder is exactly `header_size + kHeapAlignment` (80 bytes). Must split
   // into `exact_split_req` (176 bytes) + a new 16-byte free block.
-  const size_t exact_split_req =
+  const int64_t exact_split_req =
       kTargetBlockSize - header_size - kHeapAlignment;
   void* const split_head = Kmalloc(exact_split_req);
   EXPECT_THAT(split_head, t::Eq(front_block));
@@ -200,8 +198,8 @@ TEST(HeapTest, BlockSplittingThresholds) {
 TEST(HeapTest, AddressOrderedFirstFitSelectionViaFindFirstAugmented) {
   ResetFakePmm();
   ASSERT_TRUE(HeapInit());
-  const size_t initial_free = HeapTotalFreeBytes();
-  const size_t header_size = kInitialHeapFrames * kPageSize - initial_free;
+  const int64_t initial_free = HeapTotalFreeBytes();
+  const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
 
   // Create 4 free holes at ascending addresses:
   //   h0 (32B) < h1 (128B) < h2 (512B) < h3 (128B)
@@ -269,8 +267,8 @@ TEST(HeapTest, AddressOrderedFirstFitSelectionViaFindFirstAugmented) {
 TEST(HeapTest, CoalescingForwardBackwardAndThreeWay) {
   ResetFakePmm();
   ASSERT_TRUE(HeapInit());
-  const size_t initial_free = HeapTotalFreeBytes();
-  const size_t header_size = kInitialHeapFrames * kPageSize - initial_free;
+  const int64_t initial_free = HeapTotalFreeBytes();
+  const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
 
   void* a = Kmalloc(64);
   void* b = Kmalloc(128);
@@ -280,14 +278,14 @@ TEST(HeapTest, CoalescingForwardBackwardAndThreeWay) {
   ASSERT_THAT(b, t::NotNull());
   ASSERT_THAT(c, t::NotNull());
   ASSERT_THAT(d, t::NotNull());
-  const size_t free_after_abcd = HeapTotalFreeBytes();
+  const int64_t free_after_abcd = HeapTotalFreeBytes();
 
   // Backward coalescing: free `a` first, then free `b` -> `b` merges into
   // predecessor `a`, reclaiming `b`'s header.
   Kfree(a);
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_after_abcd + 64));
   Kfree(b);
-  const size_t merged_ab_size = 64 + 128 + header_size;
+  const int64_t merged_ab_size = 64 + 128 + header_size;
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_after_abcd + merged_ab_size));
 
   // Absorbed header magic at `b` must be cleared to 0.
@@ -333,7 +331,7 @@ TEST(HeapTest, CoalescingForwardBackwardAndThreeWay) {
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_after_abcd + 64 + 256));
 
   Kfree(b);
-  const size_t merged_abc_size = 64 + 128 + 256 + 2 * header_size;
+  const int64_t merged_abc_size = 64 + 128 + 256 + 2 * header_size;
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_after_abcd + merged_abc_size));
 
   const uint32_t* const c_magic_ptr = reinterpret_cast<const uint32_t*>(
@@ -358,8 +356,8 @@ TEST(HeapTest, MultiArenaExpansionContiguousAndNonContiguousIsolation) {
   g_pmm.gap_frames = 1;
   ASSERT_TRUE(HeapInit());
 
-  const size_t arena1_payload = HeapTotalFreeBytes();
-  const size_t header_size = kInitialHeapFrames * kPageSize - arena1_payload;
+  const int64_t arena1_payload = HeapTotalFreeBytes();
+  const int64_t header_size = kInitialHeapFrames * kPageSize - arena1_payload;
 
   void* const full_arena1 = Kmalloc(arena1_payload);
   ASSERT_THAT(full_arena1, t::NotNull());
@@ -378,7 +376,7 @@ TEST(HeapTest, MultiArenaExpansionContiguousAndNonContiguousIsolation) {
   Kfree(full_arena1);
   Kfree(arena2_alloc);
 
-  const size_t arena2_payload = kMinExpandFrames * kPageSize - header_size;
+  const int64_t arena2_payload = kMinExpandFrames * kPageSize - header_size;
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(arena1_payload + arena2_payload));
 
   // Because of the 1-frame gap, Arena 1 and Arena 2 must NOT have coalesced.
@@ -450,7 +448,7 @@ TEST(HeapTest, MultiArenaExpansionContiguousAndNonContiguousIsolation) {
   Kfree(cross_arena);
 }
 
-TEST(HeapTest, OomAndInvalidOrDoubleFreeResilience) {
+TEST(HeapTest, OomAndNullFreeResilience) {
   // OOM during HeapInit().
   ResetFakePmm();
   g_pmm.force_oom = true;
@@ -464,11 +462,11 @@ TEST(HeapTest, OomAndInvalidOrDoubleFreeResilience) {
   ASSERT_THAT(recovered, t::NotNull());
   Kfree(recovered);
 
-  const size_t initial_free = HeapTotalFreeBytes();
-  const size_t header_size = kInitialHeapFrames * kPageSize - initial_free;
+  const int64_t initial_free = HeapTotalFreeBytes();
+  const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
 
-  // Overflow / out-of-bounds Kmalloc sizes and PMM exhaustion.
-  EXPECT_THAT(Kmalloc(static_cast<size_t>(-1)), t::IsNull());
+  // Overflow and out-of-bounds Kmalloc sizes and PMM exhaustion.
+  EXPECT_THAT(Kmalloc(INT64_MAX), t::IsNull());
   EXPECT_THAT(Kmalloc(PmmMaxPhysicalAddress()), t::IsNull());
   EXPECT_THAT(Kmalloc(PmmMaxPhysicalAddress() - header_size), t::IsNull());
 
@@ -477,74 +475,66 @@ TEST(HeapTest, OomAndInvalidOrDoubleFreeResilience) {
   g_pmm.force_oom = false;
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
 
-  // Kfree resilience against invalid pointers and double frees.
+  // Kfree(nullptr) is a safe no-op.
+  uint8_t* const a = static_cast<uint8_t*>(Kmalloc(128));
+  ASSERT_THAT(a, t::NotNull());
+  const int64_t free_baseline = HeapTotalFreeBytes();
+  Kfree(nullptr);
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_baseline));
+  Kfree(a);
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
+}
+
+TEST(HeapDeathTest, InvalidOrDoubleFreeTriggersDcheck) {
+  ResetFakePmm();
+  ASSERT_TRUE(HeapInit());
+
   uint8_t* const a = static_cast<uint8_t*>(Kmalloc(128));
   uint8_t* const b = static_cast<uint8_t*>(Kmalloc(128));
-  uint8_t* const c = static_cast<uint8_t*>(Kmalloc(128));
   ASSERT_THAT(a, t::NotNull());
   ASSERT_THAT(b, t::NotNull());
-  ASSERT_THAT(c, t::NotNull());
   std::memset(a, 0, 128);
 
-  const size_t free_baseline = HeapTotalFreeBytes();
+  // Negative Kmalloc size triggers DCHECK.
+  EXPECT_DEATH(Kmalloc(-1), "Check failed");
 
-  // nullptr
-  Kfree(nullptr);
-  // Below kLowerMemoryLimit + sizeof(HeapBlockHeader)
-  Kfree(reinterpret_cast<void*>(kLowerMemoryLimit));
-  // >= PmmMaxPhysicalAddress()
-  Kfree(reinterpret_cast<void*>(PmmMaxPhysicalAddress()));
-  Kfree(reinterpret_cast<void*>(PmmMaxPhysicalAddress() + kPageSize));
-  // Misaligned pointers
-  Kfree(a + 1);
-  Kfree(a + 7);
-  Kfree(a + 8);
-  Kfree(a + 15);
-  // 16-byte-aligned interior pointer with zeroed magic
-  Kfree(a + 64);
+  // Out-of-bounds and misaligned pointers trigger DCHECK in Kfree.
+  EXPECT_DEATH(Kfree(reinterpret_cast<void*>(kLowerMemoryLimit)),
+               "Check failed");
+  EXPECT_DEATH(Kfree(reinterpret_cast<void*>(PmmMaxPhysicalAddress())),
+               "Check failed");
+  EXPECT_DEATH(Kfree(a + 1), "Check failed");
+  EXPECT_DEATH(Kfree(a + 64), "Check failed");
 
-  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_baseline));
-
-  // Double-free of a standalone free block in g_free_tree (`is_free == 1`).
+  // Double-free of a standalone free block triggers DCHECK (`is_free == 0`).
   Kfree(b);
-  const size_t free_after_b = HeapTotalFreeBytes();
-  EXPECT_THAT(free_after_b, t::Eq(free_baseline + 128));
-  Kfree(b);
-  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_after_b));
+  EXPECT_DEATH(Kfree(b), "Check failed");
 
-  // Double-free of a coalesced/absorbed block (`magic == 0`).
+  // Double-free of an absorbed/coalesced block triggers DCHECK
+  // (`magic == kHeapBlockMagic`).
   Kfree(a);
-  const size_t free_after_ab = HeapTotalFreeBytes();
-  EXPECT_THAT(free_after_ab, t::Eq(free_baseline + 256 + header_size));
-  Kfree(b);
-  Kfree(a);
-  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_after_ab));
-
-  Kfree(c);
-  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
+  EXPECT_DEATH(Kfree(b), "Check failed");
 }
 
 TEST(HeapTest, HighFragmentationStressAndFullCoalescence) {
   ResetFakePmm(kFakeRamFrames);
   ASSERT_TRUE(HeapInit());
-  const size_t initial_free = HeapTotalFreeBytes();
+  const int64_t initial_free = HeapTotalFreeBytes();
 
   constexpr int kNumBlocks = 512;
   uint8_t* targets[kNumBlocks];
   uint8_t* barriers[kNumBlocks];
-  size_t target_sizes[kNumBlocks];
+  int64_t target_sizes[kNumBlocks];
 
   for (int i = 0; i < kNumBlocks; ++i) {
-    target_sizes[i] = static_cast<size_t>(((i % 16) + 1) * kHeapAlignment);
+    target_sizes[i] = ((i % 16) + 1) * kHeapAlignment;
     targets[i] = static_cast<uint8_t*>(Kmalloc(target_sizes[i]));
     barriers[i] = static_cast<uint8_t*>(Kmalloc(kHeapAlignment));
     ASSERT_THAT(targets[i], t::NotNull());
     ASSERT_THAT(barriers[i], t::NotNull());
 
-    std::memset(targets[i], static_cast<int>((i + 3) & 0xFF), target_sizes[i]);
-    std::memset(barriers[i],                          //
-                static_cast<int>((i ^ 0x5A) & 0xFF),  //
-                kHeapAlignment);
+    std::memset(targets[i], (i + 3) & 0xFF, target_sizes[i]);
+    std::memset(barriers[i], (i ^ 0x5A) & 0xFF, kHeapAlignment);
   }
 
   // Free all 512 target blocks in pseudo-random order (gcd(73, 512) == 1)
@@ -573,8 +563,8 @@ TEST(HeapTest, HighFragmentationStressAndFullCoalescence) {
   // rounds, then free all barriers in pseudo-random order.
   for (int step = 0; step < kNumBlocks; ++step) {
     const int idx = (step * 83 + 11) & (kNumBlocks - 1);
-    const uint8_t expected = static_cast<uint8_t>((idx ^ 0x5A) & 0xFF);
-    for (size_t b = 0; b < kHeapAlignment; ++b) {
+    const uint8_t expected = (idx ^ 0x5A) & 0xFF;
+    for (int64_t b = 0; b < kHeapAlignment; ++b) {
       ASSERT_THAT(barriers[idx][b], t::Eq(expected));
     }
     Kfree(barriers[idx]);

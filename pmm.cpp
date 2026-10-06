@@ -1,10 +1,11 @@
 #include "pmm.h"
 
-#include <cstddef>
 #include <cstdint>
 
+#include "check.h"
 #include "multiboot.h"
 #include "paging.h"
+#include "rbtree.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -17,223 +18,327 @@ namespace protos {
 
 namespace {
 
-constexpr size_t kBitmapWordBits = 64;
+// Intrusive node stored at the start of the first 4 KiB frame of each
+// contiguous free physical frame run:
+//
+//   +-------------------+------------------------------------+
+//   | FreeRunNode       | Remaining bytes of free run        |
+//   | (48 bytes)        | (`frame_count * kPageSize - 48`)   |
+//   +-------------------+------------------------------------+
+//   ^
+//   run base physical address (4 KiB page-aligned)
+//
+// Free runs are stored in an address-ordered Red-Black Tree (`g_free_run_tree`)
+// augmented with `max_subtree_frames` (the largest `frame_count` in the node's
+// subtree) to support O(log R) lowest-address first-fit allocation and O(log R)
+// neighbor lookup for immediate physical coalescing.
+struct FreeRunNode {
+  int64_t frame_count;
+  int64_t max_subtree_frames;
+  RbNode rb_node;
+};
 
-// Dynamically placed bitmap where bit `frame_idx % 64` of
-// `g_pmm_bitmap[frame_idx / 64]` is:
-//   1 -> frame is USED / RESERVED
-//   0 -> frame is FREE
-uint64_t* g_pmm_bitmap = nullptr;
-uintptr_t g_bitmap_phys_start = 0;
-uintptr_t g_bitmap_phys_end = 0;
+static_assert(sizeof(FreeRunNode) <= kPageSize);
+
+struct FreeRunRbTraits {
+  static uintptr_t GetKey(const FreeRunNode& node) {
+    return reinterpret_cast<uintptr_t>(&node);
+  }
+
+  static bool Less(const uintptr_t a, const uintptr_t b) { return a < b; }
+
+  static void UpdateAugment(FreeRunNode* const node,
+                            const FreeRunNode* const left,
+                            const FreeRunNode* const right) {
+    int64_t max_frames = node->frame_count;
+    if (left != nullptr && left->max_subtree_frames > max_frames) {
+      max_frames = left->max_subtree_frames;
+    }
+    if (right != nullptr && right->max_subtree_frames > max_frames) {
+      max_frames = right->max_subtree_frames;
+    }
+    node->max_subtree_frames = max_frames;
+  }
+};
+
+using FreeRunTree = RbTree<FreeRunNode, &FreeRunNode::rb_node, FreeRunRbTraits>;
+
+struct PhysInterval {
+  uintptr_t start;
+  uintptr_t end;
+};
+
+// Maximum number of disjoint usable physical intervals after carving out
+// non-available regions, lower memory, the kernel image, Multiboot structures,
+// and the framebuffer from at most `kMaxMemoryRegions` entries.
+constexpr int kMaxUsableIntervals = kMaxMemoryRegions * 2 + 16;
+
+// Intrusive Red-Black Tree containing all currently FREE contiguous physical
+// frame runs across usable RAM, keyed by each run's base physical address
+// (`uintptr_t`, where the `FreeRunNode` is stored in the run's first 4 KiB
+// frame) and augmented with `max_subtree_frames` (the maximum `frame_count`
+// among all free runs in the node's subtree). Allocated frame ranges are
+// removed (or split off) from this tree and re-inserted (and coalesced with
+// adjacent free runs) when freed.
+FreeRunTree g_free_run_tree;
+PhysInterval g_usable_intervals[kMaxUsableIntervals];
+int g_usable_interval_count = 0;
 uintptr_t g_max_managed_phys_addr = 0;
-size_t g_max_frames = 0;
-size_t g_bitmap_words = 0;
-size_t g_pmm_free_frames = 0;
-size_t g_pmm_total_usable_frames = 0;
+int64_t g_max_frames = 0;
+int64_t g_pmm_free_frames = 0;
+int64_t g_pmm_total_usable_frames = 0;
+bool g_pmm_initialized = false;
 MultibootMemoryMap g_memory_map = {};
 
 // Rounds `value` up to the nearest multiple of `alignment` (power of two).
 static constexpr uintptr_t AlignUp(const uintptr_t value,
-                                   const uintptr_t alignment) {
-  return (value + alignment - 1) & ~(alignment - 1);
+                                   const int64_t alignment) {
+  const uintptr_t align = alignment;
+  return (value + align - 1) & ~(align - 1);
 }
 
 // Rounds `value` down to the nearest multiple of `alignment` (power of two).
 static constexpr uintptr_t AlignDown(const uintptr_t value,
-                                     const uintptr_t alignment) {
-  return value & ~(alignment - 1);
+                                     const int64_t alignment) {
+  const uintptr_t align = alignment;
+  return value & ~(align - 1);
 }
 
-static bool PmmIsFrameUsed(const size_t frame_idx) {
-  if (g_pmm_bitmap == nullptr || frame_idx >= g_max_frames) {
-    return true;
+static uintptr_t KernelStartAddr() {
+  return reinterpret_cast<uintptr_t>(g_kernel_start);
+}
+
+static uintptr_t KernelEndAddr() {
+  return reinterpret_cast<uintptr_t>(g_kernel_end);
+}
+
+static void ResetPmmState() {
+  g_free_run_tree.Clear();
+  g_usable_interval_count = 0;
+  g_max_managed_phys_addr = 0;
+  g_max_frames = 0;
+  g_pmm_free_frames = 0;
+  g_pmm_total_usable_frames = 0;
+  g_pmm_initialized = false;
+}
+
+static uintptr_t RunBaseAddress(const FreeRunNode* const node) {
+  DCHECK(node != nullptr);
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(node);
+  DCHECK((addr & (kPageSize - 1)) == 0);
+  return addr;
+}
+
+static uintptr_t RunEndAddress(const FreeRunNode* const node) {
+  DCHECK(node != nullptr);
+  DCHECK(node->frame_count > 0);
+  const uintptr_t base_addr = RunBaseAddress(node);
+  DCHECK(static_cast<uintptr_t>(node->frame_count) <=
+         (UINTPTR_MAX - base_addr) / kPageSize);
+  return base_addr + node->frame_count * kPageSize;
+}
+
+static bool FreeRunsAreAdjacent(const FreeRunNode* const first,
+                                const FreeRunNode* const second) {
+  DCHECK(first != nullptr);
+  DCHECK(second != nullptr);
+  return RunEndAddress(first) == RunBaseAddress(second);
+}
+
+static FreeRunNode* FreeRunTreeInsert(const uintptr_t base_addr,
+                                      const int64_t frame_count) {
+  DCHECK(base_addr >= kLowerMemoryLimit);
+  DCHECK((base_addr & (kPageSize - 1)) == 0);
+  DCHECK(frame_count > 0);
+  DCHECK(base_addr < g_max_managed_phys_addr);
+  DCHECK(static_cast<uintptr_t>(frame_count) <=
+         (g_max_managed_phys_addr - base_addr) / kPageSize);
+
+  FreeRunNode* const node = reinterpret_cast<FreeRunNode*>(base_addr);
+  node->frame_count = frame_count;
+  node->max_subtree_frames = frame_count;
+  node->rb_node = {};
+
+  const bool inserted = g_free_run_tree.Insert(node);
+  DCHECK(inserted);
+  g_pmm_free_frames += frame_count;
+  return node;
+}
+
+static void FreeRunTreeRemove(FreeRunNode* const node) {
+  DCHECK(node != nullptr);
+  DCHECK(node->frame_count > 0);
+  DCHECK(g_pmm_free_frames >= node->frame_count);
+
+  const int64_t count = node->frame_count;
+  g_free_run_tree.Erase(node);
+  node->frame_count = 0;
+  node->max_subtree_frames = 0;
+  node->rb_node = {};
+  g_pmm_free_frames -= count;
+}
+
+// Inserts a validated free run `[base_addr, base_addr + frame_count *
+// kPageSize)` into `g_free_run_tree` and immediately merges it in O(log R) time
+// with its in-order predecessor (`Prev`) and/or successor (`Next`) if they are
+// physically contiguous.
+static FreeRunNode* PmmCoalesceFreeRun(const uintptr_t base_addr,
+                                       const int64_t frame_count) {
+  DCHECK(base_addr >= kLowerMemoryLimit);
+  DCHECK((base_addr & (kPageSize - 1)) == 0);
+  DCHECK(frame_count > 0);
+  DCHECK(base_addr < g_max_managed_phys_addr);
+  DCHECK(static_cast<uintptr_t>(frame_count) <=
+         (g_max_managed_phys_addr - base_addr) / kPageSize);
+
+  const uintptr_t end_addr = base_addr + frame_count * kPageSize;
+  const FreeRunNode* const next_check = g_free_run_tree.LowerBound(base_addr);
+  const FreeRunNode* const prev_check = (next_check != nullptr)
+                                            ? FreeRunTree::Prev(next_check)
+                                            : g_free_run_tree.Last();
+  DCHECK(prev_check == nullptr || RunEndAddress(prev_check) <= base_addr);
+  DCHECK(next_check == nullptr || RunBaseAddress(next_check) >= end_addr);
+
+  FreeRunNode* run = FreeRunTreeInsert(base_addr, frame_count);
+
+  FreeRunNode* const next_run = FreeRunTree::Next(run);
+  FreeRunNode* const prev_run = FreeRunTree::Prev(run);
+
+  if (next_run != nullptr && FreeRunsAreAdjacent(run, next_run)) {
+    const int64_t next_frames = next_run->frame_count;
+    FreeRunTreeRemove(next_run);
+    run->frame_count += next_frames;
+    g_pmm_free_frames += next_frames;
+    g_free_run_tree.PropagateAugment(run);
   }
-  const size_t word_idx = frame_idx / kBitmapWordBits;
-  const size_t bit_idx = frame_idx % kBitmapWordBits;
-  return (g_pmm_bitmap[word_idx] & (1ULL << bit_idx)) != 0;
+
+  if (prev_run != nullptr && FreeRunsAreAdjacent(prev_run, run)) {
+    const int64_t run_frames = run->frame_count;
+    FreeRunTreeRemove(run);
+    prev_run->frame_count += run_frames;
+    g_pmm_free_frames += run_frames;
+    g_free_run_tree.PropagateAugment(prev_run);
+    run = prev_run;
+  }
+
+  return run;
 }
 
-static void PmmMarkFrameUsed(const size_t frame_idx) {
-  if (g_pmm_bitmap == nullptr || frame_idx >= g_max_frames) {
+// Adds the interior page-aligned range of `[base, base + length)` above
+// `kLowerMemoryLimit` into `g_usable_intervals`, keeping the table sorted and
+// merging overlapping or contiguous intervals.
+static void AddAvailableRegion(const uintptr_t base, const int64_t length) {
+  if (length < kPageSize || base >= kMaxCanonicalIdentityAddress) {
     return;
   }
-  const size_t word_idx = frame_idx / kBitmapWordBits;
-  const size_t bit_idx = frame_idx % kBitmapWordBits;
-  const uint64_t mask = 1ULL << bit_idx;
-  if ((g_pmm_bitmap[word_idx] & mask) == 0) {
-    g_pmm_bitmap[word_idx] |= mask;
-    if (g_pmm_free_frames > 0) {
-      --g_pmm_free_frames;
+  const uintptr_t max_len = kMaxCanonicalIdentityAddress - base;
+  const uintptr_t raw_len = length;
+  const uintptr_t clamped_len = (raw_len > max_len) ? max_len : raw_len;
+  uintptr_t start = AlignUp(base, kPageSize);
+  const uintptr_t end = AlignDown(base + clamped_len, kPageSize);
+  if (start < kLowerMemoryLimit) {
+    start = kLowerMemoryLimit;
+  }
+  if (start >= end) {
+    return;
+  }
+
+  int insert_pos = 0;
+  while (insert_pos < g_usable_interval_count &&
+         g_usable_intervals[insert_pos].end < start) {
+    ++insert_pos;
+  }
+
+  uintptr_t merged_start = start;
+  uintptr_t merged_end = end;
+  int merge_end = insert_pos;
+  while (merge_end < g_usable_interval_count &&
+         g_usable_intervals[merge_end].start <= merged_end) {
+    if (g_usable_intervals[merge_end].start < merged_start) {
+      merged_start = g_usable_intervals[merge_end].start;
     }
-  }
-}
-
-static void PmmMarkFrameFree(const size_t frame_idx) {
-  if (g_pmm_bitmap == nullptr || frame_idx >= g_max_frames) {
-    return;
-  }
-  const size_t word_idx = frame_idx / kBitmapWordBits;
-  const size_t bit_idx = frame_idx % kBitmapWordBits;
-  const uint64_t mask = 1ULL << bit_idx;
-  if ((g_pmm_bitmap[word_idx] & mask) != 0) {
-    g_pmm_bitmap[word_idx] &= ~mask;
-    ++g_pmm_free_frames;
-  }
-}
-
-// Marks only the complete 4 KiB frames strictly inside `[base, base + length)`
-// as free (rounding start UP and end DOWN to page boundaries so partial edge
-// frames are never freed). Uses 64-frame word-granular updates for large
-// multi-gigabyte RAM regions.
-static void PmmFreeRegionInterior(const uint64_t base, const uint64_t length) {
-  if (base >= g_max_managed_phys_addr || length < kPageSize) {
-    return;
-  }
-  const uint64_t max_len = g_max_managed_phys_addr - base;
-  const uint64_t clamped_len = (length > max_len) ? max_len : length;
-  const uintptr_t start_addr = AlignUp(static_cast<uintptr_t>(base), kPageSize);
-  const uintptr_t end_addr =
-      AlignDown(static_cast<uintptr_t>(base + clamped_len), kPageSize);
-  if (start_addr >= end_addr) {
-    return;
+    if (g_usable_intervals[merge_end].end > merged_end) {
+      merged_end = g_usable_intervals[merge_end].end;
+    }
+    ++merge_end;
   }
 
-  size_t frame_idx = start_addr / kPageSize;
-  const size_t end_frame = end_addr / kPageSize;
-  while (frame_idx < end_frame) {
-    if ((frame_idx % kBitmapWordBits) == 0 &&
-        (end_frame - frame_idx) >= kBitmapWordBits) {
-      const size_t word_idx = frame_idx / kBitmapWordBits;
-      if (g_pmm_bitmap[word_idx] == ~uint64_t{0}) {
-        g_pmm_bitmap[word_idx] = 0;
-        g_pmm_free_frames += kBitmapWordBits;
-        frame_idx += kBitmapWordBits;
-        continue;
+  const int merged_count = merge_end - insert_pos;
+  if (merged_count == 0) {
+    DCHECK(g_usable_interval_count < kMaxUsableIntervals);
+    for (int i = g_usable_interval_count; i > insert_pos; --i) {
+      g_usable_intervals[i] = g_usable_intervals[i - 1];
+    }
+    g_usable_intervals[insert_pos] = {merged_start, merged_end};
+    ++g_usable_interval_count;
+  } else {
+    g_usable_intervals[insert_pos] = {merged_start, merged_end};
+    const int remove_extra = merged_count - 1;
+    if (remove_extra > 0) {
+      for (int i = insert_pos + 1; i < g_usable_interval_count - remove_extra;
+           ++i) {
+        g_usable_intervals[i] = g_usable_intervals[i + remove_extra];
       }
+      g_usable_interval_count -= remove_extra;
     }
-    PmmMarkFrameFree(frame_idx);
-    ++frame_idx;
   }
 }
 
-// Marks all 4 KiB frames overlapping `[base, base + length)` as used (rounding
-// start DOWN and end UP to page boundaries so any partially touched frame is
-// conservatively reserved).
-static void PmmReserveRegionOutward(const uint64_t base,
-                                    const uint64_t length) {
-  if (length == 0 || base >= g_max_managed_phys_addr) {
+// Carves all 4 KiB pages overlapping `[base, base + length)` out of
+// `g_usable_intervals` (rounding start DOWN and end UP to page boundaries so
+// any partially touched page is conservatively excluded).
+static void CarveExcludedRange(const uintptr_t base, const int64_t length) {
+  if (length <= 0 || base >= kMaxCanonicalIdentityAddress) {
     return;
   }
-  const uint64_t max_len = g_max_managed_phys_addr - base;
-  const uint64_t clamped_len = (length > max_len) ? max_len : length;
-  const uintptr_t start_addr =
-      AlignDown(static_cast<uintptr_t>(base), kPageSize);
-  const uintptr_t end_addr =
-      AlignUp(static_cast<uintptr_t>(base + clamped_len), kPageSize);
-  for (uintptr_t addr = start_addr; addr < end_addr; addr += kPageSize) {
-    PmmMarkFrameUsed(addr / kPageSize);
-  }
-}
-
-// Checks whether `[addr, addr + size)` lies inside a usable RAM region within
-// `[kLowerMemoryLimit, search_limit)` and does not overlap the kernel image or
-// Multiboot structures.
-static bool IsRangeUsableForBitmap(const uintptr_t addr,  //
-                                   const size_t size,     //
-                                   const uintptr_t search_limit) {
-  if (size == 0 || addr < kLowerMemoryLimit || addr >= search_limit ||
-      (search_limit - addr) < size) {
-    return false;
+  const uintptr_t max_len = kMaxCanonicalIdentityAddress - base;
+  const uintptr_t raw_len = length;
+  const uintptr_t clamped_len = (raw_len > max_len) ? max_len : raw_len;
+  const uintptr_t res_start = AlignDown(base, kPageSize);
+  const uintptr_t res_end = AlignUp(base + clamped_len, kPageSize);
+  if (res_start >= res_end) {
+    return;
   }
 
-  const uintptr_t end_addr = addr + size;
-  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(g_kernel_start);
-  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(g_kernel_end);
+  int i = 0;
+  while (i < g_usable_interval_count) {
+    const uintptr_t u_start = g_usable_intervals[i].start;
+    const uintptr_t u_end = g_usable_intervals[i].end;
 
-  if (addr < kernel_end && end_addr > kernel_start) {
-    return false;
-  }
-  if (g_memory_map.mb_reserved_end > g_memory_map.mb_reserved_start &&
-      addr < g_memory_map.mb_reserved_end &&
-      end_addr > g_memory_map.mb_reserved_start) {
-    return false;
-  }
-  if (g_memory_map.mb1_mmap_reserved_end >
-          g_memory_map.mb1_mmap_reserved_start &&
-      addr < g_memory_map.mb1_mmap_reserved_end &&
-      end_addr > g_memory_map.mb1_mmap_reserved_start) {
-    return false;
-  }
-  if (g_memory_map.fb_addr != 0 && g_memory_map.fb_pitch != 0 &&
-      g_memory_map.fb_height != 0) {
-    const uintptr_t fb_start = g_memory_map.fb_addr;
-    const uintptr_t fb_end =
-        fb_start +
-        static_cast<uintptr_t>(g_memory_map.fb_pitch) * g_memory_map.fb_height;
-    if (addr < fb_end && end_addr > fb_start) {
-      return false;
-    }
-  }
-
-  bool inside_available = false;
-  for (size_t i = 0; i < g_memory_map.region_count; ++i) {
-    const uint64_t reg_start = g_memory_map.regions[i].base;
-    const uint64_t reg_end = reg_start + g_memory_map.regions[i].length;
-    if (g_memory_map.regions[i].type == kMemoryTypeAvailable) {
-      if (addr >= reg_start && end_addr <= reg_end) {
-        inside_available = true;
-      }
-    } else {
-      if (addr < reg_end && end_addr > reg_start) {
-        return false;
-      }
-    }
-  }
-  return inside_available;
-}
-
-static uintptr_t FindBitmapInLimit(const size_t bitmap_bytes,
-                                   const uintptr_t search_limit) {
-  for (size_t i = 0; i < g_memory_map.region_count; ++i) {
-    if (g_memory_map.regions[i].type != kMemoryTypeAvailable) {
+    if (res_end <= u_start || res_start >= u_end) {
+      ++i;
       continue;
     }
-    const uint64_t raw_start = g_memory_map.regions[i].base;
-    const uint64_t raw_end = raw_start + g_memory_map.regions[i].length;
-    if (raw_end <= kLowerMemoryLimit || raw_start >= search_limit) {
-      continue;
-    }
-    const uintptr_t clamped_start = static_cast<uintptr_t>(
-        (raw_start < kLowerMemoryLimit) ? kLowerMemoryLimit : raw_start);
-    const uintptr_t clamped_end = static_cast<uintptr_t>(
-        (raw_end > search_limit) ? search_limit : raw_end);
-    const uintptr_t aligned_start = AlignUp(clamped_start, kPageSize);
-    const uintptr_t aligned_end = AlignDown(clamped_end, kPageSize);
-    if (aligned_start >= aligned_end ||
-        (aligned_end - aligned_start) < bitmap_bytes) {
-      continue;
-    }
-    for (uintptr_t cand = aligned_start; cand <= aligned_end - bitmap_bytes;
-         cand += kPageSize) {
-      if (IsRangeUsableForBitmap(cand, bitmap_bytes, search_limit)) {
-        return cand;
-      }
-    }
-  }
-  return 0;
-}
 
-// Finds a page-aligned physical address range of `bitmap_bytes` bytes to store
-// `g_pmm_bitmap`, preferring the initial 64 MiB bootstrap window and falling
-// back to higher usable RAM if low memory is fragmented or too small.
-static uintptr_t FindBitmapPhysicalAddress(const size_t bitmap_bytes) {
-  const uintptr_t low_cand =
-      FindBitmapInLimit(bitmap_bytes, kBootstrapIdentityMapSize);
-  if (low_cand != 0) {
-    return low_cand;
+    if (res_start <= u_start && res_end >= u_end) {
+      for (int j = i; j < g_usable_interval_count - 1; ++j) {
+        g_usable_intervals[j] = g_usable_intervals[j + 1];
+      }
+      --g_usable_interval_count;
+      continue;
+    }
+
+    if (res_start <= u_start) {
+      g_usable_intervals[i].start = res_end;
+      ++i;
+      continue;
+    }
+
+    if (res_end >= u_end) {
+      g_usable_intervals[i].end = res_start;
+      ++i;
+      continue;
+    }
+
+    DCHECK(g_usable_interval_count < kMaxUsableIntervals);
+    for (int j = g_usable_interval_count; j > i + 1; --j) {
+      g_usable_intervals[j] = g_usable_intervals[j - 1];
+    }
+    g_usable_intervals[i].end = res_start;
+    g_usable_intervals[i + 1] = {res_end, u_end};
+    ++g_usable_interval_count;
+    i += 2;
   }
-  return FindBitmapInLimit(bitmap_bytes, g_max_managed_phys_addr);
 }
 
 static void ConsoleWrite(const char* const str) {
@@ -255,6 +360,8 @@ static void ConsoleWriteDec(const uint64_t value) {
 
 bool PmmInit(const uint32_t multiboot_magic,
              const uint64_t multiboot_info_addr) {
+  ResetPmmState();
+
   const bool parsed_ok =
       MultibootParseMemoryMap(multiboot_magic,               //
                               multiboot_info_addr,           //
@@ -281,108 +388,115 @@ bool PmmInit(const uint32_t multiboot_magic,
     ConsoleWrite("\n");
   }
 
-  uintptr_t highest_usable_addr = 0;
-  for (size_t i = 0; i < g_memory_map.region_count; ++i) {
+  for (int i = 0; i < g_memory_map.region_count; ++i) {
     if (g_memory_map.regions[i].type == kMemoryTypeAvailable) {
-      const uintptr_t region_end =
-          AlignDown(static_cast<uintptr_t>(g_memory_map.regions[i].base +
-                                           g_memory_map.regions[i].length),
-                    kPageSize);
-      if (region_end > highest_usable_addr) {
-        highest_usable_addr = region_end;
-      }
-    }
-  }
-  if (highest_usable_addr <= kLowerMemoryLimit) {
-    return false;
-  }
-
-  g_max_managed_phys_addr = highest_usable_addr;
-  g_max_frames = g_max_managed_phys_addr / kPageSize;
-  g_bitmap_words = (g_max_frames + kBitmapWordBits - 1) / kBitmapWordBits;
-  const size_t bitmap_bytes =
-      AlignUp(g_bitmap_words * sizeof(uint64_t), kPageSize);
-
-  const uintptr_t bitmap_phys = FindBitmapPhysicalAddress(bitmap_bytes);
-  if (bitmap_phys == 0 || !PagingMapBootstrapRange(bitmap_phys, bitmap_bytes)) {
-    return false;
-  }
-
-  g_bitmap_phys_start = bitmap_phys;
-  g_bitmap_phys_end = bitmap_phys + bitmap_bytes;
-  g_pmm_bitmap = reinterpret_cast<uint64_t*>(bitmap_phys);
-
-  for (size_t i = 0; i < g_bitmap_words; ++i) {
-    g_pmm_bitmap[i] = ~uint64_t{0};
-  }
-
-  for (size_t i = 0; i < g_memory_map.region_count; ++i) {
-    if (g_memory_map.regions[i].type == kMemoryTypeAvailable) {
-      PmmFreeRegionInterior(g_memory_map.regions[i].base,
-                            g_memory_map.regions[i].length);
+      AddAvailableRegion(g_memory_map.regions[i].base,
+                         g_memory_map.regions[i].length);
     }
   }
 
-  for (size_t i = 0; i < g_memory_map.region_count; ++i) {
+  for (int i = 0; i < g_memory_map.region_count; ++i) {
     if (g_memory_map.regions[i].type != kMemoryTypeAvailable) {
-      PmmReserveRegionOutward(g_memory_map.regions[i].base,
-                              g_memory_map.regions[i].length);
+      CarveExcludedRange(g_memory_map.regions[i].base,
+                         g_memory_map.regions[i].length);
     }
   }
 
-  PmmReserveRegionOutward(0, kLowerMemoryLimit);
+  CarveExcludedRange(0, kLowerMemoryLimit);
 
-  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(g_kernel_start);
-  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(g_kernel_end);
-  PmmReserveRegionOutward(kernel_start, kernel_end - kernel_start);
-
-  PmmReserveRegionOutward(g_bitmap_phys_start,
-                          g_bitmap_phys_end - g_bitmap_phys_start);
+  const uintptr_t kernel_start = KernelStartAddr();
+  const uintptr_t kernel_end = KernelEndAddr();
+  if (kernel_end > kernel_start) {
+    CarveExcludedRange(kernel_start, kernel_end - kernel_start);
+  }
 
   if (g_memory_map.mb_reserved_end > g_memory_map.mb_reserved_start) {
-    PmmReserveRegionOutward(
+    CarveExcludedRange(
         g_memory_map.mb_reserved_start,
         g_memory_map.mb_reserved_end - g_memory_map.mb_reserved_start);
   }
   if (g_memory_map.mb1_mmap_reserved_end >
       g_memory_map.mb1_mmap_reserved_start) {
-    PmmReserveRegionOutward(g_memory_map.mb1_mmap_reserved_start,
-                            g_memory_map.mb1_mmap_reserved_end -
-                                g_memory_map.mb1_mmap_reserved_start);
+    CarveExcludedRange(g_memory_map.mb1_mmap_reserved_start,
+                       g_memory_map.mb1_mmap_reserved_end -
+                           g_memory_map.mb1_mmap_reserved_start);
   }
-  if (g_memory_map.fb_addr != 0 && g_memory_map.fb_pitch != 0 &&
-      g_memory_map.fb_height != 0) {
-    const uint64_t fb_bytes =
-        static_cast<uint64_t>(g_memory_map.fb_pitch) * g_memory_map.fb_height;
-    PmmReserveRegionOutward(g_memory_map.fb_addr, fb_bytes);
+  if (g_memory_map.fb_addr != 0 && g_memory_map.fb_pitch > 0 &&
+      g_memory_map.fb_height > 0) {
+    const int64_t fb_bytes =
+        static_cast<int64_t>(g_memory_map.fb_pitch) * g_memory_map.fb_height;
+    CarveExcludedRange(g_memory_map.fb_addr, fb_bytes);
   }
 
-  // Clamp g_max_managed_phys_addr to the highest genuinely free usable frame
-  // so that PmmMaxPhysicalAddress() - kPageSize never lands on an overlapping
-  // reserved/ACPI/bootloader page at the tail of an available region.
-  while (g_max_frames > (kLowerMemoryLimit / kPageSize) &&
-         PmmIsFrameUsed(g_max_frames - 1)) {
-    --g_max_frames;
-  }
-  g_max_managed_phys_addr = g_max_frames * kPageSize;
-  if (g_max_managed_phys_addr <= kLowerMemoryLimit || g_pmm_free_frames == 0) {
+  if (g_usable_interval_count <= 0) {
+    ResetPmmState();
     return false;
+  }
+
+  const uintptr_t highest_usable_addr =
+      g_usable_intervals[g_usable_interval_count - 1].end;
+  if (highest_usable_addr <= kLowerMemoryLimit) {
+    ResetPmmState();
+    return false;
+  }
+
+  g_max_managed_phys_addr = highest_usable_addr;
+  g_max_frames = g_max_managed_phys_addr / kPageSize;
+  g_pmm_initialized = true;
+
+  // Populate free runs that lie inside the initial 64 MiB bootstrap window
+  // first so `PagingExtendIdentityMap` can allocate page-table frames from
+  // already-mapped low memory if needed without touching unmapped high RAM.
+  for (int i = 0; i < g_usable_interval_count; ++i) {
+    const uintptr_t u_start = g_usable_intervals[i].start;
+    const uintptr_t u_end = g_usable_intervals[i].end;
+    if (u_start >= kBootstrapIdentityMapSize) {
+      break;
+    }
+    const uintptr_t low_end =
+        (u_end < kBootstrapIdentityMapSize) ? u_end : kBootstrapIdentityMapSize;
+    if (low_end > u_start) {
+      const int64_t frames = (low_end - u_start) / kPageSize;
+      PmmCoalesceFreeRun(u_start, frames);
+    }
   }
 
   if (!PagingExtendIdentityMap(g_max_managed_phys_addr)) {
+    ResetPmmState();
     return false;
   }
 
+  // Now that the identity mapping covers all usable physical RAM up to
+  // `g_max_managed_phys_addr`, insert intervals at or above 64 MiB and
+  // coalesce any interval that straddled `kBootstrapIdentityMapSize`.
+  for (int i = 0; i < g_usable_interval_count; ++i) {
+    const uintptr_t u_start = g_usable_intervals[i].start;
+    const uintptr_t u_end = g_usable_intervals[i].end;
+    if (u_end <= kBootstrapIdentityMapSize) {
+      continue;
+    }
+    const uintptr_t high_start = (u_start > kBootstrapIdentityMapSize)
+                                     ? u_start
+                                     : kBootstrapIdentityMapSize;
+    if (u_end > high_start) {
+      const int64_t frames = (u_end - high_start) / kPageSize;
+      PmmCoalesceFreeRun(high_start, frames);
+    }
+  }
+
+  if (g_free_run_tree.Empty() || g_pmm_free_frames == 0) {
+    ResetPmmState();
+    return false;
+  }
+
+  g_max_managed_phys_addr = RunEndAddress(g_free_run_tree.Last());
+  g_max_frames = g_max_managed_phys_addr / kPageSize;
   g_pmm_total_usable_frames = g_pmm_free_frames;
 
   ConsoleWrite("[PMM] Kernel range: ");
   ConsoleWriteHex(kernel_start);
   ConsoleWrite(" .. ");
   ConsoleWriteHex(kernel_end);
-  ConsoleWrite(", Bitmap: ");
-  ConsoleWriteHex(g_bitmap_phys_start);
-  ConsoleWrite(" .. ");
-  ConsoleWriteHex(g_bitmap_phys_end);
   ConsoleWrite(", Identity-mapped: 0x0 .. ");
   ConsoleWriteHex(PagingIdentityMappedLimit());
   ConsoleWrite("\n");
@@ -397,150 +511,87 @@ bool PmmInit(const uint32_t multiboot_magic,
   ConsoleWriteDec(g_pmm_free_frames);
   ConsoleWrite("\n");
 
-  return g_pmm_free_frames > 0;
+  return true;
 }
 
-uintptr_t PmmAllocFrames(const size_t count) {
-  if (g_pmm_bitmap == nullptr || count == 0 || count > g_pmm_free_frames) {
+uintptr_t PmmAllocFrames(const int64_t count) {
+  DCHECK(g_pmm_initialized);
+  DCHECK(count > 0);
+  if (count > g_pmm_free_frames) {
     return 0;
   }
 
-  const size_t min_frame = kLowerMemoryLimit / kPageSize;
-  size_t run_start = min_frame;
-  size_t run_length = 0;
-
-  size_t frame_idx = min_frame;
-  while (frame_idx < g_max_frames) {
-    if (run_length == 0 && (frame_idx % kBitmapWordBits) == 0) {
-      const size_t word_idx = frame_idx / kBitmapWordBits;
-      if (g_pmm_bitmap[word_idx] == ~uint64_t{0}) {
-        frame_idx += kBitmapWordBits;
-        run_start = frame_idx;
-        continue;
-      }
-    }
-
-    if (!PmmIsFrameUsed(frame_idx)) {
-      if (run_length == 0) {
-        run_start = frame_idx;
-      }
-      ++run_length;
-      if (run_length == count) {
-        for (size_t i = 0; i < count; ++i) {
-          PmmMarkFrameUsed(run_start + i);
-        }
-        return run_start * kPageSize;
-      }
-    } else {
-      run_length = 0;
-    }
-    ++frame_idx;
+  FreeRunNode* const candidate = g_free_run_tree.FindFirstAugmented(
+      [count](const FreeRunNode& node) {
+        return node.max_subtree_frames >= count;
+      },
+      [count](const FreeRunNode& node) { return node.frame_count >= count; });
+  if (candidate == nullptr) {
+    return 0;
   }
 
-  return 0;
+  const uintptr_t alloc_addr = RunBaseAddress(candidate);
+  const int64_t total_frames = candidate->frame_count;
+  DCHECK(total_frames >= count);
+  FreeRunTreeRemove(candidate);
+
+  if (total_frames > count) {
+    const uintptr_t remainder_addr = alloc_addr + count * kPageSize;
+    const int64_t remainder_frames = total_frames - count;
+    FreeRunTreeInsert(remainder_addr, remainder_frames);
+  }
+
+  return alloc_addr;
 }
 
 uintptr_t PmmAllocFrame() { return PmmAllocFrames(1); }
 
-bool PmmRangeIsValidUsableRam(const uintptr_t addr, const size_t size) {
-  // Reject empty ranges, ranges starting in reserved lower memory (< 1 MiB),
-  // or ranges extending beyond the highest managed physical address (checking
-  // via subtraction to avoid overflow).
-  if (size == 0 || addr < kLowerMemoryLimit ||
+bool PmmRangeIsValidUsableRam(const uintptr_t addr, const int64_t size) {
+  if (!g_pmm_initialized || size <= 0 || addr < kLowerMemoryLimit ||
       addr >= g_max_managed_phys_addr ||
-      (g_max_managed_phys_addr - addr) < size) {
+      (g_max_managed_phys_addr - addr) < static_cast<uintptr_t>(size)) {
     return false;
   }
 
   const uintptr_t end_addr = addr + size;
-  const uintptr_t kernel_start = reinterpret_cast<uintptr_t>(g_kernel_start);
-  const uintptr_t kernel_end = reinterpret_cast<uintptr_t>(g_kernel_end);
-
-  // Reject ranges overlapping the loaded kernel image.
-  if (addr < kernel_end && end_addr > kernel_start) {
-    return false;
-  }
-  // Reject ranges overlapping the PMM frame bitmap itself.
-  if (g_bitmap_phys_end > g_bitmap_phys_start && addr < g_bitmap_phys_end &&
-      end_addr > g_bitmap_phys_start) {
-    return false;
-  }
-  // Reject ranges overlapping the Multiboot info structure or the Multiboot1
-  // memory map buffer.
-  if (g_memory_map.mb_reserved_end > g_memory_map.mb_reserved_start &&
-      addr < g_memory_map.mb_reserved_end &&
-      end_addr > g_memory_map.mb_reserved_start) {
-    return false;
-  }
-  if (g_memory_map.mb1_mmap_reserved_end >
-          g_memory_map.mb1_mmap_reserved_start &&
-      addr < g_memory_map.mb1_mmap_reserved_end &&
-      end_addr > g_memory_map.mb1_mmap_reserved_start) {
-    return false;
-  }
-  if (g_memory_map.fb_addr != 0 && g_memory_map.fb_pitch != 0 &&
-      g_memory_map.fb_height != 0) {
-    const uintptr_t fb_start = g_memory_map.fb_addr;
-    const uintptr_t fb_end =
-        fb_start +
-        static_cast<uintptr_t>(g_memory_map.fb_pitch) * g_memory_map.fb_height;
-    if (addr < fb_end && end_addr > fb_start) {
-      return false;
-    }
-  }
-
-  // Scan the parsed Multiboot memory map to verify that `[addr, end_addr)` is
-  // completely contained within at least one available RAM region and does not
-  // overlap any non-available (reserved/ACPI/defective) region.
-  bool inside_available = false;
-  for (size_t i = 0; i < g_memory_map.region_count; ++i) {
-    const uint64_t reg_start = g_memory_map.regions[i].base;
-    const uint64_t reg_end = reg_start + g_memory_map.regions[i].length;
-    if (g_memory_map.regions[i].type == kMemoryTypeAvailable) {
-      if (addr >= reg_start && end_addr <= reg_end) {
-        inside_available = true;
-      }
+  int low = 0;
+  int high = g_usable_interval_count - 1;
+  while (low <= high) {
+    const int mid = low + (high - low) / 2;
+    const PhysInterval& interval = g_usable_intervals[mid];
+    if (addr < interval.start) {
+      high = mid - 1;
+    } else if (addr >= interval.end) {
+      low = mid + 1;
     } else {
-      if (addr < reg_end && end_addr > reg_start) {
-        return false;
-      }
+      return end_addr <= interval.end;
     }
   }
-  return inside_available;
+  return false;
 }
 
-void PmmFreeFrames(const uintptr_t base_addr, const size_t count) {
-  if (base_addr == 0 || (base_addr & (kPageSize - 1)) != 0 ||
-      base_addr < kLowerMemoryLimit || base_addr >= g_max_managed_phys_addr ||
-      count == 0) {
-    return;
-  }
+void PmmFreeFrames(const uintptr_t base_addr, const int64_t count) {
+  DCHECK(g_pmm_initialized);
+  DCHECK(count > 0);
+  DCHECK(base_addr >= kLowerMemoryLimit);
+  DCHECK((base_addr & (kPageSize - 1)) == 0);
+  DCHECK(base_addr < g_max_managed_phys_addr);
+  DCHECK(static_cast<uintptr_t>(count) <=
+         (g_max_managed_phys_addr - base_addr) / kPageSize);
+  const int64_t byte_size = count * kPageSize;
+  DCHECK(PmmRangeIsValidUsableRam(base_addr, byte_size));
 
-  const size_t start_frame = base_addr / kPageSize;
-
-  for (size_t i = 0; i < count; ++i) {
-    const size_t frame_idx = start_frame + i;
-    if (frame_idx >= g_max_frames) {
-      break;
-    }
-    const uintptr_t addr = frame_idx * kPageSize;
-    if (!PmmRangeIsValidUsableRam(addr, kPageSize)) {
-      continue;
-    }
-    if (PmmIsFrameUsed(frame_idx)) {
-      PmmMarkFrameFree(frame_idx);
-    }
-  }
+  PmmCoalesceFreeRun(base_addr, count);
 }
 
 void PmmFreeFrame(const uintptr_t frame_addr) { PmmFreeFrames(frame_addr, 1); }
 
 uintptr_t PmmMaxPhysicalAddress() { return g_max_managed_phys_addr; }
 
-size_t PmmMaxFrameCount() { return g_max_frames; }
+int64_t PmmMaxFrameCount() { return g_max_frames; }
 
-size_t PmmFreeFrameCount() { return g_pmm_free_frames; }
+int64_t PmmFreeFrameCount() { return g_pmm_free_frames; }
 
-size_t PmmTotalUsableFrameCount() { return g_pmm_total_usable_frames; }
+int64_t PmmTotalUsableFrameCount() { return g_pmm_total_usable_frames; }
 
 }  // namespace protos
