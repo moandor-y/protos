@@ -1,6 +1,11 @@
 #include "smp.h"
 
+#include <atomic>
 #include <cstdint>
+#include <type_traits>
+#if __STDC_HOSTED__
+#include <thread>
+#endif
 
 #include "check.h"
 #include "paging.h"
@@ -16,9 +21,17 @@ extern const uint8_t stack_bottom[];
 extern const uint8_t stack_top[];
 #endif
 
+// Per-AP bootstrap handoff state read by the 16/32/64-bit trampoline in boot.S
+// while the BSP brings up one Application Processor at a time.
+// Top of the 16 KiB kernel stack allocated for the AP currently being booted.
 volatile uint64_t g_ap_boot_stack = 0;
+// Logical CPU index (1 .. cpu_count - 1) assigned to the AP being booted.
 volatile int g_ap_boot_cpu_index = 0;
-volatile int g_ap_boot_started = 0;
+// Set to 1 by the AP trampoline in boot.S as soon as the AP enters 32-bit
+// protected mode, allowing the BSP to skip sending a redundant second SIPI.
+std::atomic<int> g_ap_boot_started{0};
+static_assert(sizeof(g_ap_boot_started) == sizeof(int));
+static_assert(std::is_standard_layout_v<std::atomic<int>>);
 }
 
 namespace protos {
@@ -69,6 +82,7 @@ constexpr int kLapicRegIcrHigh = 0x310;
 
 constexpr uint32_t kLapicSvrSoftwareEnable = 1u << 8;
 constexpr uint32_t kLapicSpuriousVector = 0xFFu;
+constexpr uint32_t kIcrDeliveryNmi = 0x00000400u;
 constexpr uint32_t kIcrDeliveryInit = 0x00000500u;
 constexpr uint32_t kIcrDeliveryStartup = 0x00000600u;
 constexpr uint32_t kIcrDeliveryPending = 1u << 12;
@@ -79,8 +93,9 @@ constexpr int64_t kMaxTrampolineBytes = 512;
 constexpr int kIcrIdlePollLimit = 1000000;
 constexpr int kInitDelayIterations = 50000;
 constexpr int kFirstSipiPollLimit = 200000;
-constexpr int kSecondSipiPollLimit = 50000000;
 #endif
+constexpr int kSecondSipiPollLimit = 50000000;
+constexpr int kNmiRetryPollInterval = 4096;
 
 struct [[gnu::packed]] Multiboot2InfoHeader {
   uint32_t total_size;
@@ -152,17 +167,64 @@ struct [[gnu::packed]] AcpiMadtLocalX2Apic {
   uint32_t acpi_processor_uid;
 };
 
+// Discovered CPU topology and per-CPU runtime state populated during SmpInit().
 SmpTopology g_topology = {};
-int g_online_cpu_count = 0;
-int g_ap_boot_done = 0;
+// Number of CPUs (BSP + APs) that have completed initialization and come
+// online.
+std::atomic<int> g_online_cpu_count{0};
+// Handshake flag set to 1 by the currently booting AP in ApKernelEntry() once
+// it has initialized its Local APIC and recorded its hardware state, signaling
+// the BSP that it may proceed to wake the next AP.
+std::atomic<int> g_ap_boot_done{0};
+// True once SmpInit() has completed topology discovery and AP bring-up.
 bool g_smp_initialized = false;
 
+// State for synchronous multi-CPU work dispatch in SmpRunOnAllCpus():
+// Guards against concurrent or re-entrant SmpRunOnAllCpus() calls.
+std::atomic<bool> g_dispatch_in_progress{false};
+// Callback function and opaque context pointer for the current dispatch round.
+std::atomic<SmpWorkFn> g_work_fn{nullptr};
+std::atomic<void*> g_work_context{nullptr};
+// Monotonically increasing dispatch epoch incremented by the BSP to announce a
+// new work item before waking halted APs via NMI IPIs.
+std::atomic<int64_t> g_work_epoch{0};
+// Set by the BSP to `g_work_epoch` once all APs have acknowledged the wakeup,
+// releasing all CPUs to execute `g_work_fn` simultaneously.
+std::atomic<int64_t> g_work_start_epoch{0};
+// Per-CPU epoch acknowledgment written by AP `i` upon waking from `hlt`, so the
+// BSP knows whether an AP received the NMI IPI or needs a retry.
+std::atomic<int64_t> g_ap_ack_epoch[kMaxCpus] = {};
+// Per-CPU completion epoch written by AP `i` after `g_work_fn` returns, before
+// the AP goes back to `cli; hlt`.
+std::atomic<int64_t> g_ap_done_epoch[kMaxCpus] = {};
+
 #if __STDC_HOSTED__
+// Host unit-test overrides configured via SmpSetHostTestHooks().
 uint8_t g_host_bsp_apic_id = 0;
 uintptr_t g_host_ebda_base = 0;
 uintptr_t g_host_bios_rom_base = 0;
 uintptr_t g_host_acpi32_high_bits = 0;
 SmpHostApBootSimFn g_host_ap_sim_fn = nullptr;
+
+struct HostApRunner {
+  std::thread threads[kMaxCpus];
+  int64_t spawned_epoch[kMaxCpus] = {};
+  int64_t completed_epoch[kMaxCpus] = {};
+
+  void Reset() {
+    for (int i = 0; i < kMaxCpus; ++i) {
+      if (threads[i].joinable()) {
+        threads[i].join();
+      }
+      spawned_epoch[i] = 0;
+      completed_epoch[i] = 0;
+    }
+  }
+
+  ~HostApRunner() { Reset(); }
+};
+
+HostApRunner g_host_ap_runner;
 #endif
 
 static constexpr int64_t AlignUp(const int64_t value, const int64_t alignment) {
@@ -551,13 +613,25 @@ static bool TryDiscoverFromMemoryRange(const uintptr_t range_start,        //
 }
 
 static void ResetSmpState() {
+#if __STDC_HOSTED__
+  g_host_ap_runner.Reset();
+#endif
   g_topology = {};
-  __atomic_store_n(&g_online_cpu_count, 0, __ATOMIC_SEQ_CST);
-  __atomic_store_n(&g_ap_boot_done, 0, __ATOMIC_SEQ_CST);
-  __atomic_store_n(&g_ap_boot_started, 0, __ATOMIC_SEQ_CST);
+  g_online_cpu_count.store(0, std::memory_order_seq_cst);
+  g_ap_boot_done.store(0, std::memory_order_seq_cst);
+  g_ap_boot_started.store(0, std::memory_order_seq_cst);
   g_ap_boot_stack = 0;
   g_ap_boot_cpu_index = 0;
   g_smp_initialized = false;
+  g_dispatch_in_progress.store(false, std::memory_order_seq_cst);
+  g_work_fn.store(nullptr, std::memory_order_seq_cst);
+  g_work_context.store(nullptr, std::memory_order_seq_cst);
+  g_work_epoch.store(0, std::memory_order_seq_cst);
+  g_work_start_epoch.store(0, std::memory_order_seq_cst);
+  for (int i = 0; i < kMaxCpus; ++i) {
+    g_ap_ack_epoch[i].store(0, std::memory_order_seq_cst);
+    g_ap_done_epoch[i].store(0, std::memory_order_seq_cst);
+  }
 }
 
 #if !__STDC_HOSTED__
@@ -703,7 +777,7 @@ static void InstallApTrampoline(uint8_t* const saved_bytes) {
     saved_bytes[i] = dst[i];
     dst[i] = src[i];
   }
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 static void RestoreApTrampoline(const uint8_t* const saved_bytes) {
@@ -716,7 +790,7 @@ static void RestoreApTrampoline(const uint8_t* const saved_bytes) {
   for (int64_t i = 0; i < trampoline_bytes; ++i) {
     dst[i] = saved_bytes[i];
   }
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 static void WakeApplicationProcessor(const uintptr_t lapic_base,  //
@@ -729,8 +803,8 @@ static void WakeApplicationProcessor(const uintptr_t lapic_base,  //
   DCHECK(stack_top_addr != 0 && (stack_top_addr & 0xF) == 0);
   g_ap_boot_stack = stack_top_addr;
   g_ap_boot_cpu_index = cpu_index;
-  __atomic_store_n(&g_ap_boot_started, 0, __ATOMIC_SEQ_CST);
-  __atomic_store_n(&g_ap_boot_done, 0, __ATOMIC_SEQ_CST);
+  g_ap_boot_started.store(0, std::memory_order_seq_cst);
+  g_ap_boot_done.store(0, std::memory_order_seq_cst);
   const uint32_t icr_dest = static_cast<uint32_t>(apic_id) << 24;
 
   // Send INIT IPI (assert, then de-assert).
@@ -760,10 +834,10 @@ static void WakeApplicationProcessor(const uintptr_t lapic_base,  //
   CHECK(WaitForIcrIdle(lapic_base));
 
   for (int i = 0; i < kFirstSipiPollLimit; ++i) {
-    if (__atomic_load_n(&g_ap_boot_done, __ATOMIC_ACQUIRE) != 0) {
+    if (g_ap_boot_done.load(std::memory_order_acquire) != 0) {
       return;
     }
-    if (__atomic_load_n(&g_ap_boot_started, __ATOMIC_ACQUIRE) != 0) {
+    if (g_ap_boot_started.load(std::memory_order_acquire) != 0) {
       break;
     }
     asm volatile("pause" : : : "memory");
@@ -771,8 +845,8 @@ static void WakeApplicationProcessor(const uintptr_t lapic_base,  //
 
   // Send second Startup IPI (SIPI) only if the AP has not yet started
   // executing the trampoline on the first SIPI.
-  if (__atomic_load_n(&g_ap_boot_done, __ATOMIC_ACQUIRE) == 0 &&
-      __atomic_load_n(&g_ap_boot_started, __ATOMIC_ACQUIRE) == 0) {
+  if (g_ap_boot_done.load(std::memory_order_acquire) == 0 &&
+      g_ap_boot_started.load(std::memory_order_acquire) == 0) {
     LapicWrite(lapic_base, kLapicRegEsr, 0);
     (void)LapicRead(lapic_base, kLapicRegEsr);
     LapicWrite(lapic_base, kLapicRegIcrHigh, icr_dest);
@@ -783,20 +857,78 @@ static void WakeApplicationProcessor(const uintptr_t lapic_base,  //
   }
 
   for (int i = 0; i < kSecondSipiPollLimit; ++i) {
-    if (__atomic_load_n(&g_ap_boot_done, __ATOMIC_ACQUIRE) != 0) {
+    if (g_ap_boot_done.load(std::memory_order_acquire) != 0) {
       return;
     }
     asm volatile("pause" : : : "memory");
   }
-  CHECK(__atomic_load_n(&g_ap_boot_done, __ATOMIC_ACQUIRE) != 0);
+  CHECK(g_ap_boot_done.load(std::memory_order_acquire) != 0);
 }
+
 #endif
+
+static bool RunPendingApWork(const int cpu_index,
+                             int64_t* const completed_epoch) {
+  DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
+  DCHECK(completed_epoch != nullptr);
+  const int64_t epoch = g_work_epoch.load(std::memory_order_acquire);
+  if (epoch <= *completed_epoch) {
+    return false;
+  }
+  g_ap_ack_epoch[cpu_index].store(epoch, std::memory_order_release);
+  while (g_work_start_epoch.load(std::memory_order_acquire) != epoch) {
+    asm volatile("pause" : : : "memory");
+  }
+  const SmpWorkFn work_fn = g_work_fn.load(std::memory_order_acquire);
+  void* const context = g_work_context.load(std::memory_order_acquire);
+  DCHECK(work_fn != nullptr);
+  work_fn(cpu_index, context);
+  *completed_epoch = epoch;
+  g_ap_done_epoch[cpu_index].store(epoch, std::memory_order_release);
+  return true;
+}
+
+static void SendNmiIpi(const uintptr_t lapic_base,  //
+                       const int cpu_index,         //
+                       const uint8_t apic_id) {
+  DCHECK(lapic_base != 0);
+  DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
+  DCHECK(apic_id != kInvalidXapicId);
+#if !__STDC_HOSTED__
+  (void)cpu_index;
+  const uint32_t icr_dest = static_cast<uint32_t>(apic_id) << 24;
+  LapicWrite(lapic_base, kLapicRegEsr, 0);
+  (void)LapicRead(lapic_base, kLapicRegEsr);
+  LapicWrite(lapic_base, kLapicRegIcrHigh, icr_dest);
+  LapicWrite(lapic_base,       //
+             kLapicRegIcrLow,  //
+             kIcrDeliveryNmi | kIcrLevelAssert);
+  CHECK(WaitForIcrIdle(lapic_base));
+#else
+  (void)lapic_base;
+  (void)apic_id;
+  const int64_t target_epoch = g_work_epoch.load(std::memory_order_acquire);
+  if (g_host_ap_runner.spawned_epoch[cpu_index] == target_epoch) {
+    return;
+  }
+  if (g_host_ap_runner.threads[cpu_index].joinable()) {
+    g_host_ap_runner.threads[cpu_index].join();
+  }
+  g_host_ap_runner.spawned_epoch[cpu_index] = target_epoch;
+  g_host_ap_runner.threads[cpu_index] = std::thread([cpu_index]() {
+    while (!RunPendingApWork(cpu_index,
+                             &g_host_ap_runner.completed_epoch[cpu_index])) {
+      asm volatile("pause" : : : "memory");
+    }
+  });
+#endif
+}
 
 }  // namespace
 
 extern "C" void ApKernelEntry(const int cpu_index) {
 #if !__STDC_HOSTED__
-  __atomic_store_n(&g_ap_boot_started, 1, __ATOMIC_RELEASE);
+  g_ap_boot_started.store(1, std::memory_order_release);
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
   DCHECK(lapic_base != 0);
   DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
@@ -809,11 +941,15 @@ extern "C" void ApKernelEntry(const int cpu_index) {
   cpu.long_mode_active = IsHardwareLongModeActive();
   cpu.online = true;
 
-  __atomic_add_fetch(&g_online_cpu_count, 1, __ATOMIC_SEQ_CST);
-  __atomic_store_n(&g_ap_boot_done, 1, __ATOMIC_RELEASE);
+  g_online_cpu_count.fetch_add(1, std::memory_order_seq_cst);
+  g_ap_boot_done.store(1, std::memory_order_release);
 
+  int64_t completed_epoch = 0;
   for (;;) {
-    asm volatile("cli; hlt");
+    if (RunPendingApWork(cpu_index, &completed_epoch)) {
+      continue;
+    }
+    asm volatile("cli; hlt" : : : "memory");
   }
 #else
   (void)cpu_index;
@@ -1180,7 +1316,7 @@ void SmpInit(const uint32_t multiboot_magic,
 #endif
   g_topology.cpus[0].is_bsp = true;
   g_topology.cpus[0].online = true;
-  __atomic_store_n(&g_online_cpu_count, 1, __ATOMIC_SEQ_CST);
+  g_online_cpu_count.store(1, std::memory_order_seq_cst);
 
   ConsoleWrite("[SMP] Discovered CPUs: ");
   ConsoleWriteDec(g_topology.cpu_count);
@@ -1216,7 +1352,7 @@ void SmpInit(const uint32_t multiboot_magic,
 #else
       g_ap_boot_stack = g_topology.cpus[i].stack_top;
       g_ap_boot_cpu_index = i;
-      __atomic_store_n(&g_ap_boot_started, 0, __ATOMIC_SEQ_CST);
+      g_ap_boot_started.store(0, std::memory_order_seq_cst);
       bool woke_ok = false;
       if (g_host_ap_sim_fn != nullptr) {
         woke_ok = g_host_ap_sim_fn(i, &g_topology.cpus[i]);
@@ -1229,7 +1365,7 @@ void SmpInit(const uint32_t multiboot_magic,
         woke_ok = true;
       }
       CHECK(woke_ok);
-      __atomic_add_fetch(&g_online_cpu_count, 1, __ATOMIC_SEQ_CST);
+      g_online_cpu_count.fetch_add(1, std::memory_order_seq_cst);
 #endif
       CHECK(g_topology.cpus[i].online);
 
@@ -1261,7 +1397,7 @@ int SmpCpuCount() {
 
 int SmpOnlineCpuCount() {
   DCHECK(g_smp_initialized);
-  return __atomic_load_n(&g_online_cpu_count, __ATOMIC_ACQUIRE);
+  return g_online_cpu_count.load(std::memory_order_acquire);
 }
 
 const CpuInfo* SmpGetCpuInfo(const int index) {
@@ -1273,6 +1409,60 @@ const CpuInfo* SmpGetCpuInfo(const int index) {
 uintptr_t SmpLocalApicPhysAddr() {
   DCHECK(g_smp_initialized);
   return g_topology.local_apic_phys_addr;
+}
+
+void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
+  DCHECK(g_smp_initialized);
+  DCHECK(work_fn != nullptr);
+  const int cpu_count = g_topology.cpu_count;
+  DCHECK(cpu_count >= 1 && cpu_count <= kMaxCpus);
+  DCHECK(SmpOnlineCpuCount() == cpu_count);
+  DCHECK(!g_dispatch_in_progress.exchange(true, std::memory_order_acq_rel));
+
+  if (cpu_count == 1) {
+    work_fn(0, context);
+    g_dispatch_in_progress.store(false, std::memory_order_release);
+    return;
+  }
+
+  const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
+  DCHECK(lapic_base != 0);
+  g_work_fn.store(work_fn, std::memory_order_release);
+  g_work_context.store(context, std::memory_order_release);
+  const int64_t epoch =
+      g_work_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+  for (int i = 1; i < cpu_count; ++i) {
+    SendNmiIpi(lapic_base, i, g_topology.cpus[i].apic_id);
+  }
+
+  for (int poll = 0;; ++poll) {
+    bool all_acked = true;
+    for (int i = 1; i < cpu_count; ++i) {
+      if (g_ap_ack_epoch[i].load(std::memory_order_acquire) != epoch) {
+        all_acked = false;
+        if (poll > 0 && (poll % kNmiRetryPollInterval) == 0) {
+          SendNmiIpi(lapic_base, i, g_topology.cpus[i].apic_id);
+        }
+      }
+    }
+    if (all_acked) {
+      break;
+    }
+    CHECK(poll < kSecondSipiPollLimit);
+    asm volatile("pause" : : : "memory");
+  }
+
+  g_work_start_epoch.store(epoch, std::memory_order_release);
+  work_fn(0, context);
+
+  for (int i = 1; i < cpu_count; ++i) {
+    while (g_ap_done_epoch[i].load(std::memory_order_acquire) != epoch) {
+      asm volatile("pause" : : : "memory");
+    }
+  }
+
+  g_dispatch_in_progress.store(false, std::memory_order_release);
 }
 
 #if __STDC_HOSTED__

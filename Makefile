@@ -52,6 +52,7 @@ CXX_SRCS := \
 
 CXX_HDRS := \
     check.h \
+    spinlock.h \
     uart.h \
     vga.h \
     multiboot.h \
@@ -86,7 +87,7 @@ DOCKER_RUN :=
 DOCKER_DEPS :=
 endif
 
-.PHONY: all clean test test-host test-rbtree test-heap test-pmm test-smp run-boot-test
+.PHONY: all clean test test-host test-rbtree test-spinlock test-heap test-pmm test-smp run-boot-test
 
 ifeq ($(IN_DOCKER),)
 all: $(DOCKER_STAMP)
@@ -152,6 +153,7 @@ endef
 $(foreach t,$(HOST_TESTS),$(eval $(call DEFINE_HOST_TEST_SUITE,$(t))))
 
 test-rbtree: test-rbtree_test
+test-spinlock: test-spinlock_test
 test-heap: test-heap_test
 test-pmm: test-pmm_test
 test-smp: test-smp_test

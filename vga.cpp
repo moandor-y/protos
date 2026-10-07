@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "paging.h"
+#include "spinlock.h"
 
 namespace protos {
 
@@ -15,6 +16,7 @@ constexpr uint8_t kVgaColorWhiteOnBlack = 0x0F;
 constexpr int kGlyphWidth = 8;
 constexpr int kGlyphHeight = 16;
 
+IrqSpinLock g_vga_lock;
 int g_cursor_row = 0;
 int g_cursor_col = 0;
 char g_text_shadow[kVgaHeight][kVgaWidth];
@@ -186,19 +188,7 @@ static void ScrollUpOneRow() {
   }
 }
 
-}  // namespace
-
-void VgaClear() {
-  g_cursor_row = 0;
-  g_cursor_col = 0;
-  for (int r = 0; r < kVgaHeight; ++r) {
-    for (int c = 0; c < kVgaWidth; ++c) {
-      WriteCell(r, c, ' ');
-    }
-  }
-}
-
-void VgaPutc(const char ch) {
+static void VgaPutcLocked(const char ch) {
   if (ch == '\r') {
     g_cursor_col = 0;
     return;
@@ -224,20 +214,44 @@ void VgaPutc(const char ch) {
   }
 }
 
-void VgaWrite(const char* const str) {
+static void VgaWriteLocked(const char* const str) {
   if (str == nullptr) {
     return;
   }
   for (int i = 0; str[i] != '\0'; ++i) {
-    VgaPutc(str[i]);
+    VgaPutcLocked(str[i]);
   }
 }
 
+}  // namespace
+
+void VgaClear() {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
+  g_cursor_row = 0;
+  g_cursor_col = 0;
+  for (int r = 0; r < kVgaHeight; ++r) {
+    for (int c = 0; c < kVgaWidth; ++c) {
+      WriteCell(r, c, ' ');
+    }
+  }
+}
+
+void VgaPutc(const char ch) {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
+  VgaPutcLocked(ch);
+}
+
+void VgaWrite(const char* const str) {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
+  VgaWriteLocked(str);
+}
+
 void VgaWriteHex(const uint64_t value) {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
   constexpr const char* kHexDigits = "0123456789ABCDEF";
-  VgaWrite("0x");
+  VgaWriteLocked("0x");
   if (value == 0) {
-    VgaPutc('0');
+    VgaPutcLocked('0');
     return;
   }
   char buffer[16];
@@ -250,13 +264,14 @@ void VgaWriteHex(const uint64_t value) {
   }
   while (count > 0) {
     --count;
-    VgaPutc(buffer[count]);
+    VgaPutcLocked(buffer[count]);
   }
 }
 
 void VgaWriteDec(const uint64_t value) {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
   if (value == 0) {
-    VgaPutc('0');
+    VgaPutcLocked('0');
     return;
   }
   char buffer[20];
@@ -269,7 +284,7 @@ void VgaWriteDec(const uint64_t value) {
   }
   while (count > 0) {
     --count;
-    VgaPutc(buffer[count]);
+    VgaPutcLocked(buffer[count]);
   }
 }
 
@@ -278,6 +293,7 @@ void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
                           const int width,               //
                           const int height,              //
                           const int bpp) {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
   if (fb_phys_addr == 0 || pitch <= 0 || width < kVgaWidth * kGlyphWidth ||
       height < kVgaHeight * kGlyphHeight || (bpp != 32 && bpp != 24)) {
     return;

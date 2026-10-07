@@ -3,6 +3,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -11,6 +12,7 @@
 
 #include "paging.h"
 #include "pmm.h"
+#include "spinlock.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -798,11 +800,102 @@ TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
                                    nullptr),
                "Check failed");
 
-  // Calling SMP query accessors before SmpInit succeeds must trigger DCHECK.
+  // Calling SMP query accessors or SmpRunOnAllCpus before SmpInit succeeds
+  // must trigger DCHECK.
   EXPECT_DEATH(SmpCpuCount(), "Check failed");
   EXPECT_DEATH(SmpOnlineCpuCount(), "Check failed");
   EXPECT_DEATH(SmpGetCpuInfo(0), "Check failed");
   EXPECT_DEATH(SmpLocalApicPhysAddr(), "Check failed");
+  EXPECT_DEATH(SmpRunOnAllCpus([](int, void*) {}, nullptr), "Check failed");
+}
+
+TEST(SmpTest,
+     SmpRunOnAllCpusDispatchesConcurrentlyAcrossSingleAndMultipleCpus) {
+  ResetState(BaseAddr());
+  const uintptr_t rsdt_addr = OffsetAddr(0x6100);
+  const uintptr_t madt_addr = OffsetAddr(0x6400);
+  const uintptr_t bios_rom_base = OffsetAddr(0x7000);
+
+  // 1. Single-CPU topology: SmpRunOnAllCpus executes work_fn on CPU 0.
+  std::vector<uint8_t> single_recs;
+  AppendLapicRecord(&single_recs, 0, 0, 1);
+  WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, single_recs);
+  WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
+  WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
+  SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
+  SmpInit(kMultiboot1Magic, 0);
+  ASSERT_THAT(SmpCpuCount(), t::Eq(1));
+
+  int single_cpu_calls = 0;
+  SmpRunOnAllCpus(
+      [](const int cpu_index, void* const ctx) {
+        EXPECT_THAT(cpu_index, t::Eq(0));
+        ++(*static_cast<int*>(ctx));
+      },
+      &single_cpu_calls);
+  EXPECT_THAT(single_cpu_calls, t::Eq(1));
+
+  // Null work_fn or nested SmpRunOnAllCpus must trigger DCHECK.
+  EXPECT_DEATH(SmpRunOnAllCpus(nullptr, nullptr), "Check failed");
+  EXPECT_DEATH(
+      SmpRunOnAllCpus(
+          [](int, void*) { SmpRunOnAllCpus([](int, void*) {}, nullptr); },
+          nullptr),
+      "Check failed");
+
+  // 2. Multi-CPU topology (4 CPUs): SmpRunOnAllCpus executes concurrently
+  //    across all 4 CPUs with a simultaneous barrier and IrqSpinLock
+  //    synchronization across multiple dispatch rounds.
+  ResetState(BaseAddr());
+  std::vector<uint8_t> multi_recs;
+  for (int i = 0; i < 4; ++i) {
+    AppendLapicRecord(&multi_recs,              //
+                      static_cast<uint8_t>(i),  //
+                      static_cast<uint8_t>(i),  //
+                      1);
+  }
+  WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, multi_recs);
+  WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
+  WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
+  SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
+  SmpInit(kMultiboot1Magic, 0);
+  ASSERT_THAT(SmpCpuCount(), t::Eq(4));
+
+  struct DispatchTestState {
+    IrqSpinLock lock;
+    std::atomic<int> arrived{0};
+    int64_t total_counter = 0;
+    int per_cpu_runs[4] = {};
+  };
+
+  DispatchTestState dispatch_state = {};
+  for (int round = 0; round < 3; ++round) {
+    dispatch_state.arrived.store(0, std::memory_order_release);
+    SmpRunOnAllCpus(
+        [](const int cpu_index, void* const raw_ctx) {
+          DispatchTestState* const st =
+              static_cast<DispatchTestState*>(raw_ctx);
+          ASSERT_GE(cpu_index, 0);
+          ASSERT_LT(cpu_index, 4);
+
+          // Wait for all 4 CPUs to arrive concurrently.
+          st->arrived.fetch_add(1, std::memory_order_acq_rel);
+          while (st->arrived.load(std::memory_order_acquire) < 4) {
+            asm volatile("pause" : : : "memory");
+          }
+
+          for (int iter = 0; iter < 500; ++iter) {
+            const IrqSpinLockGuard guard(st->lock);
+            ++st->total_counter;
+          }
+          const IrqSpinLockGuard guard(st->lock);
+          ++st->per_cpu_runs[cpu_index];
+        },
+        &dispatch_state);
+  }
+
+  EXPECT_THAT(dispatch_state.total_counter, t::Eq(3 * 4 * 500));
+  EXPECT_THAT(dispatch_state.per_cpu_runs, t::ElementsAre(3, 3, 3, 3));
 }
 
 }  // namespace

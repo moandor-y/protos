@@ -126,6 +126,17 @@ const CpuInfo* SmpGetCpuInfo(int index);
 // during `SmpInit`. Validates with `DCHECK` that `SmpInit` has completed.
 uintptr_t SmpLocalApicPhysAddr();
 
+// Callback signature for multi-CPU work dispatched via `SmpRunOnAllCpus`.
+using SmpWorkFn = void (*)(int cpu_index, void* context);
+
+// Dispatches non-null `work_fn(cpu_index, context)` across all online CPUs
+// (`0 .. SmpCpuCount() - 1`), synchronizing all CPUs at a start barrier so
+// they execute `work_fn` concurrently, waiting for all CPUs to complete, and
+// returning all Application Processors cleanly to their halted idle state.
+// Validates with `DCHECK` that `SmpInit` has completed and `work_fn !=
+// nullptr`.
+void SmpRunOnAllCpus(SmpWorkFn work_fn, void* context);
+
 #if __STDC_HOSTED__
 // Host unit-test hook for overriding hardware AP bring-up behavior and 32-bit
 // ACPI table pointer base during host tests.

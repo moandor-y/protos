@@ -1,5 +1,6 @@
 #include "memory_tests.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -8,6 +9,7 @@
 #include "paging.h"
 #include "pmm.h"
 #include "smp.h"
+#include "spinlock.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -541,6 +543,269 @@ static bool TestSmpDiscoveryAndApBringup() {
   return true;
 }
 
+struct ConcurrentHeapItem {
+  uint64_t tag;
+  uint64_t inverted_tag;
+
+  explicit ConcurrentHeapItem(const uint64_t seed)
+      : tag(seed), inverted_tag(~seed) {}
+
+  bool IsValid(const uint64_t expected_seed) const {
+    return tag == expected_seed && inverted_tag == ~expected_seed;
+  }
+};
+
+struct KfreeDeleter {
+  void operator()(void* const ptr) const { Kfree(ptr); }
+};
+
+class ScopedPmmFrames {
+ public:
+  ScopedPmmFrames(const uintptr_t addr, const int64_t count)
+      : addr_(addr), count_(count) {}
+
+  ~ScopedPmmFrames() {
+    if (addr_ != 0) {
+      PmmFreeFrames(addr_, count_);
+    }
+  }
+
+  ScopedPmmFrames(const ScopedPmmFrames&) = delete;
+  ScopedPmmFrames& operator=(const ScopedPmmFrames&) = delete;
+
+  uintptr_t get() const { return addr_; }
+
+ private:
+  uintptr_t addr_;
+  int64_t count_;
+};
+
+struct MultiCpuStressContext {
+  IrqSpinLock counter_lock;
+  int64_t shared_counter = 0;
+  int64_t invariant_a = 0;
+  int64_t invariant_b = 0;
+  int expected_cpus = 0;
+  std::atomic<int> start_barrier_count{0};
+  int second_pass_count = 0;
+  bool per_cpu_ok[kMaxCpus] = {};
+};
+
+constexpr int kMultiCpuStressIterations = 64;
+
+static void MultiCpuStressWorker(const int cpu_index, void* const raw_context) {
+  MultiCpuStressContext* const ctx =
+      static_cast<MultiCpuStressContext*>(raw_context);
+  if (ctx == nullptr || cpu_index < 0 || cpu_index >= ctx->expected_cpus) {
+    return;
+  }
+
+  ctx->start_barrier_count.fetch_add(1, std::memory_order_acq_rel);
+  while (ctx->start_barrier_count.load(std::memory_order_acquire) <
+         ctx->expected_cpus) {
+    asm volatile("pause" : : : "memory");
+  }
+
+  bool ok = true;
+  for (int iter = 0; iter < kMultiCpuStressIterations; ++iter) {
+    // 1. Increment shared counter and update two-part invariant under
+    //    IrqSpinLock.
+    {
+      const IrqSpinLockGuard guard(ctx->counter_lock);
+      if (AreInterruptsEnabled() || !ctx->counter_lock.IsLockedByCurrentCpu() ||
+          (ctx->invariant_a + ctx->invariant_b) != 0) {
+        ok = false;
+      }
+      const int64_t delta = (cpu_index + 1) * 17 + iter;
+      ctx->invariant_a += delta;
+      ++ctx->shared_counter;
+      ctx->invariant_b -= delta;
+    }
+
+    // 2. Concurrent PMM single-frame and multi-frame allocation + pattern
+    //    verification.
+    const ScopedPmmFrames frame_single(PmmAllocFrame(), 1);
+    const ScopedPmmFrames frame_pair(PmmAllocFrames(2), 2);
+    if (frame_single.get() == 0 || frame_pair.get() == 0 ||
+        frame_single.get() == frame_pair.get() ||
+        (frame_single.get() & (kPageSize - 1)) != 0 ||
+        (frame_pair.get() & (kPageSize - 1)) != 0 ||
+        !PmmRangeIsValidUsableRam(frame_single.get(), kPageSize) ||
+        !PmmRangeIsValidUsableRam(frame_pair.get(), 2 * kPageSize)) {
+      ok = false;
+      break;
+    }
+
+    const uint64_t frame_pat1 = 0xC0DEC0DE00000000ULL |
+                                (static_cast<uint64_t>(cpu_index) << 16) |
+                                static_cast<uint64_t>(iter);
+    const uint64_t frame_pat2 = frame_pat1 ^ 0x55AA55AA55AA55AAULL;
+    volatile uint64_t* const f1_words =
+        reinterpret_cast<volatile uint64_t*>(frame_single.get());
+    volatile uint64_t* const f2_first =
+        reinterpret_cast<volatile uint64_t*>(frame_pair.get());
+    volatile uint64_t* const f2_second =
+        reinterpret_cast<volatile uint64_t*>(frame_pair.get() + kPageSize);
+    f1_words[0] = frame_pat1;
+    f1_words[kPageSize / sizeof(uint64_t) - 1] = ~frame_pat1;
+    f2_first[0] = frame_pat2;
+    f2_second[kPageSize / sizeof(uint64_t) - 1] = ~frame_pat2;
+
+    // 3. Concurrent Kmalloc/Kfree and C++ new/delete allocations with per-CPU
+    //    payload verification.
+    const int64_t size_a = 32 + ((iter + cpu_index) % 8) * 32;
+    const int64_t size_b = 128 + ((iter * 3 + cpu_index) % 8) * 64;
+    const std::unique_ptr<uint8_t[], KfreeDeleter> buf_a(
+        static_cast<uint8_t*>(Kmalloc(size_a)));
+    const std::unique_ptr<uint8_t[], KfreeDeleter> buf_b(
+        static_cast<uint8_t*>(Kmalloc(size_b)));
+    const uint64_t item_seed =
+        0xA5A5000000000000ULL | (static_cast<uint64_t>(cpu_index) << 24) | iter;
+    const std::unique_ptr<ConcurrentHeapItem> heap_item =
+        std::make_unique<ConcurrentHeapItem>(item_seed);
+    constexpr int kArrayWords = 8;
+    const std::unique_ptr<uint64_t[]> heap_array =
+        std::make_unique<uint64_t[]>(kArrayWords);
+
+    if (buf_a == nullptr || buf_b == nullptr || heap_item == nullptr ||
+        heap_array == nullptr ||
+        (reinterpret_cast<uintptr_t>(buf_a.get()) & (kHeapAlignment - 1)) !=
+            0 ||
+        (reinterpret_cast<uintptr_t>(buf_b.get()) & (kHeapAlignment - 1)) !=
+            0) {
+      ok = false;
+      break;
+    }
+
+    const uint8_t byte_a =
+        static_cast<uint8_t>(((cpu_index + 1) * 29 + iter * 7) & 0xFF);
+    const uint8_t byte_b = static_cast<uint8_t>(byte_a ^ 0x3Cu);
+    for (int64_t i = 0; i < size_a; ++i) {
+      buf_a[i] = static_cast<uint8_t>(byte_a + (i & 0xF));
+    }
+    for (int64_t i = 0; i < size_b; ++i) {
+      buf_b[i] = static_cast<uint8_t>(byte_b ^ (i & 0xF));
+    }
+    for (int i = 0; i < kArrayWords; ++i) {
+      heap_array[i] = item_seed + i;
+    }
+
+    // Acquire the shared spinlock a second time while holding live PMM frames
+    // and Heap allocations so allocations across CPUs overlap in time.
+    {
+      const IrqSpinLockGuard guard(ctx->counter_lock);
+      if ((ctx->invariant_a + ctx->invariant_b) != 0) {
+        ok = false;
+      }
+      const int64_t delta = (cpu_index + 3) * 31 + iter;
+      ctx->invariant_a -= delta;
+      ++ctx->shared_counter;
+      ctx->invariant_b += delta;
+    }
+
+    if (f1_words[0] != frame_pat1 ||
+        f1_words[kPageSize / sizeof(uint64_t) - 1] != ~frame_pat1 ||
+        f2_first[0] != frame_pat2 ||
+        f2_second[kPageSize / sizeof(uint64_t) - 1] != ~frame_pat2 ||
+        !heap_item->IsValid(item_seed)) {
+      ok = false;
+    }
+    for (int64_t i = 0; i < size_a; ++i) {
+      if (buf_a[i] != static_cast<uint8_t>(byte_a + (i & 0xF))) {
+        ok = false;
+        break;
+      }
+    }
+    for (int64_t i = 0; i < size_b; ++i) {
+      if (buf_b[i] != static_cast<uint8_t>(byte_b ^ (i & 0xF))) {
+        ok = false;
+        break;
+      }
+    }
+    for (int i = 0; i < kArrayWords; ++i) {
+      if (heap_array[i] != item_seed + i) {
+        ok = false;
+        break;
+      }
+    }
+
+    // 4. Concurrent UART and VGA console logging on first and last iterations.
+    //    Pass a complete string per UartWrite / VgaWrite call so g_uart_lock
+    //    and g_vga_lock serialize the entire message atomically, and use '\r'
+    //    on VGA so Row 0 ("Hello, x86-64 Kernel World!") at 0xB8000 is never
+    //    scrolled off screen.
+    if (iter == 0 || iter + 1 == kMultiCpuStressIterations) {
+      const char cpu_digit = static_cast<char>('0' + (cpu_index % 10));
+      const char pass_digit = (iter == 0) ? '0' : '1';
+      const char uart_msg[] = {
+          '[', 'S',       'M',        'P', ']', ' ', 'C',  'P', 'U',
+          ' ', cpu_digit, ' ',        's', 'y', 'n', 'c',  ' ', 's',
+          't', 'r',       'e',        's', 's', ' ', 'p',  'a', 's',
+          's', ' ',       pass_digit, ' ', 'o', 'k', '\n', '\0'};
+      const char vga_msg[] = {'[', 'S', 'M',       'P', ']', ' ', 'C',  'P',
+                              'U', ' ', cpu_digit, ' ', 'o', 'k', '\r', '\0'};
+      UartWrite(uart_msg);
+      VgaWrite(vga_msg);
+    }
+  }
+
+  ctx->per_cpu_ok[cpu_index] = ok;
+}
+
+static void MultiCpuSecondPassWorker(const int cpu_index,
+                                     void* const raw_context) {
+  MultiCpuStressContext* const ctx =
+      static_cast<MultiCpuStressContext*>(raw_context);
+  if (ctx == nullptr || cpu_index < 0 || cpu_index >= ctx->expected_cpus) {
+    return;
+  }
+  const IrqSpinLockGuard guard(ctx->counter_lock);
+  ctx->second_pass_count += (cpu_index + 1);
+}
+
+static bool TestSmpMultiCpuSyncStress() {
+  const int cpu_count = SmpCpuCount();
+  if (cpu_count < 1 || SmpOnlineCpuCount() != cpu_count) {
+    return false;
+  }
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  if (pmm_free_before <= 0 || heap_free_before <= 0) {
+    return false;
+  }
+
+  MultiCpuStressContext ctx = {};
+  ctx.expected_cpus = cpu_count;
+
+  SmpRunOnAllCpus(MultiCpuStressWorker, &ctx);
+  // Ensure cursor is at column 0 before LogTestResult writes the test summary.
+  VgaPutc('\r');
+
+  // Dispatch a second round of work across all CPUs to verify APs returned
+  // cleanly to their halted state after the first round and can be re-woken.
+  SmpRunOnAllCpus(MultiCpuSecondPassWorker, &ctx);
+
+  const int64_t expected_counter =
+      static_cast<int64_t>(cpu_count) * kMultiCpuStressIterations * 2;
+  const int expected_second_pass = (cpu_count * (cpu_count + 1)) / 2;
+  if (ctx.shared_counter != expected_counter ||
+      (ctx.invariant_a + ctx.invariant_b) != 0 ||
+      ctx.second_pass_count != expected_second_pass) {
+    return false;
+  }
+
+  for (int i = 0; i < cpu_count; ++i) {
+    if (!ctx.per_cpu_ok[i]) {
+      return false;
+    }
+  }
+
+  return PmmFreeFrameCount() == pmm_free_before &&
+         HeapTotalFreeBytes() == heap_free_before &&
+         SmpOnlineCpuCount() == cpu_count;
+}
+
 }  // namespace
 
 void RunBootVerificationSuite() {
@@ -584,11 +849,16 @@ void RunBootVerificationSuite() {
   const bool smp_ok = TestSmpDiscoveryAndApBringup();
   LogTestResult("smp_discovery_and_ap_bringup", smp_ok);
 
+  const bool smp_sync_ok = TestSmpMultiCpuSyncStress();
+  LogTestResult("smp_multicpu_sync_stress", smp_sync_ok);
+
   if (pmm_ok && alloc_bounds_ok && free_reuse_ok && varied_ok && pattern_ok &&
-      cpp_ok && stress_ok && edge_ok && smp_ok) {
-    ConsoleWrite("[TEST] ALL MEMORY TESTS PASSED\n");
+      cpp_ok && stress_ok && edge_ok && smp_ok && smp_sync_ok) {
+    UartWrite("[TEST] ALL MEMORY TESTS PASSED\n");
+    VgaWrite("[TEST] ALL MEMORY TESTS PASSED");
   } else {
-    ConsoleWrite("[TEST] MEMORY VERIFICATION FAILED\n");
+    UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");
+    VgaWrite("[TEST] MEMORY VERIFICATION FAILED");
   }
 }
 

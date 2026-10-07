@@ -8,6 +8,7 @@
 #include "check.h"
 #include "pmm.h"
 #include "rbtree.h"
+#include "spinlock.h"
 
 namespace protos {
 
@@ -70,6 +71,12 @@ struct FreeBlockRbTraits {
 using FreeBlockTree = RbTree<HeapBlockHeader,            //
                              &HeapBlockHeader::rb_node,  //
                              FreeBlockRbTraits>;
+
+// Spinlock protecting `g_free_tree`, `g_total_free_bytes`, and
+// `g_heap_initialized` across concurrent multi-CPU heap operations.
+// When `Kmalloc` triggers `HeapExpand -> PmmAllocFrames`, lock acquisition
+// follows the strict order `g_heap_lock -> g_pmm_lock`.
+IrqSpinLock g_heap_lock;
 
 // Intrusive Red-Black Tree containing all currently FREE heap blocks across all
 // PMM arenas, keyed by each block header's physical address (`uintptr_t`) and
@@ -278,6 +285,7 @@ static void* KmallocAligned(const int64_t size, const int64_t alignment) {
 }  // namespace
 
 void HeapInit() {
+  const IrqSpinLockGuard lock_guard(g_heap_lock);
   g_free_tree.Clear();
   g_total_free_bytes = 0;
   g_heap_initialized = false;
@@ -290,7 +298,10 @@ void HeapInit() {
   g_heap_initialized = true;
 }
 
-int64_t HeapTotalFreeBytes() { return g_total_free_bytes; }
+int64_t HeapTotalFreeBytes() {
+  const IrqSpinLockGuard lock_guard(g_heap_lock);
+  return g_total_free_bytes;
+}
 
 // Address-ordered first-fit allocator over `g_free_tree`:
 // 1. Rounds `size` up to a non-zero multiple of `kHeapAlignment` (16 bytes).
@@ -300,6 +311,7 @@ int64_t HeapTotalFreeBytes() { return g_total_free_bytes; }
 //    payload pointer (`candidate + 1`).
 // 3. If no existing free block fits, expands the heap via `HeapExpand`.
 void* Kmalloc(const int64_t size) {
+  const IrqSpinLockGuard lock_guard(g_heap_lock);
   DCHECK(g_heap_initialized);
   DCHECK(size >= 0);
   const uintptr_t max_phys = PmmMaxPhysicalAddress();
@@ -335,6 +347,7 @@ void Kfree(void* const ptr) {
   if (ptr == nullptr) {
     return;
   }
+  const IrqSpinLockGuard lock_guard(g_heap_lock);
   DCHECK(g_heap_initialized);
   const uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(ptr);
   DCHECK(ptr_addr >= kLowerMemoryLimit + kBlockHeaderSize);

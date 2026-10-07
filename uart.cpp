@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "spinlock.h"
+
 namespace protos {
 
 namespace {
@@ -9,6 +11,7 @@ namespace {
 constexpr uint16_t kCom1Port = 0x3F8;
 constexpr int kMaxTransmitPollIterations = 100000;
 
+IrqSpinLock g_uart_lock;
 bool g_uart_present = false;
 
 static inline void Outb(const uint16_t port, const uint8_t value) {
@@ -21,22 +24,7 @@ static inline uint8_t Inb(const uint16_t port) {
   return value;
 }
 
-}  // namespace
-
-void UartInit() {
-  Outb(kCom1Port + 1, 0x00);
-  Outb(kCom1Port + 3, 0x80);
-  Outb(kCom1Port + 0, 0x03);
-  Outb(kCom1Port + 1, 0x00);
-  Outb(kCom1Port + 3, 0x03);
-  Outb(kCom1Port + 2, 0xC7);
-  Outb(kCom1Port + 4, 0x0B);
-
-  // If the Line Status Register floats high (0xFF), no UART is decoding 0x3F8.
-  g_uart_present = (Inb(kCom1Port + 5) != 0xFF);
-}
-
-void UartPutc(const char c) {
+static void UartPutcLocked(const char c) {
   if (!g_uart_present) {
     return;
   }
@@ -52,20 +40,50 @@ void UartPutc(const char c) {
   g_uart_present = false;
 }
 
-void UartWrite(const char* const str) {
+static void UartWriteLocked(const char* const str) {
+  if (str == nullptr) {
+    return;
+  }
   for (int i = 0; str[i] != '\0'; ++i) {
     if (str[i] == '\n') {
-      UartPutc('\r');
+      UartPutcLocked('\r');
     }
-    UartPutc(str[i]);
+    UartPutcLocked(str[i]);
   }
 }
 
+}  // namespace
+
+void UartInit() {
+  const IrqSpinLockGuard lock_guard(g_uart_lock);
+  Outb(kCom1Port + 1, 0x00);
+  Outb(kCom1Port + 3, 0x80);
+  Outb(kCom1Port + 0, 0x03);
+  Outb(kCom1Port + 1, 0x00);
+  Outb(kCom1Port + 3, 0x03);
+  Outb(kCom1Port + 2, 0xC7);
+  Outb(kCom1Port + 4, 0x0B);
+
+  // If the Line Status Register floats high (0xFF), no UART is decoding 0x3F8.
+  g_uart_present = (Inb(kCom1Port + 5) != 0xFF);
+}
+
+void UartPutc(const char c) {
+  const IrqSpinLockGuard lock_guard(g_uart_lock);
+  UartPutcLocked(c);
+}
+
+void UartWrite(const char* const str) {
+  const IrqSpinLockGuard lock_guard(g_uart_lock);
+  UartWriteLocked(str);
+}
+
 void UartWriteHex(const uint64_t value) {
+  const IrqSpinLockGuard lock_guard(g_uart_lock);
   constexpr const char* kHexDigits = "0123456789ABCDEF";
-  UartWrite("0x");
+  UartWriteLocked("0x");
   if (value == 0) {
-    UartPutc('0');
+    UartPutcLocked('0');
     return;
   }
   char buffer[16];
@@ -78,13 +96,14 @@ void UartWriteHex(const uint64_t value) {
   }
   while (count > 0) {
     --count;
-    UartPutc(buffer[count]);
+    UartPutcLocked(buffer[count]);
   }
 }
 
 void UartWriteDec(const uint64_t value) {
+  const IrqSpinLockGuard lock_guard(g_uart_lock);
   if (value == 0) {
-    UartPutc('0');
+    UartPutcLocked('0');
     return;
   }
   char buffer[20];
@@ -97,7 +116,7 @@ void UartWriteDec(const uint64_t value) {
   }
   while (count > 0) {
     --count;
-    UartPutc(buffer[count]);
+    UartPutcLocked(buffer[count]);
   }
 }
 

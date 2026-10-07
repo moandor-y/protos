@@ -1,0 +1,286 @@
+#include "spinlock.h"
+
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <cstdint>
+#include <thread>
+#include <vector>
+
+namespace protos {
+namespace {
+
+namespace t = ::testing;
+
+// Global constexpr instance to verify compile-time zero-initialization for
+// `.bss` compatibility.
+constinit IrqSpinLock g_static_spinlock;
+
+TEST(SpinLockTest, ConstexprInitAndBasicLockUnlock) {
+  EXPECT_FALSE(g_static_spinlock.IsLocked());
+  EXPECT_FALSE(g_static_spinlock.IsLockedByCurrentCpu());
+  EXPECT_THAT(g_static_spinlock.NextTicket(), t::Eq(0));
+  EXPECT_THAT(g_static_spinlock.ServingTicket(), t::Eq(0));
+
+  IrqSpinLock::SetInterruptsEnabledForTest(true);
+  ASSERT_TRUE(AreInterruptsEnabled());
+
+  g_static_spinlock.Lock();
+  EXPECT_TRUE(g_static_spinlock.IsLocked());
+  EXPECT_TRUE(g_static_spinlock.IsLockedByCurrentCpu());
+  EXPECT_FALSE(AreInterruptsEnabled());
+  EXPECT_THAT(g_static_spinlock.NextTicket(), t::Eq(1));
+  EXPECT_THAT(g_static_spinlock.ServingTicket(), t::Eq(0));
+
+  g_static_spinlock.Unlock();
+  EXPECT_FALSE(g_static_spinlock.IsLocked());
+  EXPECT_FALSE(g_static_spinlock.IsLockedByCurrentCpu());
+  EXPECT_TRUE(AreInterruptsEnabled());
+  EXPECT_THAT(g_static_spinlock.NextTicket(), t::Eq(1));
+  EXPECT_THAT(g_static_spinlock.ServingTicket(), t::Eq(1));
+}
+
+TEST(SpinLockTest, ScopedGuardSupportsReferenceAndPointer) {
+  IrqSpinLock lock;
+  SetInterruptsEnabledForTest(true);
+
+  {
+    const IrqSpinLockGuard guard(lock);
+    EXPECT_TRUE(lock.IsLocked());
+    EXPECT_TRUE(lock.IsLockedByCurrentCpu());
+    EXPECT_FALSE(AreInterruptsEnabled());
+  }
+  EXPECT_FALSE(lock.IsLocked());
+  EXPECT_TRUE(AreInterruptsEnabled());
+
+  {
+    const IrqSpinLockGuard guard(&lock);
+    EXPECT_TRUE(lock.IsLocked());
+    EXPECT_TRUE(lock.IsLockedByCurrentCpu());
+    EXPECT_FALSE(AreInterruptsEnabled());
+  }
+  EXPECT_FALSE(lock.IsLocked());
+  EXPECT_TRUE(AreInterruptsEnabled());
+}
+
+TEST(SpinLockTest, InterruptFlagSaveAndRestoreAcrossSingleAndNestedLocks) {
+  IrqSpinLock lock_a;
+  IrqSpinLock lock_b;
+  IrqSpinLock lock_c;
+
+  // Case 1: Interrupts initially enabled -> disabled during nested critical
+  // sections -> restored only when outermost lock is released.
+  SetInterruptsEnabledForTest(true);
+  ASSERT_TRUE(AreInterruptsEnabled());
+  {
+    const IrqSpinLockGuard guard_a(lock_a);
+    EXPECT_FALSE(AreInterruptsEnabled());
+    {
+      const IrqSpinLockGuard guard_b(lock_b);
+      EXPECT_FALSE(AreInterruptsEnabled());
+      {
+        const IrqSpinLockGuard guard_c(lock_c);
+        EXPECT_FALSE(AreInterruptsEnabled());
+      }
+      EXPECT_FALSE(AreInterruptsEnabled());
+    }
+    EXPECT_FALSE(AreInterruptsEnabled());
+  }
+  EXPECT_TRUE(AreInterruptsEnabled());
+
+  // Case 2: Interrupts initially disabled -> remain disabled throughout and
+  // after outermost unlock.
+  SetInterruptsEnabledForTest(false);
+  ASSERT_FALSE(AreInterruptsEnabled());
+  {
+    const IrqSpinLockGuard guard_a(lock_a);
+    EXPECT_FALSE(AreInterruptsEnabled());
+    {
+      const IrqSpinLockGuard guard_b(lock_b);
+      EXPECT_FALSE(AreInterruptsEnabled());
+    }
+    EXPECT_FALSE(AreInterruptsEnabled());
+  }
+  EXPECT_FALSE(AreInterruptsEnabled());
+
+  SetInterruptsEnabledForTest(true);
+  EXPECT_TRUE(AreInterruptsEnabled());
+}
+
+TEST(SpinLockTest, EnforcesStrictFifoTicketOrdering) {
+  IrqSpinLock lock;
+  constexpr int kNumWaiters = 6;
+  std::vector<int> acquisition_order;
+  acquisition_order.reserve(kNumWaiters);
+
+  // Acquire the lock on the main thread (ticket 0) so all worker threads must
+  // queue up on consecutive tickets 1..kNumWaiters.
+  lock.Lock();
+  ASSERT_THAT(lock.NextTicket(), t::Eq(1));
+  ASSERT_THAT(lock.ServingTicket(), t::Eq(0));
+
+  std::vector<std::thread> waiters;
+  waiters.reserve(kNumWaiters);
+  for (int i = 0; i < kNumWaiters; ++i) {
+    const int64_t expected_next_ticket = i + 2;
+    waiters.emplace_back([&lock, &acquisition_order, i]() {
+      const IrqSpinLockGuard guard(lock);
+      acquisition_order.push_back(i);
+    });
+    // Wait until thread `i` has fetched its ticket before spawning `i + 1` so
+    // ticket assignment order is strictly 0, 1, ..., kNumWaiters - 1.
+    while (lock.NextTicket() < expected_next_ticket) {
+      std::this_thread::yield();
+    }
+  }
+
+  // Release the initial lock; queued waiters must enter and exit in exact
+  // ticket order 0, 1, 2, 3, 4, 5.
+  lock.Unlock();
+
+  for (std::thread& waiter : waiters) {
+    waiter.join();
+  }
+
+  EXPECT_THAT(acquisition_order, t::ElementsAre(0, 1, 2, 3, 4, 5));
+  EXPECT_THAT(lock.NextTicket(), t::Eq(kNumWaiters + 1));
+  EXPECT_THAT(lock.ServingTicket(), t::Eq(kNumWaiters + 1));
+}
+
+TEST(SpinLockTest, MutualExclusionAndProgressUnderHighContention) {
+  IrqSpinLock lock;
+  constexpr int kNumThreads = 8;
+  constexpr int kIterationsPerThread = 1500;
+
+  std::atomic<bool> start_flag{false};
+  std::atomic<int> ready_threads{0};
+  std::atomic<int> active_in_critical_section{0};
+  int64_t shared_counter = 0;
+  int64_t invariant_a = 0;
+  int64_t invariant_b = 0;
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+  for (int tid = 0; tid < kNumThreads; ++tid) {
+    threads.emplace_back([&, tid]() {
+      const bool initial_irq = (tid % 2 == 0);
+      SetInterruptsEnabledForTest(initial_irq);
+      ready_threads.fetch_add(1, std::memory_order_acq_rel);
+      while (!start_flag.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+
+      for (int iter = 0; iter < kIterationsPerThread; ++iter) {
+        {
+          const IrqSpinLockGuard guard(lock);
+          const int concurrent = active_in_critical_section.fetch_add(
+              1, std::memory_order_acq_rel);
+          ASSERT_THAT(concurrent, t::Eq(0));
+          ASSERT_FALSE(AreInterruptsEnabled());
+          ASSERT_TRUE(lock.IsLockedByCurrentCpu());
+          ASSERT_THAT(invariant_a + invariant_b, t::Eq(0));
+
+          const int64_t delta = (tid + 1) * 13 + iter;
+          invariant_a += delta;
+          ++shared_counter;
+          invariant_b -= delta;
+
+          active_in_critical_section.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        ASSERT_THAT(AreInterruptsEnabled(), t::Eq(initial_irq));
+      }
+      SetInterruptsEnabledForTest(true);
+    });
+  }
+
+  while (ready_threads.load(std::memory_order_acquire) < kNumThreads) {
+    std::this_thread::yield();
+  }
+  start_flag.store(true, std::memory_order_release);
+
+  for (std::thread& worker : threads) {
+    worker.join();
+  }
+
+  constexpr int64_t kExpectedTotal =
+      static_cast<int64_t>(kNumThreads) * kIterationsPerThread;
+  EXPECT_THAT(shared_counter, t::Eq(kExpectedTotal));
+  EXPECT_THAT(invariant_a + invariant_b, t::Eq(0));
+  EXPECT_THAT(lock.NextTicket(), t::Eq(kExpectedTotal));
+  EXPECT_THAT(lock.ServingTicket(), t::Eq(kExpectedTotal));
+  EXPECT_FALSE(lock.IsLocked());
+}
+
+TEST(SpinLockDeathTest, InvariantViolationsTriggerDcheck) {
+  // Null pointer passed to IrqSpinLockGuard triggers DCHECK.
+  EXPECT_DEATH(
+      {
+        IrqSpinLock* const null_lock = nullptr;
+        const IrqSpinLockGuard guard(null_lock);
+      },
+      "Check failed");
+
+  // Unlocking an unlocked spinlock triggers DCHECK.
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock;
+        lock.Unlock();
+      },
+      "Check failed");
+
+  // Double unlock triggers DCHECK.
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock;
+        lock.Lock();
+        lock.Unlock();
+        lock.Unlock();
+      },
+      "Check failed");
+
+  // Recursive lock on the same CPU/thread triggers DCHECK immediately without
+  // deadlocking.
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock;
+        lock.Lock();
+        lock.Lock();
+      },
+      "Check failed");
+
+  // Out-of-order (non-LIFO) unlock of nested locks triggers DCHECK.
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock_a;
+        IrqSpinLock lock_b;
+        lock_a.Lock();
+        lock_b.Lock();
+        lock_a.Unlock();
+      },
+      "Check failed");
+
+  // Re-enabling interrupts while holding an IrqSpinLock triggers DCHECK on
+  // Unlock().
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock;
+        lock.Lock();
+        SetInterruptsEnabledForTest(true);
+        lock.Unlock();
+      },
+      "Check failed");
+
+  // Unlocking a lock held by a different thread triggers DCHECK.
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock;
+        lock.Lock();
+        std::thread other([&lock]() { lock.Unlock(); });
+        other.join();
+      },
+      "Check failed");
+}
+
+}  // namespace
+}  // namespace protos

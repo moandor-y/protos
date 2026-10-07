@@ -3,9 +3,12 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "multiboot.h"
 #include "paging.h"
@@ -742,6 +745,101 @@ TEST(PmmTest, InvalidAndDoubleFreeTriggerDcheck) {
 
   PmmFreeFrames(allocated, 4);
   EXPECT_DEATH(PmmFreeFrame(allocated), "Check failed");
+}
+
+TEST(PmmTest, ConcurrentMultiThreadedAllocAndFreeStress) {
+  ResetFakeEnv(2560);
+  constexpr int64_t kArenaStartFrame = 32;
+  constexpr int64_t kArenaFrames = 2048;
+  AddRegion(FrameAddr(kArenaStartFrame),  //
+            kArenaFrames * kPageSize,     //
+            kMemoryTypeAvailable);
+  PmmInit(0, 0);
+  ASSERT_THAT(PmmFreeFrameCount(), t::Eq(kArenaFrames));
+
+  constexpr int kNumThreads = 8;
+  constexpr int kIterationsPerThread = 200;
+  std::atomic<int> ready_threads{0};
+  std::atomic<bool> start_gate{false};
+
+  std::vector<std::thread> workers;
+  workers.reserve(kNumThreads);
+  for (int tid = 0; tid < kNumThreads; ++tid) {
+    workers.emplace_back([&, tid]() {
+      ready_threads.fetch_add(1, std::memory_order_acq_rel);
+      while (!start_gate.load(std::memory_order_acquire)) {
+        asm volatile("pause" : : : "memory");
+      }
+
+      for (int iter = 0; iter < kIterationsPerThread; ++iter) {
+        const int64_t run_len = ((iter + tid) % 4) + 1;
+        const uintptr_t single = PmmAllocFrame();
+        const uintptr_t multi = PmmAllocFrames(run_len);
+        ASSERT_THAT(single, t::Ne(0u));
+        ASSERT_THAT(multi, t::Ne(0u));
+        ASSERT_THAT(single, t::Ne(multi));
+        ASSERT_THAT(single & (kPageSize - 1), t::Eq(0u));
+        ASSERT_THAT(multi & (kPageSize - 1), t::Eq(0u));
+        ASSERT_TRUE(PmmRangeIsValidUsableRam(single, kPageSize));
+        ASSERT_TRUE(PmmRangeIsValidUsableRam(multi, run_len * kPageSize));
+
+        const uint64_t base_tag = 0xCAFE000000000000ULL |
+                                  (static_cast<uint64_t>(tid) << 32) |
+                                  (static_cast<uint64_t>(iter) << 8);
+        uint64_t* const single_words = reinterpret_cast<uint64_t*>(single);
+        single_words[0] = base_tag;
+        single_words[kPageSize / sizeof(uint64_t) - 1] = ~base_tag;
+
+        for (int64_t f = 0; f < run_len; ++f) {
+          uint64_t* const page_words =
+              reinterpret_cast<uint64_t*>(multi + f * kPageSize);
+          const uint64_t page_tag = base_tag | static_cast<uint64_t>(f + 1);
+          page_words[0] = page_tag;
+          page_words[kPageSize / sizeof(uint64_t) - 1] = ~page_tag;
+        }
+
+        const int64_t observed_free = PmmFreeFrameCount();
+        EXPECT_GE(observed_free, 0);
+        EXPECT_LE(observed_free, kArenaFrames);
+
+        ASSERT_THAT(single_words[0], t::Eq(base_tag));
+        ASSERT_THAT(single_words[kPageSize / sizeof(uint64_t) - 1],
+                    t::Eq(~base_tag));
+        for (int64_t f = 0; f < run_len; ++f) {
+          const uint64_t* const page_words =
+              reinterpret_cast<const uint64_t*>(multi + f * kPageSize);
+          const uint64_t page_tag = base_tag | static_cast<uint64_t>(f + 1);
+          ASSERT_THAT(page_words[0], t::Eq(page_tag));
+          ASSERT_THAT(page_words[kPageSize / sizeof(uint64_t) - 1],
+                      t::Eq(~page_tag));
+        }
+
+        if ((iter & 1) == 0) {
+          PmmFreeFrame(single);
+          PmmFreeFrames(multi, run_len);
+        } else {
+          PmmFreeFrames(multi, run_len);
+          PmmFreeFrame(single);
+        }
+      }
+    });
+  }
+
+  while (ready_threads.load(std::memory_order_acquire) < kNumThreads) {
+    std::this_thread::yield();
+  }
+  start_gate.store(true, std::memory_order_release);
+
+  for (std::thread& worker : workers) {
+    worker.join();
+  }
+
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kArenaFrames));
+  const uintptr_t whole_arena = PmmAllocFrames(kArenaFrames);
+  EXPECT_THAT(whole_arena, t::Eq(FrameAddr(kArenaStartFrame)));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
+  PmmFreeFrames(whole_arena, kArenaFrames);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kArenaFrames));
 }
 
 }  // namespace

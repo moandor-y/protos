@@ -54,6 +54,7 @@ REQUIRED_MARKERS=(
   "[TEST] heap_stress_reuse: PASS"
   "[TEST] edge_cases_and_oom: PASS"
   "[TEST] smp_discovery_and_ap_bringup: PASS"
+  "[TEST] smp_multicpu_sync_stress: PASS"
   "[TEST] ALL MEMORY TESTS PASSED"
 )
 

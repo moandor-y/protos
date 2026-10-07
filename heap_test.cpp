@@ -3,11 +3,14 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "pmm.h"
+#include "spinlock.h"
 
 namespace protos {
 namespace {
@@ -32,6 +35,7 @@ struct FakePmmState {
   std::vector<int64_t> requested_counts;
 };
 
+IrqSpinLock g_fake_pmm_lock;
 FakePmmState g_pmm;
 
 static uintptr_t FakeRamBase() {
@@ -39,6 +43,7 @@ static uintptr_t FakeRamBase() {
 }
 
 static void ResetFakePmm(const int64_t zero_frames = 512) {
+  const IrqSpinLockGuard lock_guard(g_fake_pmm_lock);
   g_pmm = FakePmmState{};
   const int64_t bytes_to_zero = (zero_frames <= kFakeRamFrames)
                                     ? (zero_frames * kPageSize)
@@ -49,6 +54,7 @@ static void ResetFakePmm(const int64_t zero_frames = 512) {
 }  // namespace
 
 uintptr_t PmmMaxPhysicalAddress() {
+  const IrqSpinLockGuard lock_guard(g_fake_pmm_lock);
   if (g_pmm.max_phys_override != 0) {
     return g_pmm.max_phys_override;
   }
@@ -56,6 +62,7 @@ uintptr_t PmmMaxPhysicalAddress() {
 }
 
 uintptr_t PmmAllocFrames(const int64_t count) {
+  const IrqSpinLockGuard lock_guard(g_fake_pmm_lock);
   ++g_pmm.alloc_call_count;
   g_pmm.requested_counts.push_back(count);
   if (g_pmm.force_oom || count <= 0) {
@@ -577,6 +584,114 @@ TEST(HeapTest, HighFragmentationStressAndFullCoalescence) {
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(0));
   Kfree(whole_arena);
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
+}
+
+TEST(HeapTest, ConcurrentMultiThreadedAllocFreeAndArenaExpansionStress) {
+  ResetFakePmm(kFakeRamFrames);
+  HeapInit();
+  const int64_t initial_free = HeapTotalFreeBytes();
+  const int64_t header_size = kInitialHeapFrames * kPageSize - initial_free;
+
+  constexpr int kNumThreads = 8;
+  constexpr int kIterationsPerThread = 120;
+  constexpr int kBatchSize = 6;
+  std::atomic<int> ready_threads{0};
+  std::atomic<bool> start_gate{false};
+  std::atomic<int> expanded_threads{0};
+
+  std::vector<std::thread> workers;
+  workers.reserve(kNumThreads);
+  for (int tid = 0; tid < kNumThreads; ++tid) {
+    workers.emplace_back([&, tid]() {
+      ready_threads.fetch_add(1, std::memory_order_acq_rel);
+      while (!start_gate.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+
+      // Phase 1: Each thread simultaneously holds a 192 KiB allocation
+      // (8 * 192 KiB = 1.5 MiB > 1 MiB initial arena) so concurrent threads
+      // deterministically trigger HeapExpand -> PmmAllocFrames under nested
+      // g_heap_lock -> g_fake_pmm_lock ordering.
+      constexpr int64_t kExpandAllocSize = 192 * 1024;
+      uint8_t* const expand_ptr =
+          static_cast<uint8_t*>(Kmalloc(kExpandAllocSize));
+      ASSERT_THAT(expand_ptr, t::NotNull());
+      const uint8_t expand_tag = static_cast<uint8_t>(0xA0 + tid);
+      std::memset(expand_ptr, expand_tag, kExpandAllocSize);
+      expanded_threads.fetch_add(1, std::memory_order_acq_rel);
+      while (expanded_threads.load(std::memory_order_acquire) < kNumThreads) {
+        std::this_thread::yield();
+      }
+      ASSERT_THAT(expand_ptr[0], t::Eq(expand_tag));
+      ASSERT_THAT(expand_ptr[kExpandAllocSize / 2], t::Eq(expand_tag));
+      ASSERT_THAT(expand_ptr[kExpandAllocSize - 1], t::Eq(expand_tag));
+      Kfree(expand_ptr);
+
+      // Phase 2: High-contention mixed-size allocations and frees.
+      for (int iter = 0; iter < kIterationsPerThread; ++iter) {
+        uint8_t* ptrs[kBatchSize] = {};
+        int64_t sizes[kBatchSize] = {};
+
+        for (int b = 0; b < kBatchSize; ++b) {
+          const int64_t req_size =
+              (((iter + tid + b) % 16) + 1) * kHeapAlignment;
+          sizes[b] = req_size;
+          ptrs[b] = static_cast<uint8_t*>(Kmalloc(req_size));
+          ASSERT_THAT(ptrs[b], t::NotNull());
+          ASSERT_THAT(
+              reinterpret_cast<uintptr_t>(ptrs[b]) & (kHeapAlignment - 1),
+              t::Eq(0u));
+          const uint8_t pattern =
+              static_cast<uint8_t>(((tid + 1) * 37 + iter * 11 + b * 5) & 0xFF);
+          std::memset(ptrs[b], pattern, req_size);
+        }
+
+        if ((iter & 15) == 0) {
+          EXPECT_GE(HeapTotalFreeBytes(), 0);
+        }
+
+        for (int b = 0; b < kBatchSize; ++b) {
+          const uint8_t expected =
+              static_cast<uint8_t>(((tid + 1) * 37 + iter * 11 + b * 5) & 0xFF);
+          ASSERT_THAT(ptrs[b][0], t::Eq(expected));
+          ASSERT_THAT(ptrs[b][sizes[b] / 2], t::Eq(expected));
+          ASSERT_THAT(ptrs[b][sizes[b] - 1], t::Eq(expected));
+        }
+
+        if ((iter & 1) == 0) {
+          for (int b = 0; b < kBatchSize; ++b) {
+            Kfree(ptrs[b]);
+          }
+        } else {
+          for (int b = kBatchSize; b > 0; --b) {
+            Kfree(ptrs[b - 1]);
+          }
+        }
+      }
+    });
+  }
+
+  while (ready_threads.load(std::memory_order_acquire) < kNumThreads) {
+    std::this_thread::yield();
+  }
+  start_gate.store(true, std::memory_order_release);
+
+  for (std::thread& worker : workers) {
+    worker.join();
+  }
+
+  // Because contiguous FakePmm arenas coalesce into the initial arena, the
+  // final free bytes must equal `g_pmm.next_frame * kPageSize - header_size`.
+  EXPECT_GT(g_pmm.alloc_call_count, 1);
+  const int64_t expected_total_free =
+      g_pmm.next_frame * kPageSize - header_size;
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(expected_total_free));
+
+  void* const whole_heap = Kmalloc(expected_total_free);
+  ASSERT_THAT(whole_heap, t::NotNull());
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(0));
+  Kfree(whole_heap);
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(expected_total_free));
 }
 
 }  // namespace

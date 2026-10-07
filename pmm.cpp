@@ -6,6 +6,7 @@
 #include "multiboot.h"
 #include "paging.h"
 #include "rbtree.h"
+#include "spinlock.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -72,6 +73,10 @@ struct PhysInterval {
 // non-available regions, lower memory, the kernel image, Multiboot structures,
 // and the framebuffer from at most `kMaxMemoryRegions` entries.
 constexpr int kMaxUsableIntervals = kMaxMemoryRegions * 2 + 16;
+
+// Spinlock protecting `g_free_run_tree`, `g_pmm_free_frames`, and PMM queries
+// across concurrent multi-CPU calls.
+IrqSpinLock g_pmm_lock;
 
 // Intrusive Red-Black Tree containing all currently FREE contiguous physical
 // frame runs across usable RAM, keyed by each run's base physical address
@@ -356,6 +361,76 @@ static void ConsoleWriteDec(const uint64_t value) {
   VgaWriteDec(value);
 }
 
+static bool PmmRangeIsValidUsableRamLocked(const uintptr_t addr,
+                                           const int64_t size) {
+  if (!g_pmm_initialized || size <= 0 || addr < kLowerMemoryLimit ||
+      addr >= g_max_managed_phys_addr ||
+      (g_max_managed_phys_addr - addr) < static_cast<uintptr_t>(size)) {
+    return false;
+  }
+
+  const uintptr_t end_addr = addr + size;
+  int low = 0;
+  int high = g_usable_interval_count - 1;
+  while (low <= high) {
+    const int mid = low + (high - low) / 2;
+    const PhysInterval& interval = g_usable_intervals[mid];
+    if (addr < interval.start) {
+      high = mid - 1;
+    } else if (addr >= interval.end) {
+      low = mid + 1;
+    } else {
+      return end_addr <= interval.end;
+    }
+  }
+  return false;
+}
+
+static uintptr_t PmmAllocFramesLocked(const int64_t count) {
+  DCHECK(g_pmm_initialized);
+  DCHECK(count > 0);
+  if (count > g_pmm_free_frames) {
+    return 0;
+  }
+
+  FreeRunNode* const candidate = g_free_run_tree.FindFirstAugmented(
+      [count](const FreeRunNode& node) {
+        return node.max_subtree_frames >= count;
+      },
+      [count](const FreeRunNode& node) { return node.frame_count >= count; });
+  if (candidate == nullptr) {
+    return 0;
+  }
+
+  const uintptr_t alloc_addr = RunBaseAddress(candidate);
+  const int64_t total_frames = candidate->frame_count;
+  DCHECK(total_frames >= count);
+  FreeRunTreeRemove(candidate);
+
+  if (total_frames > count) {
+    const uintptr_t remainder_addr = alloc_addr + count * kPageSize;
+    const int64_t remainder_frames = total_frames - count;
+    FreeRunTreeInsert(remainder_addr, remainder_frames);
+  }
+
+  return alloc_addr;
+}
+
+static void PmmFreeFramesLocked(const uintptr_t base_addr,
+                                const int64_t count) {
+  DCHECK(g_pmm_initialized);
+  DCHECK(count > 0);
+  DCHECK(base_addr >= kLowerMemoryLimit);
+  DCHECK((base_addr & (kPageSize - 1)) == 0);
+  DCHECK(base_addr < g_max_managed_phys_addr);
+  DCHECK(static_cast<uintptr_t>(count) <=
+         (g_max_managed_phys_addr - base_addr) / kPageSize);
+  const int64_t byte_size = count * kPageSize;
+  DCHECK(PmmRangeIsValidUsableRamLocked(base_addr, byte_size));
+
+  PmmCoalesceFreeRun(base_addr, count);
+}
+
 }  // namespace
 
 void PmmInit(const uint32_t multiboot_magic,
@@ -497,82 +572,38 @@ void PmmInit(const uint32_t multiboot_magic,
 }
 
 uintptr_t PmmAllocFrames(const int64_t count) {
-  DCHECK(g_pmm_initialized);
-  DCHECK(count > 0);
-  if (count > g_pmm_free_frames) {
-    return 0;
-  }
-
-  FreeRunNode* const candidate = g_free_run_tree.FindFirstAugmented(
-      [count](const FreeRunNode& node) {
-        return node.max_subtree_frames >= count;
-      },
-      [count](const FreeRunNode& node) { return node.frame_count >= count; });
-  if (candidate == nullptr) {
-    return 0;
-  }
-
-  const uintptr_t alloc_addr = RunBaseAddress(candidate);
-  const int64_t total_frames = candidate->frame_count;
-  DCHECK(total_frames >= count);
-  FreeRunTreeRemove(candidate);
-
-  if (total_frames > count) {
-    const uintptr_t remainder_addr = alloc_addr + count * kPageSize;
-    const int64_t remainder_frames = total_frames - count;
-    FreeRunTreeInsert(remainder_addr, remainder_frames);
-  }
-
-  return alloc_addr;
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  return PmmAllocFramesLocked(count);
 }
 
-uintptr_t PmmAllocFrame() { return PmmAllocFrames(1); }
+uintptr_t PmmAllocFrame() {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  return PmmAllocFramesLocked(1);
+}
 
 bool PmmRangeIsValidUsableRam(const uintptr_t addr, const int64_t size) {
-  if (!g_pmm_initialized || size <= 0 || addr < kLowerMemoryLimit ||
-      addr >= g_max_managed_phys_addr ||
-      (g_max_managed_phys_addr - addr) < static_cast<uintptr_t>(size)) {
-    return false;
-  }
-
-  const uintptr_t end_addr = addr + size;
-  int low = 0;
-  int high = g_usable_interval_count - 1;
-  while (low <= high) {
-    const int mid = low + (high - low) / 2;
-    const PhysInterval& interval = g_usable_intervals[mid];
-    if (addr < interval.start) {
-      high = mid - 1;
-    } else if (addr >= interval.end) {
-      low = mid + 1;
-    } else {
-      return end_addr <= interval.end;
-    }
-  }
-  return false;
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  return PmmRangeIsValidUsableRamLocked(addr, size);
 }
 
 void PmmFreeFrames(const uintptr_t base_addr, const int64_t count) {
-  DCHECK(g_pmm_initialized);
-  DCHECK(count > 0);
-  DCHECK(base_addr >= kLowerMemoryLimit);
-  DCHECK((base_addr & (kPageSize - 1)) == 0);
-  DCHECK(base_addr < g_max_managed_phys_addr);
-  DCHECK(static_cast<uintptr_t>(count) <=
-         (g_max_managed_phys_addr - base_addr) / kPageSize);
-  const int64_t byte_size = count * kPageSize;
-  DCHECK(PmmRangeIsValidUsableRam(base_addr, byte_size));
-
-  PmmCoalesceFreeRun(base_addr, count);
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  PmmFreeFramesLocked(base_addr, count);
 }
 
-void PmmFreeFrame(const uintptr_t frame_addr) { PmmFreeFrames(frame_addr, 1); }
+void PmmFreeFrame(const uintptr_t frame_addr) {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  PmmFreeFramesLocked(frame_addr, 1);
+}
 
 uintptr_t PmmMaxPhysicalAddress() { return g_max_managed_phys_addr; }
 
 int64_t PmmMaxFrameCount() { return g_max_frames; }
 
-int64_t PmmFreeFrameCount() { return g_pmm_free_frames; }
+int64_t PmmFreeFrameCount() {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  return g_pmm_free_frames;
+}
 
 int64_t PmmTotalUsableFrameCount() { return g_pmm_total_usable_frames; }
 
