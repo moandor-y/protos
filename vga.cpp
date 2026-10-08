@@ -189,6 +189,12 @@ static void ScrollUpOneRow() {
 }
 
 static void VgaPutcLocked(const char ch) {
+  if (g_cursor_row < 0 || g_cursor_row >= kVgaHeight) {
+    g_cursor_row = kVgaHeight - 1;
+  }
+  if (g_cursor_col < 0 || g_cursor_col >= kVgaWidth) {
+    g_cursor_col = 0;
+  }
   if (ch == '\r') {
     g_cursor_col = 0;
     return;
@@ -220,6 +226,25 @@ static void VgaWriteLocked(const char* const str) {
   }
   for (int i = 0; str[i] != '\0'; ++i) {
     VgaPutcLocked(str[i]);
+  }
+}
+
+static void VgaWriteDecLocked(const uint64_t value) {
+  if (value == 0) {
+    VgaPutcLocked('0');
+    return;
+  }
+  char buffer[20];
+  int count = 0;
+  uint64_t remaining = value;
+  while (remaining > 0) {
+    buffer[count] = '0' + (remaining % 10);
+    remaining /= 10;
+    ++count;
+  }
+  while (count > 0) {
+    --count;
+    VgaPutcLocked(buffer[count]);
   }
 }
 
@@ -270,23 +295,12 @@ void VgaWriteHex(const uint64_t value) {
 
 void VgaWriteDec(const uint64_t value) {
   const IrqSpinLockGuard lock_guard(g_vga_lock);
-  if (value == 0) {
-    VgaPutcLocked('0');
-    return;
-  }
-  char buffer[20];
-  int count = 0;
-  uint64_t remaining = value;
-  while (remaining > 0) {
-    buffer[count] = '0' + (remaining % 10);
-    remaining /= 10;
-    ++count;
-  }
-  while (count > 0) {
-    --count;
-    VgaPutcLocked(buffer[count]);
-  }
+  VgaWriteDecLocked(value);
 }
+
+void VgaPanicWrite(const char* const str) { VgaWriteLocked(str); }
+
+void VgaPanicWriteDec(const uint64_t value) { VgaWriteDecLocked(value); }
 
 void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
                           const int pitch,               //

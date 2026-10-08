@@ -22,21 +22,24 @@ namespace internal {
   std::fflush(stderr);
   std::_Exit(134);
 #else
-  UartWrite("[FATAL] Check failed: ");
-  UartWrite(expr);
-  UartWrite(" at ");
-  UartWrite(file);
-  UartWrite(":");
-  UartWriteDec(line);
-  UartWrite("\n");
+  asm volatile("cli" : : : "memory", "cc");
+  const uint64_t line_num = (line > 0) ? static_cast<uint64_t>(line) : 0;
 
-  VgaWrite("[FATAL] Check failed: ");
-  VgaWrite(expr);
-  VgaWrite(" at ");
-  VgaWrite(file);
-  VgaWrite(":");
-  VgaWriteDec(line);
-  VgaWrite("\n");
+  UartPanicWrite("[FATAL] Check failed: ");
+  UartPanicWrite(expr);
+  UartPanicWrite(" at ");
+  UartPanicWrite(file);
+  UartPanicWrite(":");
+  UartPanicWriteDec(line_num);
+  UartPanicWrite("\n");
+
+  VgaPanicWrite("[FATAL] Check failed: ");
+  VgaPanicWrite(expr);
+  VgaPanicWrite(" at ");
+  VgaPanicWrite(file);
+  VgaPanicWrite(":");
+  VgaPanicWriteDec(line_num);
+  VgaPanicWrite("\n");
 
   for (;;) {
     asm volatile("cli; hlt");

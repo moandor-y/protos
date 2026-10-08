@@ -694,5 +694,141 @@ TEST(HeapTest, ConcurrentMultiThreadedAllocFreeAndArenaExpansionStress) {
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(expected_total_free));
 }
 
+TEST(
+    HeapTest,
+    KmallocAlignedSupportsPowerOfTwoAlignmentsUpToPageSizeAndRestoresFreeBytes) {
+  ResetFakePmm(kFakeRamFrames);
+  HeapInit();
+  const int64_t initial_free = HeapTotalFreeBytes();
+
+  // Invalid alignments (<= 0, non-power-of-two, or > kPageSize) return nullptr
+  // without modifying heap state.
+  EXPECT_THAT(KmallocAligned(64, 0), t::IsNull());
+  EXPECT_THAT(KmallocAligned(64, -16), t::IsNull());
+  EXPECT_THAT(KmallocAligned(64, 3), t::IsNull());
+  EXPECT_THAT(KmallocAligned(64, 24), t::IsNull());
+  EXPECT_THAT(KmallocAligned(64, 96), t::IsNull());
+  EXPECT_THAT(KmallocAligned(64, kPageSize * 2), t::IsNull());
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
+
+  constexpr int64_t kAlignments[] = {1,   2,   4,   8,    16,   32,  64,
+                                     128, 256, 512, 1024, 2048, 4096};
+  constexpr int kNumAlignments = sizeof(kAlignments) / sizeof(kAlignments[0]);
+  constexpr int64_t kSizes[] = {0, 1, 17, 64, 192, 512, 4096};
+  constexpr int kNumSizes = sizeof(kSizes) / sizeof(kSizes[0]);
+
+  struct AllocationRecord {
+    uint8_t* ptr;
+    int64_t size;
+    int64_t alignment;
+    uint8_t pattern;
+  };
+  std::vector<AllocationRecord> records;
+  records.reserve(kNumAlignments * kNumSizes);
+
+  for (int a_idx = 0; a_idx < kNumAlignments; ++a_idx) {
+    const int64_t alignment = kAlignments[a_idx];
+    const int64_t effective_align =
+        (alignment < kHeapAlignment) ? kHeapAlignment : alignment;
+    for (int s_idx = 0; s_idx < kNumSizes; ++s_idx) {
+      const int64_t req_size = kSizes[s_idx];
+      const int64_t usable_size = (req_size == 0) ? kHeapAlignment : req_size;
+      uint8_t* const ptr =
+          static_cast<uint8_t*>(KmallocAligned(req_size, alignment));
+      ASSERT_THAT(ptr, t::NotNull());
+      const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+      EXPECT_THAT(addr & static_cast<uintptr_t>(effective_align - 1),
+                  t::Eq(0u));
+      const uint8_t pattern =
+          static_cast<uint8_t>(((a_idx + 1) * 29 + (s_idx + 1) * 7) & 0xFF);
+      std::memset(ptr, pattern, usable_size);
+      records.push_back(AllocationRecord{ptr,              //
+                                         usable_size,      //
+                                         effective_align,  //
+                                         pattern});
+    }
+  }
+
+  // Verify payload isolation and integrity across all aligned allocations.
+  const int num_records = static_cast<int>(records.size());
+  for (int i = 0; i < num_records; ++i) {
+    const uintptr_t start_i = reinterpret_cast<uintptr_t>(records[i].ptr);
+    const uintptr_t end_i = start_i + static_cast<uintptr_t>(records[i].size);
+    for (int j = i + 1; j < num_records; ++j) {
+      const uintptr_t start_j = reinterpret_cast<uintptr_t>(records[j].ptr);
+      const uintptr_t end_j = start_j + static_cast<uintptr_t>(records[j].size);
+      EXPECT_TRUE(end_i <= start_j || end_j <= start_i);
+    }
+    for (int64_t b = 0; b < records[i].size; ++b) {
+      ASSERT_THAT(records[i].ptr[b], t::Eq(records[i].pattern));
+    }
+  }
+
+  // Free in interleaved order and verify 100% of free bytes are restored and
+  // coalesced back into a single arena block.
+  for (int step = 0; step < num_records; ++step) {
+    const int idx = (step * 37 + 11) % num_records;
+    Kfree(records[idx].ptr);
+  }
+  const int64_t expected_total_free =
+      g_pmm.next_frame * kPageSize -
+      (kInitialHeapFrames * kPageSize - initial_free);
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(expected_total_free));
+
+  void* const whole_heap = Kmalloc(expected_total_free);
+  ASSERT_THAT(whole_heap, t::NotNull());
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(0));
+  Kfree(whole_heap);
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(expected_total_free));
+}
+
+TEST(HeapTest, KmallocAlignedFrontSplitHeaderShiftAndCoalescing) {
+  ResetFakePmm();
+  HeapInit();
+  const int64_t initial_free = HeapTotalFreeBytes();
+
+  // Initial payload starts at FakeRamBase() + 64 (offset 64 mod 4096).
+  // Case 1: Request 64-byte alignment when current free payload is at +64
+  // (offset == 0): no shift or front split needed.
+  void* const aligned64_zero_offset = KmallocAligned(32, 64);
+  ASSERT_THAT(aligned64_zero_offset, t::NotNull());
+  EXPECT_THAT(reinterpret_cast<uintptr_t>(aligned64_zero_offset) & 63u,
+              t::Eq(0u));
+
+  // Next free block payload is at +64 + 32 + 64 = +160 (32 mod 64).
+  // Requesting 64-byte alignment requires offset = 32 bytes (< 80), exercising
+  // the header-shift path (`0 < offset < kMinFrontSplitOffset`).
+  void* const aligned64_shifted = KmallocAligned(64, 64);
+  ASSERT_THAT(aligned64_shifted, t::NotNull());
+  EXPECT_THAT(reinterpret_cast<uintptr_t>(aligned64_shifted) & 63u, t::Eq(0u));
+  std::memset(aligned64_shifted, 0x5A, 64);
+
+  // Requesting 4096-byte alignment requires a large offset (>= 80), exercising
+  // the front-split path (`offset >= kMinFrontSplitOffset`), which returns the
+  // front padding block to `g_free_tree`.
+  void* const aligned4096_front_split = KmallocAligned(128, kPageSize);
+  ASSERT_THAT(aligned4096_front_split, t::NotNull());
+  EXPECT_THAT(
+      reinterpret_cast<uintptr_t>(aligned4096_front_split) & (kPageSize - 1),
+      t::Eq(0u));
+  std::memset(aligned4096_front_split, 0xA5, 128);
+
+  // Allocate a small 16-byte block: it must fit inside the front-split free
+  // block created before `aligned4096_front_split`.
+  void* const from_front_split = Kmalloc(16);
+  ASSERT_THAT(from_front_split, t::NotNull());
+  EXPECT_LT(reinterpret_cast<uintptr_t>(from_front_split),
+            reinterpret_cast<uintptr_t>(aligned4096_front_split));
+
+  // Free in various orders to exercise forward, backward, and 3-way coalescing
+  // of shifted and front-split blocks.
+  Kfree(aligned64_shifted);
+  Kfree(from_front_split);
+  Kfree(aligned4096_front_split);
+  Kfree(aligned64_zero_offset);
+
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
+}
+
 }  // namespace
 }  // namespace protos

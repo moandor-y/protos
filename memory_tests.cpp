@@ -6,8 +6,10 @@
 #include <new>
 
 #include "heap.h"
+#include "multiboot.h"
 #include "paging.h"
 #include "pmm.h"
+#include "rbtree.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "uart.h"
@@ -240,7 +242,54 @@ static bool TestPmmFreeAndReuse(const int64_t free_before_allocs,  //
   return reused_match && (PmmFreeFrameCount() == free_before_allocs);
 }
 
+struct alignas(64) CacheLineAlignedWidget {
+  uint64_t id;
+  uint64_t checksum;
+
+  CacheLineAlignedWidget()
+      : id(g_widget_ctor_count + 1),
+        checksum((g_widget_ctor_count + 1) ^ 0xA5A5A5A5A5A5A5A5ULL) {
+    ++g_widget_ctor_count;
+  }
+
+  explicit CacheLineAlignedWidget(const uint64_t seed)
+      : id(seed), checksum(seed ^ 0xA5A5A5A5A5A5A5A5ULL) {
+    ++g_widget_ctor_count;
+  }
+
+  ~CacheLineAlignedWidget() {
+    if ((id ^ 0xA5A5A5A5A5A5A5A5ULL) == checksum) {
+      ++g_widget_dtor_count;
+    }
+    id = 0;
+    checksum = 0;
+  }
+
+  bool IsValid() const { return (id ^ 0xA5A5A5A5A5A5A5A5ULL) == checksum; }
+};
+
+struct alignas(256) PageSubblockAlignedWidget {
+  uint64_t tag;
+  uint64_t mirror;
+
+  explicit PageSubblockAlignedWidget(const uint64_t seed = 0xCAFE0000ULL)
+      : tag(seed), mirror(~seed) {
+    ++g_widget_ctor_count;
+  }
+
+  ~PageSubblockAlignedWidget() {
+    if (tag == ~mirror) {
+      ++g_widget_dtor_count;
+    }
+    tag = 0;
+    mirror = 0;
+  }
+
+  bool IsValid() const { return tag == ~mirror; }
+};
+
 static bool TestHeapVariedSizesAndAlignment() {
+  const int64_t free_before = HeapTotalFreeBytes();
   constexpr int64_t kSizes[] = {1,   7,    15,   16,    31,   64,
                                 256, 1024, 4096, 16384, 65536};
   constexpr int kNumSizes = sizeof(kSizes) / sizeof(kSizes[0]);
@@ -269,7 +318,39 @@ static bool TestHeapVariedSizesAndAlignment() {
     delete[] new_ptrs[i];
   }
 
-  return true;
+  // Verify KmallocAligned across all power-of-two alignments in [1, kPageSize],
+  // exercising both header-shifting (0 < offset < 80) and front-splitting
+  // (offset >= 80).
+  constexpr int64_t kAlignments[] = {1,   2,   4,   8,    16,   32,  64,
+                                     128, 256, 512, 1024, 2048, 4096};
+  constexpr int kNumAlignments = sizeof(kAlignments) / sizeof(kAlignments[0]);
+  uint8_t* aligned_ptrs[kNumAlignments];
+  for (int i = 0; i < kNumAlignments; ++i) {
+    const int64_t align = kAlignments[i];
+    const int64_t eff_align = (align < kHeapAlignment) ? kHeapAlignment : align;
+    const int64_t req_size = 48 + i * 16;
+    aligned_ptrs[i] = static_cast<uint8_t*>(KmallocAligned(req_size, align));
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(aligned_ptrs[i]);
+    if (aligned_ptrs[i] == nullptr ||
+        (addr & static_cast<uintptr_t>(eff_align - 1)) != 0 ||
+        !PmmRangeIsValidUsableRam(addr, req_size)) {
+      return false;
+    }
+    for (int64_t b = 0; b < req_size; ++b) {
+      aligned_ptrs[i][b] = static_cast<uint8_t>((i * 31 + b) & 0xFF);
+    }
+  }
+  for (int i = 0; i < kNumAlignments; ++i) {
+    const int64_t req_size = 48 + i * 16;
+    for (int64_t b = 0; b < req_size; ++b) {
+      if (aligned_ptrs[i][b] != static_cast<uint8_t>((i * 31 + b) & 0xFF)) {
+        return false;
+      }
+    }
+    Kfree(aligned_ptrs[i]);
+  }
+
+  return HeapTotalFreeBytes() == free_before;
 }
 
 static bool TestHeapPatternIsolation() {
@@ -345,6 +426,38 @@ static bool TestCppNewDeleteLifecycle() {
     }
   }
   if (g_widget_dtor_count != (1 + kArrayLen)) {
+    return false;
+  }
+
+  // Verify over-aligned C++17 `operator new(size_t, std::align_val_t)` and
+  // `operator new[](size_t, std::align_val_t)` with `alignas(64)` and
+  // `alignas(256)` types.
+  const int base_ctor_count = g_widget_ctor_count;
+  {
+    const std::unique_ptr<CacheLineAlignedWidget> aligned64 =
+        std::make_unique<CacheLineAlignedWidget>(0x2468ACE0ULL);
+    const std::unique_ptr<PageSubblockAlignedWidget> aligned256 =
+        std::make_unique<PageSubblockAlignedWidget>(0xF00DBABEULL);
+    constexpr int kAlignedArrayLen = 4;
+    const std::unique_ptr<CacheLineAlignedWidget[]> aligned64_arr =
+        std::make_unique<CacheLineAlignedWidget[]>(kAlignedArrayLen);
+    if (aligned64 == nullptr || aligned256 == nullptr ||
+        aligned64_arr == nullptr ||
+        (reinterpret_cast<uintptr_t>(aligned64.get()) & 63u) != 0 ||
+        (reinterpret_cast<uintptr_t>(aligned256.get()) & 255u) != 0 ||
+        (reinterpret_cast<uintptr_t>(aligned64_arr.get()) & 63u) != 0 ||
+        !aligned64->IsValid() || !aligned256->IsValid() ||
+        g_widget_ctor_count != base_ctor_count + 2 + kAlignedArrayLen) {
+      return false;
+    }
+    for (int i = 0; i < kAlignedArrayLen; ++i) {
+      if (!aligned64_arr[i].IsValid() ||
+          (reinterpret_cast<uintptr_t>(&aligned64_arr[i]) & 63u) != 0) {
+        return false;
+      }
+    }
+  }
+  if (g_widget_dtor_count != g_widget_ctor_count) {
     return false;
   }
 
@@ -465,6 +578,157 @@ static bool TestHeapStressReuse() {
   return free_after_first_expand >= free_before;
 }
 
+struct KernelRbAugNode {
+  RbNode hook;
+  int64_t span = 0;
+  int64_t max_subtree_span = 0;
+
+  explicit KernelRbAugNode(const int64_t s) : span(s), max_subtree_span(s) {}
+  KernelRbAugNode(const KernelRbAugNode&) = delete;
+  KernelRbAugNode& operator=(const KernelRbAugNode&) = delete;
+};
+
+struct KernelRbAugTraits {
+  static RbNode* GetNode(KernelRbAugNode& item) { return &item.hook; }
+  static const RbNode* GetNode(const KernelRbAugNode& item) {
+    return &item.hook;
+  }
+  static uintptr_t GetKey(const KernelRbAugNode& item) {
+    return reinterpret_cast<uintptr_t>(&item);
+  }
+  static bool UpdateAugment(KernelRbAugNode& item,              //
+                            const KernelRbAugNode* const left,  //
+                            const KernelRbAugNode* const right) {
+    int64_t max_val = item.span;
+    if (left != nullptr && left->max_subtree_span > max_val) {
+      max_val = left->max_subtree_span;
+    }
+    if (right != nullptr && right->max_subtree_span > max_val) {
+      max_val = right->max_subtree_span;
+    }
+    if (item.max_subtree_span == max_val) {
+      return false;
+    }
+    item.max_subtree_span = max_val;
+    return true;
+  }
+};
+
+static bool TestRbTreeEdgeCases() {
+  struct NodeGroup {
+    KernelRbAugNode n0{4};
+    KernelRbAugNode n1{8};
+    KernelRbAugNode n2{16};
+    KernelRbAugNode uninserted{32};
+  } group;
+
+  RbTree<KernelRbAugNode, &KernelRbAugNode::hook, KernelRbAugTraits> tree;
+  tree.Insert(group.n0);
+  tree.Insert(group.n1);
+  tree.Insert(group.n2);
+
+  // Erasing an uninserted node must not corrupt root() or existing nodes.
+  tree.Erase(group.uninserted);
+  if (tree.root() == nullptr) {
+    return false;
+  }
+
+  const auto& const_tree = tree;
+  bool saw_foreign_address = false;
+  const KernelRbAugNode* const match16 =
+      const_tree.FindFirstAugmented([&](const KernelRbAugNode& node) {
+        if (&node != &group.n0 && &node != &group.n1 && &node != &group.n2) {
+          saw_foreign_address = true;
+        }
+        return node.max_subtree_span >= 12;
+      });
+  if (saw_foreign_address || match16 != &group.n2) {
+    return false;
+  }
+
+  // Erasing n1 twice must leave n0 and n2 intact, and right-subtree augmented
+  // search from root n0 (span=4, max_subtree_span=16) must return &group.n2.
+  tree.Erase(group.n1);
+  tree.Erase(group.n1);
+  const KernelRbAugNode* const match_after_erase =
+      const_tree.FindFirstAugmented([&](const KernelRbAugNode& node) {
+        if (&node != &group.n0 && &node != &group.n2) {
+          saw_foreign_address = true;
+        }
+        return node.max_subtree_span >= 12;
+      });
+  if (saw_foreign_address || match_after_erase != &group.n2) {
+    return false;
+  }
+
+  tree.Erase(group.n0);
+  tree.Erase(group.n2);
+  return tree.root() == nullptr;
+}
+
+static void ResetTestMemoryMap(MultibootMemoryMap* const map) {
+  map->region_count = 0;
+  map->total_ram_bytes = 0;
+  map->usable_ram_bytes = 0;
+  map->reserved_ram_bytes = 0;
+  map->mb_reserved_start = 0;
+  map->mb_reserved_end = 0;
+  map->mb1_mmap_reserved_start = 0;
+  map->mb1_mmap_reserved_end = 0;
+  map->fb_addr = 0;
+  map->fb_pitch = 0;
+  map->fb_width = 0;
+  map->fb_height = 0;
+  map->fb_bpp = 0;
+  map->fb_type = 0;
+}
+
+static bool TestMultibootMmapEdgeCases() {
+  const std::unique_ptr<MultibootMemoryMap> map(
+      static_cast<MultibootMemoryMap*>(operator new(
+          sizeof(MultibootMemoryMap))));
+  if (map == nullptr) {
+    return false;
+  }
+  ResetTestMemoryMap(map.get());
+
+  constexpr uint64_t kHugeLen = static_cast<uint64_t>(INT64_MAX) + 4096ULL;
+  if (!MultibootRecordMmapEntry(map.get(),  //
+                                0x100000,   //
+                                kHugeLen,   //
+                                kMemoryTypeAvailable) ||
+      map->usable_ram_bytes != INT64_MAX || map->total_ram_bytes != INT64_MAX) {
+    return false;
+  }
+  if (!MultibootRecordMmapEntry(map.get(), 0x200000, kHugeLen, 2) ||
+      map->reserved_ram_bytes != INT64_MAX ||
+      map->total_ram_bytes != INT64_MAX) {
+    return false;
+  }
+
+  ResetTestMemoryMap(map.get());
+  if (!MultibootRecordMmapEntry(map.get(),  //
+                                0x200000,   //
+                                kPageSize,  //
+                                kMemoryTypeAvailable) ||
+      !MultibootRecordMmapEntry(map.get(),  //
+                                0x202000,   //
+                                kPageSize,  //
+                                kMemoryTypeAvailable) ||
+      map->region_count != 2) {
+    return false;
+  }
+  if (!MultibootRecordMmapEntry(map.get(),  //
+                                0x201000,   //
+                                kPageSize,  //
+                                kMemoryTypeAvailable) ||
+      map->region_count != 1 || map->regions[0].base != 0x200000 ||
+      map->regions[0].length != 3 * kPageSize) {
+    return false;
+  }
+  return true;
+}
+
 static bool TestEdgeCasesAndOom() {
   const int64_t free_before = HeapTotalFreeBytes();
 
@@ -486,7 +750,15 @@ static bool TestEdgeCasesAndOom() {
   void* const oom2 = Kmalloc(max_phys);
   void* oom3 = operator new(max_phys);
   asm volatile("" : "+r"(oom3));
-  if (oom1 != nullptr || oom2 != nullptr || oom3 != nullptr) {
+  void* const bad_align1 = KmallocAligned(64, 0);
+  void* const bad_align2 = KmallocAligned(64, 24);
+  void* const bad_align3 = KmallocAligned(64, kPageSize * 2);
+  void* bad_align4 = operator new(64,
+                                  static_cast<std::align_val_t>(kPageSize * 2));
+  asm volatile("" : "+r"(bad_align4));
+  if (oom1 != nullptr || oom2 != nullptr || oom3 != nullptr ||
+      bad_align1 != nullptr || bad_align2 != nullptr || bad_align3 != nullptr ||
+      bad_align4 != nullptr) {
     return false;
   }
 
@@ -495,6 +767,16 @@ static bool TestEdgeCasesAndOom() {
     return false;
   }
   Kfree(recovery);
+
+#ifdef NDEBUG
+  if (PmmAllocFrames(0) != 0 || PmmAllocFrames(-1) != 0) {
+    return false;
+  }
+#endif
+
+  if (!TestRbTreeEdgeCases() || !TestMultibootMmapEdgeCases()) {
+    return false;
+  }
 
   const int64_t free_after = HeapTotalFreeBytes();
   return free_after == free_before;

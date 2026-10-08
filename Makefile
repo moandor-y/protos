@@ -34,7 +34,7 @@ TEST_SAN_ENV_tsan := TSAN_OPTIONS=halt_on_error=1
 HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp))
 HOST_TESTS := $(patsubst %.cpp,%,$(HOST_TEST_SRCS))
 TEST_EXTRA_SRCS_heap_test := heap.cpp
-TEST_EXTRA_SRCS_pmm_test := pmm.cpp
+TEST_EXTRA_SRCS_pmm_test := pmm.cpp multiboot.cpp
 TEST_EXTRA_SRCS_smp_test := smp.cpp
 
 BUILD_DIR := build

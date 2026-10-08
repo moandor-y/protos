@@ -389,7 +389,7 @@ static bool PmmRangeIsValidUsableRamLocked(const uintptr_t addr,
 static uintptr_t PmmAllocFramesLocked(const int64_t count) {
   DCHECK(g_pmm_initialized);
   DCHECK(count > 0);
-  if (count > g_pmm_free_frames) {
+  if (!g_pmm_initialized || count <= 0 || count > g_pmm_free_frames) {
     return 0;
   }
 

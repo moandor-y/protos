@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <vector>
 
 namespace protos {
@@ -774,6 +775,414 @@ TEST(RbTreeTest, CustomTraitsInvokeAugmentCallbacksOnInsertAndPropagate) {
       });
 
   tree.PropagateAugment(&n20);
+
+  // Read-only FindFirstAugmented queries must not trigger observer callbacks.
+  EXPECT_CALL(*observer, OnUpdateAugment).Times(0);
+  const auto& const_tree = tree;
+  EXPECT_THAT(const_tree.FindFirstAugmented(
+                  [](const ObservedRbTestNode& n) { return n.key >= 10; }),
+              t::Eq(&n10));
+  EXPECT_THAT(const_tree.FindFirstAugmented(
+                  [](const ObservedRbTestNode& n) { return n.key > 100; }),
+              t::IsNull());
+}
+
+TEST(RbTreeTest, EraseUninsertedOrAlreadyErasedNodePreservesTreeInvariants) {
+  RbTree<BasicRbTestNode, &BasicRbTestNode::node> tree;
+  BasicRbTestNode inserted[8];
+  for (int i = 0; i < 8; ++i) {
+    inserted[i] = {(i + 1) * 10, i, {}};
+    ASSERT_TRUE(tree.Insert(&inserted[i]));
+  }
+  ASSERT_TRUE(VerifyRbTree(tree, 8));
+
+  BasicRbTestNode uninserted_red = {999, 99, {}};
+  tree.Erase(&uninserted_red);
+  tree.Erase(uninserted_red);
+  ASSERT_TRUE(VerifyRbTree(tree, 8));
+
+  BasicRbTestNode uninserted_black = {888, 88, {}};
+  uninserted_black.node.color = RbColor::kBlack;
+  tree.Erase(&uninserted_black);
+  ASSERT_TRUE(VerifyRbTree(tree, 8));
+
+  // Erase a real node, then erase it a second time after it has been removed.
+  tree.Erase(&inserted[3]);
+  ASSERT_TRUE(VerifyRbTree(tree, 7));
+  tree.Erase(&inserted[3]);
+  ASSERT_TRUE(VerifyRbTree(tree, 7));
+}
+
+struct NonCopyableAugmentedNode {
+  int key = 0;
+  int64_t payload_size = 0;
+  int64_t subtree_max_size = 0;
+  RbNode node = {};
+
+  NonCopyableAugmentedNode() = default;
+  NonCopyableAugmentedNode(const NonCopyableAugmentedNode&) = delete;
+  NonCopyableAugmentedNode& operator=(const NonCopyableAugmentedNode&) = delete;
+};
+
+struct NonCopyableAugmentedTraits {
+  static int GetKey(const NonCopyableAugmentedNode& item) { return item.key; }
+
+  static bool Less(const int a, const int b) { return a < b; }
+
+  static void UpdateAugment(NonCopyableAugmentedNode* const item,
+                            const NonCopyableAugmentedNode* const left,
+                            const NonCopyableAugmentedNode* const right) {
+    int64_t max_size = item->payload_size;
+    if (left != nullptr && left->subtree_max_size > max_size) {
+      max_size = left->subtree_max_size;
+    }
+    if (right != nullptr && right->subtree_max_size > max_size) {
+      max_size = right->subtree_max_size;
+    }
+    item->subtree_max_size = max_size;
+  }
+};
+
+TEST(RbTreeTest, FindFirstAugmentedOnNonCopyableNodesIsConstAndThreadSafe) {
+  using NonCopyTree = RbTree<NonCopyableAugmentedNode,         //
+                             &NonCopyableAugmentedNode::node,  //
+                             NonCopyableAugmentedTraits>;
+  NonCopyTree tree;
+  constexpr int kNodeCount = 64;
+  NonCopyableAugmentedNode nodes[kNodeCount];
+  for (int i = 0; i < kNodeCount; ++i) {
+    nodes[i].key = (i + 1) * 10;
+    nodes[i].payload_size = ((i * 37 + 11) % 200) + 10;
+    ASSERT_TRUE(tree.Insert(&nodes[i]));
+  }
+  nodes[kNodeCount - 1].payload_size = 5000;
+  tree.PropagateAugment(&nodes[kNodeCount - 1]);
+
+  const NonCopyTree& const_tree = tree;
+  constexpr int kNumThreads = 4;
+  std::vector<std::thread> readers;
+  readers.reserve(kNumThreads);
+  for (int tid = 0; tid < kNumThreads; ++tid) {
+    readers.emplace_back([&const_tree, &nodes]() {
+      for (int iter = 0; iter < 50; ++iter) {
+        const NonCopyableAugmentedNode* const match_max =
+            const_tree.FindFirstAugmented(
+                [](const NonCopyableAugmentedNode& n) {
+                  return n.subtree_max_size >= 5000;
+                });
+        EXPECT_THAT(match_max, t::Eq(&nodes[kNodeCount - 1]));
+
+        const NonCopyableAugmentedNode* const match_min =
+            const_tree.FindFirstAugmented(
+                [](const NonCopyableAugmentedNode& n) {
+                  return n.subtree_max_size >= 10;
+                });
+        EXPECT_THAT(match_min, t::Eq(&nodes[0]));
+
+        const NonCopyableAugmentedNode* const match_none =
+            const_tree.FindFirstAugmented(
+                [](const NonCopyableAugmentedNode& n) {
+                  return n.subtree_max_size >= 99999;
+                });
+        EXPECT_THAT(match_none, t::IsNull());
+      }
+    });
+  }
+  for (auto& reader : readers) {
+    reader.join();
+  }
+}
+
+struct AddressKeyedAugmentedNode {
+  int64_t payload_size = 0;
+  int64_t subtree_max_size = 0;
+  uintptr_t subtree_max_addr = 0;
+  RbNode node = {};
+};
+
+struct AddressKeyedAugmentedTraits {
+  static uintptr_t GetKey(const AddressKeyedAugmentedNode& item) {
+    return reinterpret_cast<uintptr_t>(&item);
+  }
+
+  static bool Less(const uintptr_t a, const uintptr_t b) { return a < b; }
+
+  static void UpdateAugment(AddressKeyedAugmentedNode* const item,
+                            const AddressKeyedAugmentedNode* const left,
+                            const AddressKeyedAugmentedNode* const right) {
+    int64_t max_size = item->payload_size;
+    uintptr_t max_addr = GetKey(*item);
+    if (left != nullptr) {
+      if (left->subtree_max_size > max_size) {
+        max_size = left->subtree_max_size;
+      }
+      if (left->subtree_max_addr > max_addr) {
+        max_addr = left->subtree_max_addr;
+      }
+    }
+    if (right != nullptr) {
+      if (right->subtree_max_size > max_size) {
+        max_size = right->subtree_max_size;
+      }
+      if (right->subtree_max_addr > max_addr) {
+        max_addr = right->subtree_max_addr;
+      }
+    }
+    item->subtree_max_size = max_size;
+    item->subtree_max_addr = max_addr;
+  }
+};
+
+TEST(RbTreeTest, FindFirstAugmentedWorksWithAddressKeyedTraits) {
+  using AddrTree = RbTree<AddressKeyedAugmentedNode,         //
+                          &AddressKeyedAugmentedNode::node,  //
+                          AddressKeyedAugmentedTraits>;
+  AddrTree tree;
+  constexpr int kCount = 32;
+  AddressKeyedAugmentedNode nodes[kCount];
+  for (int i = 0; i < kCount; ++i) {
+    nodes[i].payload_size = (i + 1) * 16;
+    ASSERT_TRUE(tree.Insert(&nodes[i]));
+  }
+
+  const AddrTree& const_tree = tree;
+  for (int i = 0; i < kCount; ++i) {
+    const int64_t target_size = (i + 1) * 16;
+    const uintptr_t target_addr = reinterpret_cast<uintptr_t>(&nodes[i]);
+
+    const AddressKeyedAugmentedNode* const by_size =
+        const_tree.FindFirstAugmented(
+            [target_size](const AddressKeyedAugmentedNode& n) {
+              return n.subtree_max_size >= target_size;
+            });
+    EXPECT_THAT(by_size, t::Eq(&nodes[i]));
+
+    const AddressKeyedAugmentedNode* const by_addr =
+        const_tree.FindFirstAugmented(
+            [target_addr](const AddressKeyedAugmentedNode& n) {
+              return n.subtree_max_addr >= target_addr;
+            });
+    EXPECT_THAT(by_addr, t::Eq(&nodes[i]));
+  }
+}
+
+struct NonTrivialDestructorAugmentedNode {
+  int key = 0;
+  int64_t payload_size = 0;
+  int64_t subtree_max_size = 0;
+  std::shared_ptr<int> lifetime_token;
+  RbNode node = {};
+};
+
+struct NonTrivialDestructorAugmentedTraits {
+  static int GetKey(const NonTrivialDestructorAugmentedNode& item) {
+    return item.key;
+  }
+
+  static bool Less(const int a, const int b) { return a < b; }
+
+  static void UpdateAugment(
+      NonTrivialDestructorAugmentedNode* const item,
+      const NonTrivialDestructorAugmentedNode* const left,
+      const NonTrivialDestructorAugmentedNode* const right) {
+    int64_t max_size = item->payload_size;
+    if (left != nullptr && left->subtree_max_size > max_size) {
+      max_size = left->subtree_max_size;
+    }
+    if (right != nullptr && right->subtree_max_size > max_size) {
+      max_size = right->subtree_max_size;
+    }
+    item->subtree_max_size = max_size;
+  }
+};
+
+struct TrivialObserverAugmentedNode {
+  int key = 0;
+  int64_t payload_size = 0;
+  int64_t subtree_max_size = 0;
+  int* observer_calls = nullptr;
+  RbNode node = {};
+};
+
+struct TrivialObserverAugmentedTraits {
+  static int GetKey(const TrivialObserverAugmentedNode& item) {
+    return item.key;
+  }
+
+  static bool Less(const int a, const int b) { return a < b; }
+
+  static void UpdateAugment(TrivialObserverAugmentedNode* const item,
+                            const TrivialObserverAugmentedNode* const left,
+                            const TrivialObserverAugmentedNode* const right) {
+    if (item->observer_calls != nullptr) {
+      ++(*item->observer_calls);
+    }
+    int64_t max_size = item->payload_size;
+    if (left != nullptr && left->subtree_max_size > max_size) {
+      max_size = left->subtree_max_size;
+    }
+    if (right != nullptr && right->subtree_max_size > max_size) {
+      max_size = right->subtree_max_size;
+    }
+    item->subtree_max_size = max_size;
+  }
+};
+
+TEST(RbTreeTest,
+     FindFirstAugmentedHandlesNonTriviallyDestructibleAndTrivialObserverNodes) {
+  // 1) Non-trivially-destructible augmented node (holding std::shared_ptr<int>)
+  // must descend into right child when root's own payload_size is too small.
+  using NonTrivialTree = RbTree<NonTrivialDestructorAugmentedNode,         //
+                                &NonTrivialDestructorAugmentedNode::node,  //
+                                NonTrivialDestructorAugmentedTraits>;
+  NonTrivialTree nt_tree;
+  const auto token = std::make_shared<int>(42);
+  NonTrivialDestructorAugmentedNode nt10 = {10, 10, 10, token, {}};
+  NonTrivialDestructorAugmentedNode nt20 = {20, 100, 100, token, {}};
+  ASSERT_TRUE(nt_tree.Insert(&nt10));
+  ASSERT_TRUE(nt_tree.Insert(&nt20));
+
+  const NonTrivialTree& const_nt_tree = nt_tree;
+  const NonTrivialDestructorAugmentedNode* const nt_found =
+      const_nt_tree.FindFirstAugmented(
+          [](const NonTrivialDestructorAugmentedNode& n) {
+            return n.subtree_max_size >= 100;
+          });
+  EXPECT_THAT(nt_found, t::Eq(&nt20));
+  EXPECT_THAT(token.use_count(), t::Eq(3));
+
+  // 2) Trivially-destructible node with raw observer counter pointer must never
+  // invoke Traits::UpdateAugment during read-only FindFirstAugmented queries.
+  using TrivialObsTree = RbTree<TrivialObserverAugmentedNode,         //
+                                &TrivialObserverAugmentedNode::node,  //
+                                TrivialObserverAugmentedTraits>;
+  TrivialObsTree obs_tree;
+  int observer_calls = 0;
+  TrivialObserverAugmentedNode obs10 = {10, 10, 10, &observer_calls, {}};
+  TrivialObserverAugmentedNode obs20 = {20, 100, 100, &observer_calls, {}};
+  ASSERT_TRUE(obs_tree.Insert(&obs10));
+  ASSERT_TRUE(obs_tree.Insert(&obs20));
+
+  observer_calls = 0;
+  const TrivialObsTree& const_obs_tree = obs_tree;
+  const TrivialObserverAugmentedNode* const obs_found =
+      const_obs_tree.FindFirstAugmented(
+          [](const TrivialObserverAugmentedNode& n) {
+            return n.subtree_max_size >= 100;
+          });
+  EXPECT_THAT(obs_found, t::Eq(&obs20));
+  EXPECT_THAT(observer_calls, t::Eq(0));
+}
+
+struct DerivedAddressAugmentedNode {
+  int64_t payload_size = 0;
+  uintptr_t subtree_max_end = 0;
+  RbNode node = {};
+};
+
+struct DerivedAddressAugmentedTraits {
+  static uintptr_t GetKey(const DerivedAddressAugmentedNode& item) {
+    return reinterpret_cast<uintptr_t>(&item);
+  }
+
+  static bool Less(const uintptr_t a, const uintptr_t b) { return a < b; }
+
+  static void UpdateAugment(DerivedAddressAugmentedNode* const item,
+                            const DerivedAddressAugmentedNode* const left,
+                            const DerivedAddressAugmentedNode* const right) {
+    uintptr_t max_end =
+        GetKey(*item) + static_cast<uintptr_t>(item->payload_size);
+    if (left != nullptr && left->subtree_max_end > max_end) {
+      max_end = left->subtree_max_end;
+    }
+    if (right != nullptr && right->subtree_max_end > max_end) {
+      max_end = right->subtree_max_end;
+    }
+    item->subtree_max_end = max_end;
+  }
+};
+
+struct NonCopyableAddressKeyedNode {
+  int64_t payload_size = 0;
+  int64_t subtree_max_size = 0;
+  RbNode node = {};
+
+  NonCopyableAddressKeyedNode() = default;
+  NonCopyableAddressKeyedNode(const NonCopyableAddressKeyedNode&) = delete;
+  NonCopyableAddressKeyedNode& operator=(const NonCopyableAddressKeyedNode&) =
+      delete;
+};
+
+struct NonCopyableAddressKeyedTraits {
+  static uintptr_t GetKey(const NonCopyableAddressKeyedNode& item) {
+    return reinterpret_cast<uintptr_t>(&item);
+  }
+
+  static bool Less(const uintptr_t a, const uintptr_t b) { return a < b; }
+
+  static void UpdateAugment(NonCopyableAddressKeyedNode* const item,
+                            const NonCopyableAddressKeyedNode* const left,
+                            const NonCopyableAddressKeyedNode* const right) {
+    int64_t max_size = item->payload_size;
+    if (left != nullptr && left->subtree_max_size > max_size) {
+      max_size = left->subtree_max_size;
+    }
+    if (right != nullptr && right->subtree_max_size > max_size) {
+      max_size = right->subtree_max_size;
+    }
+    item->subtree_max_size = max_size;
+  }
+};
+
+TEST(RbTreeTest,
+     FindFirstAugmentedSupportsAddressDerivedEndAndNonCopyableAddrPredicates) {
+  // 1) Address-keyed derived augmentation (`GetKey(*item) + payload_size`).
+  using DerivedAddrTree = RbTree<DerivedAddressAugmentedNode,         //
+                                 &DerivedAddressAugmentedNode::node,  //
+                                 DerivedAddressAugmentedTraits>;
+  DerivedAddrTree derived_tree;
+  const auto derived_nodes = std::make_unique<DerivedAddressAugmentedNode[]>(2);
+  derived_nodes[0].payload_size = 16;
+  derived_nodes[1].payload_size = 64;
+  ASSERT_TRUE(derived_tree.Insert(&derived_nodes[0]));
+  ASSERT_TRUE(derived_tree.Insert(&derived_nodes[1]));
+
+  const DerivedAddrTree& const_derived_tree = derived_tree;
+  const uintptr_t target_end =
+      reinterpret_cast<uintptr_t>(&derived_nodes[1]) + 64;
+  const DerivedAddressAugmentedNode* const derived_found =
+      const_derived_tree.FindFirstAugmented(
+          [target_end](const DerivedAddressAugmentedNode& n) {
+            return n.subtree_max_end >= target_end;
+          });
+  EXPECT_THAT(derived_found, t::Eq(&derived_nodes[1]));
+
+  // 2) Non-copyable address-keyed predicate inspecting `&n` must never receive
+  // a stack copy address while locating the matching right-subtree node.
+  using NonCopyAddrTree = RbTree<NonCopyableAddressKeyedNode,         //
+                                 &NonCopyableAddressKeyedNode::node,  //
+                                 NonCopyableAddressKeyedTraits>;
+  NonCopyAddrTree nc_tree;
+  constexpr int kCount = 8;
+  NonCopyableAddressKeyedNode nc_nodes[kCount];
+  for (int i = 0; i < kCount; ++i) {
+    nc_nodes[i].payload_size = (i + 1) * 10;
+    ASSERT_TRUE(nc_tree.Insert(&nc_nodes[i]));
+  }
+
+  const NonCopyAddrTree& const_nc_tree = nc_tree;
+  bool saw_foreign_stack_copy = false;
+  const NonCopyableAddressKeyedNode* const nc_found =
+      const_nc_tree.FindFirstAugmented(
+          [&nc_nodes,
+           &saw_foreign_stack_copy](const NonCopyableAddressKeyedNode& n) {
+            if (&n < &nc_nodes[0] || &n >= &nc_nodes[kCount]) {
+              saw_foreign_stack_copy = true;
+            }
+            return n.subtree_max_size >= 80;
+          });
+  EXPECT_FALSE(saw_foreign_stack_copy);
+  EXPECT_THAT(nc_found, t::Eq(&nc_nodes[kCount - 1]));
 }
 
 }  // namespace

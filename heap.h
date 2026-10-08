@@ -22,9 +22,15 @@ int64_t HeapTotalFreeBytes();
 // allocates a minimum 16-byte payload block.
 void* Kmalloc(int64_t size);
 
-// Frees a pointer previously returned by `Kmalloc` and coalesces it with any
-// physically adjacent free blocks. Safe no-op if `ptr == nullptr`; validates
-// with `DCHECK` that non-null `ptr` is a valid, aligned, in-use heap block.
+// Allocates at least `size` bytes of memory aligned to `alignment` (which must
+// be a power of two in `[1, kPageSize]`). Returns nullptr if `size < 0`,
+// `alignment` is invalid, or out of memory.
+void* KmallocAligned(int64_t size, int64_t alignment);
+
+// Frees a pointer previously returned by `Kmalloc` or `KmallocAligned` and
+// coalesces it with any physically adjacent free blocks. Safe no-op if
+// `ptr == nullptr`; validates with `DCHECK` that non-null `ptr` is a valid,
+// aligned, in-use heap block.
 void Kfree(void* ptr);
 
 }  // namespace protos

@@ -16,6 +16,12 @@ void UartWrite(const char* str);
 void UartWriteHex(uint64_t value);
 // Writes a 64-bit unsigned integer in base-10 decimal to COM1.
 void UartWriteDec(uint64_t value);
+// Lockless emergency panic writer for COM1; must only be called with local
+// interrupts disabled in unrecoverable panic paths (e.g., CheckFailure).
+void UartPanicWrite(const char* str);
+// Lockless emergency base-10 decimal writer for COM1; must only be called with
+// local interrupts disabled in unrecoverable panic paths.
+void UartPanicWriteDec(uint64_t value);
 
 }  // namespace protos
 

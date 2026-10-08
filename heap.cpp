@@ -41,6 +41,7 @@ struct alignas(kHeapAlignment) HeapBlockHeader {
   int64_t size;
   int64_t max_free_size;
   RbNode rb_node;
+  int64_t align_offset;
 };
 
 constexpr int64_t kBlockHeaderSize = sizeof(HeapBlockHeader);
@@ -97,6 +98,20 @@ static constexpr int64_t AlignUp(const int64_t value, const int64_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
+static constexpr bool IsValidAlignment(const int64_t alignment) {
+  return alignment > 0 && alignment <= kPageSize &&
+         (alignment & (alignment - 1)) == 0;
+}
+
+static int64_t HeapAlignmentOffset(const HeapBlockHeader* const block,
+                                   const int64_t alignment) {
+  DCHECK(block != nullptr);
+  const uintptr_t payload_addr = reinterpret_cast<uintptr_t>(block + 1);
+  const uintptr_t mask = static_cast<uintptr_t>(alignment - 1);
+  const uintptr_t aligned_addr = (payload_addr + mask) & ~mask;
+  return static_cast<int64_t>(aligned_addr - payload_addr);
+}
+
 // Returns true if `second` starts at the exact byte immediately following the
 // end of `first`'s payload in physical memory (i.e. both blocks are physically
 // contiguous with no allocated block or unmapped arena gap between them).
@@ -117,6 +132,7 @@ static void FreeTreeInsert(HeapBlockHeader* const block) {
   block->is_free = 1;
   block->max_free_size = block->size;
   block->rb_node = {};
+  block->align_offset = 0;
   const bool inserted = g_free_tree.Insert(block);
   DCHECK(inserted);
   g_total_free_bytes += block->size;
@@ -201,6 +217,7 @@ static void HeapSplitBlock(HeapBlockHeader* const block,
   new_block->size = block->size - aligned_size - kBlockHeaderSize;
   new_block->max_free_size = 0;
   new_block->rb_node = {};
+  new_block->align_offset = 0;
 
   if (block->is_free == 1) {
     g_total_free_bytes -= (block->size - aligned_size);
@@ -211,6 +228,67 @@ static void HeapSplitBlock(HeapBlockHeader* const block,
   }
 
   FreeTreeInsert(new_block);
+}
+
+// Splits the front of an already-removed `block` when `offset >=
+// kBlockHeaderSize + kHeapAlignment`, returning the leading `[block, block +
+// offset)` slice to `g_free_tree` and returning the new aligned block header at
+// `block + offset`.
+static HeapBlockHeader* HeapSplitFront(HeapBlockHeader* const block,
+                                       const int64_t offset) {
+  DCHECK(block != nullptr);
+  DCHECK(block->is_free == 0);
+  DCHECK(offset >= kBlockHeaderSize + kHeapAlignment);
+  DCHECK((offset & (kHeapAlignment - 1)) == 0);
+  DCHECK(block->size > offset);
+
+  const int64_t orig_size = block->size;
+  const uintptr_t block_addr = reinterpret_cast<uintptr_t>(block);
+  const uintptr_t aligned_block_addr =
+      block_addr + static_cast<uintptr_t>(offset);
+
+  block->size = offset - kBlockHeaderSize;
+  block->align_offset = 0;
+  FreeTreeInsert(block);
+
+  HeapBlockHeader* const aligned_block =
+      reinterpret_cast<HeapBlockHeader*>(aligned_block_addr);
+  aligned_block->magic = kHeapBlockMagic;
+  aligned_block->is_free = 0;
+  aligned_block->size = orig_size - offset;
+  aligned_block->max_free_size = 0;
+  aligned_block->rb_node = {};
+  aligned_block->align_offset = 0;
+  return aligned_block;
+}
+
+// Shifts the header of an already-removed `block` forward by `offset` bytes
+// when `0 < offset < kBlockHeaderSize + kHeapAlignment` (where the prefix gap
+// is too small to form a standalone free block), recording `align_offset =
+// offset` so `Kfree` can restore the original block boundary for coalescing.
+static HeapBlockHeader* HeapShiftHeader(HeapBlockHeader* const block,
+                                        const int64_t offset) {
+  DCHECK(block != nullptr);
+  DCHECK(block->is_free == 0);
+  DCHECK(offset > 0);
+  DCHECK(offset < kBlockHeaderSize + kHeapAlignment);
+  DCHECK((offset & (kHeapAlignment - 1)) == 0);
+  DCHECK(block->size > offset);
+
+  const int64_t remaining_size = block->size - offset;
+  const uintptr_t aligned_block_addr =
+      reinterpret_cast<uintptr_t>(block) + static_cast<uintptr_t>(offset);
+  block->magic = 0;
+
+  HeapBlockHeader* const aligned_block =
+      reinterpret_cast<HeapBlockHeader*>(aligned_block_addr);
+  aligned_block->magic = kHeapBlockMagic;
+  aligned_block->is_free = 0;
+  aligned_block->size = remaining_size;
+  aligned_block->max_free_size = 0;
+  aligned_block->rb_node = {};
+  aligned_block->align_offset = offset;
+  return aligned_block;
 }
 
 // Initializes a newly allocated PMM frame range `[arena_addr, arena_addr +
@@ -227,6 +305,7 @@ static HeapBlockHeader* HeapInsertArena(const uintptr_t arena_addr,
   new_block->size = arena_bytes - kBlockHeaderSize;
   new_block->max_free_size = 0;
   new_block->rb_node = {};
+  new_block->align_offset = 0;
 
   return HeapCoalesceBlock(new_block);
 }
@@ -259,28 +338,69 @@ static HeapBlockHeader* HeapExpand(const int64_t aligned_size) {
   return HeapInsertArena(arena_addr, alloc_frames * kPageSize);
 }
 
-// Finds the lowest-address free block with `size >= aligned_size` in O(log n)
-// time using subtree `max_free_size` augmentation.
-static HeapBlockHeader* HeapFindFirstFit(const int64_t aligned_size) {
+// Finds the lowest-address free block in `g_free_tree` whose payload can
+// accommodate `aligned_size` bytes after aligning the payload start to
+// `eff_align` in O(log n) time using subtree `max_free_size` augmentation.
+static HeapBlockHeader* HeapFindFirstFit(const int64_t aligned_size,
+                                         const int64_t eff_align) {
   return g_free_tree.FindFirstAugmented(
       [aligned_size](const HeapBlockHeader& block) {
         return block.max_free_size >= aligned_size;
       },
-      [aligned_size](const HeapBlockHeader& block) {
-        return block.size >= aligned_size;
+      [aligned_size, eff_align](const HeapBlockHeader& block) {
+        if (block.size < aligned_size) {
+          return false;
+        }
+        const int64_t offset = HeapAlignmentOffset(&block, eff_align);
+        return (block.size - aligned_size) >= offset;
       });
 }
 
-#if !__STDC_HOSTED__
-// Helper for C++ aligned `operator new` overloads; supports alignments up to
-// `kHeapAlignment` (16 bytes).
-static void* KmallocAligned(const int64_t size, const int64_t alignment) {
-  if (alignment <= 0 || alignment > kHeapAlignment) {
+static void* KmallocAlignedLocked(const int64_t size, const int64_t alignment) {
+  DCHECK(g_heap_initialized);
+  DCHECK(size >= 0);
+  if (size < 0 || !IsValidAlignment(alignment)) {
     return nullptr;
   }
-  return Kmalloc(size);
+  const int64_t eff_align =
+      (alignment < kHeapAlignment) ? kHeapAlignment : alignment;
+  const int64_t max_pad = eff_align - kHeapAlignment;
+  const uintptr_t max_phys = PmmMaxPhysicalAddress();
+  const uintptr_t min_overhead =
+      static_cast<uintptr_t>(kBlockHeaderSize + kHeapAlignment + max_pad);
+  if (max_phys <= min_overhead ||
+      static_cast<uintptr_t>(size) > max_phys - min_overhead) {
+    return nullptr;
+  }
+
+  const int64_t raw_size = (size == 0) ? kHeapAlignment : size;
+  const int64_t aligned_size = AlignUp(raw_size, kHeapAlignment);
+
+  HeapBlockHeader* candidate = HeapFindFirstFit(aligned_size, eff_align);
+  if (candidate == nullptr) {
+    candidate = HeapExpand(aligned_size + max_pad);
+    if (candidate == nullptr) {
+      return nullptr;
+    }
+  }
+
+  const int64_t offset = HeapAlignmentOffset(candidate, eff_align);
+  DCHECK(candidate->size >= aligned_size + offset);
+
+  FreeTreeRemove(candidate);
+  if (offset >= kBlockHeaderSize + kHeapAlignment) {
+    candidate = HeapSplitFront(candidate, offset);
+  } else if (offset > 0) {
+    candidate = HeapShiftHeader(candidate, offset);
+  } else {
+    candidate->align_offset = 0;
+  }
+
+  if (HeapCanSplitBlock(candidate, aligned_size)) {
+    HeapSplitBlock(candidate, aligned_size);
+  }
+  return reinterpret_cast<void*>(candidate + 1);
 }
-#endif  // !__STDC_HOSTED__
 
 }  // namespace
 
@@ -303,6 +423,11 @@ int64_t HeapTotalFreeBytes() {
   return g_total_free_bytes;
 }
 
+void* KmallocAligned(const int64_t size, const int64_t alignment) {
+  const IrqSpinLockGuard lock_guard(g_heap_lock);
+  return KmallocAlignedLocked(size, alignment);
+}
+
 // Address-ordered first-fit allocator over `g_free_tree`:
 // 1. Rounds `size` up to a non-zero multiple of `kHeapAlignment` (16 bytes).
 // 2. Queries `g_free_tree.FindFirstAugmented` in O(log n) time for the lowest-
@@ -314,35 +439,13 @@ void* Kmalloc(const int64_t size) {
   const IrqSpinLockGuard lock_guard(g_heap_lock);
   DCHECK(g_heap_initialized);
   DCHECK(size >= 0);
-  const uintptr_t max_phys = PmmMaxPhysicalAddress();
-  constexpr uintptr_t kMinOverhead = kBlockHeaderSize + kHeapAlignment;
-  if (max_phys <= kMinOverhead ||
-      static_cast<uintptr_t>(size) > max_phys - kMinOverhead) {
-    return nullptr;
-  }
-
-  const int64_t raw_size = (size == 0) ? kHeapAlignment : size;
-  const int64_t aligned_size = AlignUp(raw_size, kHeapAlignment);
-
-  HeapBlockHeader* candidate = HeapFindFirstFit(aligned_size);
-  if (candidate == nullptr) {
-    candidate = HeapExpand(aligned_size);
-    if (candidate == nullptr) {
-      return nullptr;
-    }
-    DCHECK(candidate->size >= aligned_size);
-  }
-
-  FreeTreeRemove(candidate);
-  if (HeapCanSplitBlock(candidate, aligned_size)) {
-    HeapSplitBlock(candidate, aligned_size);
-  }
-  return reinterpret_cast<void*>(candidate + 1);
+  return KmallocAlignedLocked(size, kHeapAlignment);
 }
 
 // Validates that `ptr` points to a live, 16-byte-aligned payload preceded by a
-// valid in-use `HeapBlockHeader`, inserts the block into `g_free_tree`, and
-// coalesces it with physically adjacent free neighbors in O(log n) time.
+// valid in-use `HeapBlockHeader`, restores any shifted alignment header,
+// inserts the block into `g_free_tree`, and coalesces it with physically
+// adjacent free neighbors in O(log n) time.
 void Kfree(void* const ptr) {
   if (ptr == nullptr) {
     return;
@@ -354,11 +457,36 @@ void Kfree(void* const ptr) {
   DCHECK(ptr_addr < PmmMaxPhysicalAddress());
   DCHECK((ptr_addr & (kHeapAlignment - 1)) == 0);
 
-  HeapBlockHeader* const block = reinterpret_cast<HeapBlockHeader*>(ptr) - 1;
+  HeapBlockHeader* block = reinterpret_cast<HeapBlockHeader*>(ptr) - 1;
   DCHECK(block->magic == kHeapBlockMagic);
   DCHECK(block->is_free == 0);
   DCHECK(block->size >= kHeapAlignment);
   DCHECK((block->size & (kHeapAlignment - 1)) == 0);
+  DCHECK(block->align_offset >= 0);
+  DCHECK(block->align_offset < kBlockHeaderSize + kHeapAlignment);
+  DCHECK((block->align_offset & (kHeapAlignment - 1)) == 0);
+  DCHECK(ptr_addr >= kLowerMemoryLimit + kBlockHeaderSize +
+                         static_cast<uintptr_t>(block->align_offset));
+
+  if (block->align_offset > 0) {
+    const int64_t shift = block->align_offset;
+    const int64_t restored_size = block->size + shift;
+    const uintptr_t orig_addr =
+        reinterpret_cast<uintptr_t>(block) - static_cast<uintptr_t>(shift);
+    block->magic = 0;
+    block->is_free = 1;
+    block->align_offset = 0;
+
+    HeapBlockHeader* const orig_block =
+        reinterpret_cast<HeapBlockHeader*>(orig_addr);
+    orig_block->magic = kHeapBlockMagic;
+    orig_block->is_free = 0;
+    orig_block->size = restored_size;
+    orig_block->max_free_size = 0;
+    orig_block->rb_node = {};
+    orig_block->align_offset = 0;
+    block = orig_block;
+  }
 
   HeapCoalesceBlock(block);
 }

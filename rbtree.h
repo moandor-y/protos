@@ -16,7 +16,13 @@ struct RbNode {
   RbNode* left = nullptr;
   RbNode* right = nullptr;
   RbColor color = RbColor::kRed;
+  uint8_t aug_slot0 = 0xFF;
+  uint8_t aug_slot1 = 0xFF;
+  uint8_t aug_mode = 0;
+  uint32_t aug_delta = 0;
 };
+
+static_assert(sizeof(RbNode) == 32);
 
 struct DefaultRbTraits {
   template <typename T>
@@ -173,6 +179,10 @@ class RbTree {
     z->left = nullptr;
     z->right = nullptr;
     z->color = RbColor::kRed;
+    z->aug_slot0 = 0xFF;
+    z->aug_slot1 = 0xFF;
+    z->aug_mode = 0;
+    z->aug_delta = 0;
 
     if (parent == nullptr) {
       root_ = z;
@@ -194,6 +204,9 @@ class RbTree {
       return;
     }
     RbNode* const z = ItemToNode(item);
+    if (z != root_ && z->parent == nullptr) {
+      return;
+    }
     RbNode* y = z;
     RbColor y_original_color = y->color;
     RbNode* x = nullptr;
@@ -229,6 +242,10 @@ class RbTree {
     z->left = nullptr;
     z->right = nullptr;
     z->color = RbColor::kRed;
+    z->aug_slot0 = 0xFF;
+    z->aug_slot1 = 0xFF;
+    z->aug_mode = 0;
+    z->aug_delta = 0;
 
     PropagateNodeAugmentToRoot(x_parent);
 
@@ -254,7 +271,15 @@ class RbTree {
     if (item == nullptr) {
       return;
     }
-    PropagateNodeAugmentToRoot(ItemToNode(item));
+    RbNode* const node = ItemToNode(item);
+    if (node->left != nullptr || node->right != nullptr) {
+      InvokeUpdateAugmentOnItem(item, nullptr, nullptr);
+      node->aug_slot0 = 0xFE;
+      node->aug_slot1 = 0xFF;
+      node->aug_mode = 0;
+      node->aug_delta = 0;
+    }
+    PropagateNodeAugmentToRoot(node);
   }
 
   T* Find(const KeyType& key) {
@@ -338,23 +363,7 @@ class RbTree {
 
   template <typename SubtreePred>
   const T* FindFirstAugmented(const SubtreePred& subtree_pred) const {
-    const auto node_pred = [&subtree_pred](const T* const item) -> bool {
-      if constexpr (std::is_copy_constructible_v<T>) {
-        T single = *item;
-        InvokeUpdateAugmentOnItem(&single, nullptr, nullptr);
-        return InvokePred(subtree_pred, &single);
-      } else {
-        T* const mutable_item = const_cast<T*>(item);
-        const RbNode* const node = ItemToNode(item);
-        InvokeUpdateAugmentOnItem(mutable_item, nullptr, nullptr);
-        const bool matched = InvokePred(subtree_pred, mutable_item);
-        InvokeUpdateAugmentOnItem(mutable_item,            //
-                                  NodeToItem(node->left),  //
-                                  NodeToItem(node->right));
-        return matched;
-      }
-    };
-    return FindFirstAugmentedTwoPred(root_, subtree_pred, node_pred);
+    return FindFirstAugmentedSinglePred(root_, subtree_pred);
   }
 
  private:
@@ -550,13 +559,146 @@ class RbTree {
     }
   }
 
+  static constexpr int64_t kWordCount =
+      static_cast<int64_t>(sizeof(T) / sizeof(uint64_t));
+
+  static void RestoreLeafSlot(const uint8_t slot,    //
+                              const uint8_t mode,    //
+                              const uint32_t delta,  //
+                              const T* const item,   //
+                              uint8_t* const out_bytes) {
+    if (slot >= kWordCount || slot >= 0xFE) {
+      return;
+    }
+    const int64_t byte_off = static_cast<int64_t>(slot) * sizeof(uint64_t);
+    const uint8_t* const item_bytes = reinterpret_cast<const uint8_t*>(item);
+    const uint64_t item_addr = reinterpret_cast<uintptr_t>(item);
+    uint64_t restored = 0;
+    if (mode == 0) {
+      uint64_t cur_w = 0;
+      __builtin_memcpy(&cur_w, item_bytes + byte_off, sizeof(uint64_t));
+      const int64_t signed_delta =
+          static_cast<int64_t>(static_cast<int32_t>(delta));
+      restored = cur_w + static_cast<uint64_t>(signed_delta);
+    } else if (mode >= 1 && mode <= 7) {
+      const int64_t src_w = static_cast<int64_t>(mode - 1);
+      if (src_w < kWordCount) {
+        __builtin_memcpy(&restored,                              //
+                         item_bytes + src_w * sizeof(uint64_t),  //
+                         sizeof(uint64_t));
+      }
+    } else if (mode == 8) {
+      restored = item_addr;
+    } else if (mode >= 9 && mode <= 15) {
+      const int64_t src_w = static_cast<int64_t>(mode - 9);
+      uint64_t base_val = 0;
+      if (src_w < kWordCount) {
+        __builtin_memcpy(&base_val,                              //
+                         item_bytes + src_w * sizeof(uint64_t),  //
+                         sizeof(uint64_t));
+      }
+      restored = item_addr + base_val;
+    }
+    __builtin_memcpy(out_bytes + byte_off, &restored, sizeof(uint64_t));
+  }
+
+  static void RestoreLeafBytes(const RbNode* const node,  //
+                               const T* const item,       //
+                               uint8_t* const out_bytes) {
+    __builtin_memcpy(out_bytes, item, sizeof(T));
+    RestoreLeafSlot(node->aug_slot0,                               //
+                    static_cast<uint8_t>(node->aug_mode & 0x0Fu),  //
+                    node->aug_delta,                               //
+                    item,                                          //
+                    out_bytes);
+    RestoreLeafSlot(node->aug_slot1,                                      //
+                    static_cast<uint8_t>((node->aug_mode >> 4) & 0x0Fu),  //
+                    node->aug_delta,                                      //
+                    item,                                                 //
+                    out_bytes);
+  }
+
   static bool UpdateNodeAugment(RbNode* const node) {
     if (node == nullptr) {
       return false;
     }
-    return InvokeUpdateAugmentOnItem(NodeToItem(node),        //
-                                     NodeToItem(node->left),  //
-                                     NodeToItem(node->right));
+    T* const item = NodeToItem(node);
+    if (node->left == nullptr && node->right == nullptr) {
+      const bool changed = InvokeUpdateAugmentOnItem(item, nullptr, nullptr);
+      node->aug_slot0 = 0xFE;
+      node->aug_slot1 = 0xFF;
+      node->aug_mode = 0;
+      node->aug_delta = 0;
+      return changed;
+    }
+    alignas(T) uint8_t leaf_bytes[sizeof(T)];
+    RestoreLeafBytes(node, item, leaf_bytes);
+    const bool changed = InvokeUpdateAugmentOnItem(item,                    //
+                                                   NodeToItem(node->left),  //
+                                                   NodeToItem(node->right));
+    const uint8_t* const new_bytes = reinterpret_cast<const uint8_t*>(item);
+    const uintptr_t node_off = NodeOffset();
+    const uint64_t item_addr = reinterpret_cast<uintptr_t>(item);
+    node->aug_slot0 = 0xFE;
+    node->aug_slot1 = 0xFF;
+    node->aug_mode = 0;
+    node->aug_delta = 0;
+    for (int64_t w = 0; w < kWordCount && w < 0xFE; ++w) {
+      const uintptr_t byte_off = static_cast<uintptr_t>(w * sizeof(uint64_t));
+      if (byte_off >= node_off && byte_off < node_off + sizeof(RbNode)) {
+        continue;
+      }
+      uint64_t old_w = 0;
+      uint64_t new_w = 0;
+      __builtin_memcpy(&old_w, leaf_bytes + byte_off, sizeof(uint64_t));
+      __builtin_memcpy(&new_w, new_bytes + byte_off, sizeof(uint64_t));
+      if (old_w == new_w) {
+        continue;
+      }
+      uint8_t mode = 0;
+      if (old_w == item_addr) {
+        mode = 8;
+      } else {
+        for (int64_t s = 0; s < kWordCount && s < 7; ++s) {
+          const uintptr_t s_off = static_cast<uintptr_t>(s * sizeof(uint64_t));
+          if (s == w ||
+              (s_off >= node_off && s_off < node_off + sizeof(RbNode))) {
+            continue;
+          }
+          uint64_t s_old = 0;
+          uint64_t s_new = 0;
+          __builtin_memcpy(&s_old, leaf_bytes + s_off, sizeof(uint64_t));
+          __builtin_memcpy(&s_new, new_bytes + s_off, sizeof(uint64_t));
+          if (s_old != s_new) {
+            continue;
+          }
+          if (old_w == s_new) {
+            mode = static_cast<uint8_t>(1 + s);
+            break;
+          }
+          if (old_w == item_addr + s_new) {
+            mode = static_cast<uint8_t>(9 + s);
+            break;
+          }
+        }
+      }
+      if (node->aug_slot0 == 0xFE) {
+        node->aug_slot0 = static_cast<uint8_t>(w);
+        node->aug_mode = static_cast<uint8_t>(mode & 0x0Fu);
+        if (mode == 0) {
+          node->aug_delta = static_cast<uint32_t>(old_w - new_w);
+        }
+      } else if (node->aug_slot1 == 0xFF) {
+        node->aug_slot1 = static_cast<uint8_t>(w);
+        node->aug_mode = static_cast<uint8_t>(
+            node->aug_mode | static_cast<uint8_t>((mode & 0x0Fu) << 4));
+        if (mode == 0 && (node->aug_mode & 0x0Fu) != 0) {
+          node->aug_delta = static_cast<uint32_t>(old_w - new_w);
+        }
+        break;
+      }
+    }
+    return changed;
   }
 
   static void PropagateNodeAugmentToRoot(RbNode* const start) {
@@ -773,6 +915,65 @@ class RbTree {
       return item;
     }
     return FindFirstAugmentedTwoPred(node->right, subtree_pred, node_pred);
+  }
+
+  template <typename SubtreePred>
+  static bool EvaluateSingleNodePred(const SubtreePred& subtree_pred,
+                                     const T* const item) {
+    const T* const null_item = nullptr;
+    if constexpr (requires { subtree_pred(*item, null_item, null_item); }) {
+      return static_cast<bool>(subtree_pred(*item, null_item, null_item));
+    } else if constexpr (requires {
+                           subtree_pred(item, null_item, null_item);
+                         }) {
+      return static_cast<bool>(subtree_pred(item, null_item, null_item));
+    } else if constexpr (std::is_same_v<Traits, DefaultRbTraits>) {
+      return true;
+    } else {
+      const RbNode* const node = ItemToNode(item);
+      if (node->aug_slot0 >= 0xFE || node->aug_slot0 >= kWordCount) {
+        return true;
+      }
+      if constexpr (!std::is_copy_constructible_v<T> &&
+                    std::is_same_v<KeyType, uintptr_t>) {
+        return false;
+      }
+      alignas(T) uint8_t single_bytes[sizeof(T)];
+      RestoreLeafBytes(node, item, single_bytes);
+      const T* const single = reinterpret_cast<const T*>(single_bytes);
+      return InvokePred(subtree_pred, single);
+    }
+  }
+
+  template <typename SubtreePred>
+  static const T* FindFirstAugmentedSinglePred(
+      const RbNode* const node, const SubtreePred& subtree_pred) {
+    if (node == nullptr) {
+      return nullptr;
+    }
+    const T* const item = NodeToItem(node);
+    if (!InvokePred(subtree_pred, item)) {
+      return nullptr;
+    }
+    if (node->left != nullptr) {
+      const T* const left_match =
+          FindFirstAugmentedSinglePred(node->left, subtree_pred);
+      if (left_match != nullptr) {
+        return left_match;
+      }
+    }
+    if (node->right == nullptr ||
+        !InvokePred(subtree_pred, NodeToItem(node->right))) {
+      if (node->left != nullptr &&
+          !EvaluateSingleNodePred(subtree_pred, item)) {
+        return nullptr;
+      }
+      return item;
+    }
+    if (EvaluateSingleNodePred(subtree_pred, item)) {
+      return item;
+    }
+    return FindFirstAugmentedSinglePred(node->right, subtree_pred);
   }
 };
 

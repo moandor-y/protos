@@ -38,11 +38,25 @@ struct MultibootMemoryMap {
   int fb_type;
 };
 
+// Records a single memory map entry into `*out_map`, coalescing adjacent or
+// overlapping regions of the same availability class and saturating byte
+// totals at `INT64_MAX`. Returns false if `out_map` is null or if adding an
+// uncoalesceable region would exceed `kMaxMemoryRegions`.
+bool MultibootRecordMmapEntry(MultibootMemoryMap* out_map,  //
+                              uint64_t raw_base,            //
+                              uint64_t raw_length,          //
+                              uint32_t type);
+
 // Parses the Multiboot1 (`0x2BADB002`) or Multiboot2 (`0x36D76289`) memory map
 // at `multiboot_info_addr` (must lie below `max_physical_addr`), mapping the
 // bootloader structures on demand if they lie above the initial 64 MiB
 // bootstrap window, and populates `*out_map`. Returns true if a valid memory
-// map with usable RAM was found.
+// map with usable RAM was found without region table overflow.
+bool MultibootParseMemoryMapFromBuffer(uint32_t multiboot_magic,      //
+                                       uint64_t multiboot_info_addr,  //
+                                       uintptr_t max_physical_addr,   //
+                                       MultibootMemoryMap* out_map);
+
 bool MultibootParseMemoryMap(uint32_t multiboot_magic,
                              uint64_t multiboot_info_addr,
                              uintptr_t max_physical_addr,

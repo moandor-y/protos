@@ -23,6 +23,14 @@ void VgaWriteHex(uint64_t value);
 // Writes a 64-bit unsigned integer in base-10 decimal to the console.
 void VgaWriteDec(uint64_t value);
 
+// Lockless emergency panic writer for the VGA console; must only be called with
+// local interrupts disabled in unrecoverable panic paths (e.g., CheckFailure).
+void VgaPanicWrite(const char* str);
+
+// Lockless emergency base-10 decimal writer for the VGA console; must only be
+// called with local interrupts disabled in unrecoverable panic paths.
+void VgaPanicWriteDec(uint64_t value);
+
 // Attaches a Multiboot2 direct-color linear pixel framebuffer (such as UEFI
 // GOP on pure-UEFI machines without legacy 0xB8000 VGA text mode) and renders
 // the current 80x25 text buffer onto it.
