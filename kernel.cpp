@@ -6,6 +6,7 @@
 #include "memory_tests.h"
 #include "pmm.h"
 #include "smp.h"
+#include "task.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -25,6 +26,7 @@ extern "C" [[noreturn]] void kernel_main(const uint32_t multiboot_magic,
   PmmInit(multiboot_magic, multiboot_info_addr);
   HeapInit();
   SmpInit(multiboot_magic, multiboot_info_addr);
+  TaskInit();
 
   RunBootVerificationSuite();
 

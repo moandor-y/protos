@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <type_traits>
 #if __STDC_HOSTED__
 #include <thread>
@@ -12,6 +13,7 @@
 #include "paging.h"
 #include "pmm.h"
 #include "spinlock.h"
+#include "task.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -191,7 +193,7 @@ struct [[gnu::packed]] AcpiMadtLocalX2Apic {
 // Discovered CPU topology and per-CPU runtime state populated during SmpInit().
 SmpTopology g_topology = {};
 // Cache-line-aligned per-CPU state blocks (`0 .. SmpCpuCount() - 1`).
-alignas(64) CpuLocal g_cpu_locals[kMaxCpus] = {};
+std::unique_ptr<CpuLocal[]> g_cpu_locals;
 // Calibrated periodic Local APIC timer initial count computed on the BSP.
 uint32_t g_calibrated_timer_initial_count = 0;
 // Number of CPUs (BSP + APs) that have completed initialization and come
@@ -218,10 +220,10 @@ std::atomic<int64_t> g_work_epoch{0};
 std::atomic<int64_t> g_work_start_epoch{0};
 // Per-CPU epoch acknowledgment written by AP `i` upon waking from `hlt`, so the
 // BSP knows whether an AP received the wakeup IPI or needs a retry.
-std::atomic<int64_t> g_ap_ack_epoch[kMaxCpus] = {};
+std::unique_ptr<std::atomic<int64_t>[]> g_ap_ack_epoch;
 // Per-CPU completion epoch written by AP `i` after `g_work_fn` returns, before
 // the AP goes back to `sti; hlt`.
-std::atomic<int64_t> g_ap_done_epoch[kMaxCpus] = {};
+std::unique_ptr<std::atomic<int64_t>[]> g_ap_done_epoch;
 
 #if __STDC_HOSTED__
 constexpr uint64_t kDefaultHostCalibrationTicks = 625000;
@@ -236,18 +238,34 @@ uint64_t g_host_calibration_ticks = kDefaultHostCalibrationTicks;
 std::atomic<int64_t> g_host_eoi_count{0};
 
 struct HostApRunner {
-  std::thread threads[kMaxCpus];
-  int64_t spawned_epoch[kMaxCpus] = {};
-  int64_t completed_epoch[kMaxCpus] = {};
+  int count = 0;
+  std::unique_ptr<std::thread[]> threads;
+  std::unique_ptr<int64_t[]> spawned_epoch;
+  std::unique_ptr<int64_t[]> completed_epoch;
+
+  void EnsureCapacity(const int cpu_count) {
+    if (count >= cpu_count) {
+      return;
+    }
+    Reset();
+    count = cpu_count;
+    threads.reset(new std::thread[cpu_count]);
+    spawned_epoch.reset(new int64_t[cpu_count]());
+    completed_epoch.reset(new int64_t[cpu_count]());
+  }
 
   void Reset() {
-    for (int i = 0; i < kMaxCpus; ++i) {
-      if (threads[i].joinable()) {
-        threads[i].join();
+    if (threads != nullptr) {
+      for (int i = 0; i < count; ++i) {
+        if (threads[i].joinable()) {
+          threads[i].join();
+        }
       }
-      spawned_epoch[i] = 0;
-      completed_epoch[i] = 0;
     }
+    threads.reset();
+    spawned_epoch.reset();
+    completed_epoch.reset();
+    count = 0;
   }
 
   ~HostApRunner() { Reset(); }
@@ -525,27 +543,19 @@ static bool IsValidLocalApicAddress(const uintptr_t addr,
          (max_physical_addr - addr) >= static_cast<uintptr_t>(kPageSize);
 }
 
-static void AddDiscoveredCpu(SmpTopology* const topology,      //
-                             const uint8_t apic_id,            //
-                             const uint8_t acpi_processor_id,  //
-                             const uint8_t bsp_apic_id) {
+static void AddDiscoveredCpu(SmpTopology* const topology,  //
+                             const int capacity,           //
+                             const uint8_t apic_id,        //
+                             const uint8_t acpi_processor_id) {
   DCHECK(topology != nullptr);
+  DCHECK(topology->cpus != nullptr);
   DCHECK(apic_id != kInvalidXapicId);
-  DCHECK(bsp_apic_id != kInvalidXapicId);
   for (int i = 0; i < topology->cpu_count; ++i) {
     if (topology->cpus[i].apic_id == apic_id) {
       return;
     }
   }
-  if (topology->cpu_count >= kMaxCpus) {
-    if (apic_id == bsp_apic_id) {
-      CpuInfo& bsp_slot = topology->cpus[kMaxCpus - 1];
-      bsp_slot = {};
-      bsp_slot.apic_id = apic_id;
-      bsp_slot.acpi_processor_id = acpi_processor_id;
-    }
-    return;
-  }
+  DCHECK(topology->cpu_count < capacity);
   CpuInfo& cpu = topology->cpus[topology->cpu_count];
   cpu = {};
   cpu.apic_id = apic_id;
@@ -641,25 +651,13 @@ static bool TryDiscoverFromMemoryRange(const uintptr_t range_start,        //
   return false;
 }
 
-static void ResetCpuLocalSlot(const int cpu_index) {
-  DCHECK(cpu_index >= 0 && cpu_index < kMaxCpus);
-  CpuLocal& slot = g_cpu_locals[cpu_index];
-  slot.self = nullptr;
-  slot.cpu_id = 0;
-  slot.apic_id = 0;
-  slot.online = false;
-  slot.stack_base = 0;
-  slot.stack_top = 0;
-  slot.timer_ticks.store(0, std::memory_order_relaxed);
-  slot.ipi_count.store(0, std::memory_order_relaxed);
-}
-
 static void InitCpuLocalSlot(const int cpu_index,         //
                              const uint8_t apic_id,       //
                              const bool online,           //
                              const uintptr_t stack_base,  //
                              const uintptr_t stack_top) {
-  DCHECK(cpu_index >= 0 && cpu_index < kMaxCpus);
+  DCHECK(g_cpu_locals != nullptr);
+  DCHECK(cpu_index >= 0 && cpu_index < g_topology.cpu_count);
   CpuLocal& slot = g_cpu_locals[cpu_index];
   slot.self = &slot;
   slot.cpu_id = cpu_index;
@@ -680,9 +678,7 @@ static void ResetSmpState() {
   internal::g_cpu_local_bound.store(false, std::memory_order_release);
 #endif
   g_topology = {};
-  for (int i = 0; i < kMaxCpus; ++i) {
-    ResetCpuLocalSlot(i);
-  }
+  g_cpu_locals.reset();
   g_calibrated_timer_initial_count = 0;
   g_online_cpu_count.store(0, std::memory_order_seq_cst);
   g_ap_boot_done.store(0, std::memory_order_seq_cst);
@@ -695,10 +691,8 @@ static void ResetSmpState() {
   g_work_context.store(nullptr, std::memory_order_seq_cst);
   g_work_epoch.store(0, std::memory_order_seq_cst);
   g_work_start_epoch.store(0, std::memory_order_seq_cst);
-  for (int i = 0; i < kMaxCpus; ++i) {
-    g_ap_ack_epoch[i].store(0, std::memory_order_seq_cst);
-    g_ap_done_epoch[i].store(0, std::memory_order_seq_cst);
-  }
+  g_ap_ack_epoch.reset();
+  g_ap_done_epoch.reset();
 }
 
 #if !__STDC_HOSTED__
@@ -1054,6 +1048,7 @@ static void SendWakeupIpi(const uintptr_t lapic_base,  //
 #else
   (void)lapic_base;
   (void)apic_id;
+  g_host_ap_runner.EnsureCapacity(g_topology.cpu_count);
   const int64_t target_epoch = g_work_epoch.load(std::memory_order_acquire);
   if (g_host_ap_runner.spawned_epoch[cpu_index] == target_epoch) {
     return;
@@ -1109,6 +1104,10 @@ extern "C" void ApKernelEntry(const int cpu_index) {
   for (;;) {
     asm volatile("cli" : : : "memory", "cc");
     if (RunPendingApWork(cpu_index, &completed_epoch)) {
+      continue;
+    }
+    const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+    if (scheduler != nullptr && scheduler->PollIdleCpu(cpu_index)) {
       continue;
     }
     asm volatile("sti; hlt" : : : "memory", "cc");
@@ -1263,6 +1262,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
           : kDefaultLocalApicPhysAddr;
   out_topology->bsp_apic_id = bsp_apic_id;
 
+  int candidate_count = 0;
   int64_t offset = kMadtHeaderSize;
   constexpr int64_t kEntryHeaderSize = sizeof(AcpiMadtEntryHeader);
   while (offset + kEntryHeaderSize <= madt_length) {
@@ -1281,10 +1281,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
           reinterpret_cast<const AcpiMadtLocalApic*>(entry);
       if ((lapic->flags & kMadtLapicUsableMask) != 0 &&
           lapic->apic_id != kInvalidXapicId) {
-        AddDiscoveredCpu(out_topology,              //
-                         lapic->apic_id,            //
-                         lapic->acpi_processor_id,  //
-                         bsp_apic_id);
+        ++candidate_count;
       }
     } else if (entry->type == kMadtTypeLocalApicOverride) {
       if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtLocalApicOverride))) {
@@ -1304,10 +1301,63 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
           reinterpret_cast<const AcpiMadtLocalX2Apic*>(entry);
       if ((x2apic->flags & kMadtLapicUsableMask) != 0 &&
           x2apic->x2apic_id < kInvalidXapicId) {
-        AddDiscoveredCpu(out_topology,                                      //
-                         static_cast<uint8_t>(x2apic->x2apic_id),           //
-                         static_cast<uint8_t>(x2apic->acpi_processor_uid),  //
-                         bsp_apic_id);
+        ++candidate_count;
+      }
+    }
+
+    offset += entry_len;
+  }
+
+  if (candidate_count <= 0) {
+    *out_topology = {};
+    return false;
+  }
+
+  const int capacity = candidate_count + 1;
+  out_topology->cpus.reset(new CpuInfo[capacity]());
+  if (out_topology->cpus == nullptr) {
+    *out_topology = {};
+    return false;
+  }
+
+  offset = kMadtHeaderSize;
+  while (offset + kEntryHeaderSize <= madt_length) {
+    const AcpiMadtEntryHeader* const entry =
+        reinterpret_cast<const AcpiMadtEntryHeader*>(madt_addr + offset);
+    const int64_t entry_len = entry->length;
+    if (entry_len < kEntryHeaderSize || offset + entry_len > madt_length) {
+      break;
+    }
+
+    if (entry->type == kMadtTypeLocalApic) {
+      if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtLocalApic))) {
+        break;
+      }
+      const AcpiMadtLocalApic* const lapic =
+          reinterpret_cast<const AcpiMadtLocalApic*>(entry);
+      if ((lapic->flags & kMadtLapicUsableMask) != 0 &&
+          lapic->apic_id != kInvalidXapicId) {
+        AddDiscoveredCpu(out_topology,    //
+                         capacity,        //
+                         lapic->apic_id,  //
+                         lapic->acpi_processor_id);
+      }
+    } else if (entry->type == kMadtTypeLocalApicOverride) {
+      if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtLocalApicOverride))) {
+        break;
+      }
+    } else if (entry->type == kMadtTypeLocalX2Apic) {
+      if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtLocalX2Apic))) {
+        break;
+      }
+      const AcpiMadtLocalX2Apic* const x2apic =
+          reinterpret_cast<const AcpiMadtLocalX2Apic*>(entry);
+      if ((x2apic->flags & kMadtLapicUsableMask) != 0 &&
+          x2apic->x2apic_id < kInvalidXapicId) {
+        AddDiscoveredCpu(out_topology,                             //
+                         capacity,                                 //
+                         static_cast<uint8_t>(x2apic->x2apic_id),  //
+                         static_cast<uint8_t>(x2apic->acpi_processor_uid));
       }
     }
 
@@ -1334,15 +1384,11 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
     }
     out_topology->cpus[0] = bsp_info;
   } else if (bsp_index < 0) {
-    const int shift_limit = (out_topology->cpu_count < kMaxCpus)
-                                ? out_topology->cpu_count
-                                : (kMaxCpus - 1);
-    for (int i = shift_limit; i > 0; --i) {
+    DCHECK(out_topology->cpu_count < capacity);
+    for (int i = out_topology->cpu_count; i > 0; --i) {
       out_topology->cpus[i] = out_topology->cpus[i - 1];
     }
-    if (out_topology->cpu_count < kMaxCpus) {
-      ++out_topology->cpu_count;
-    }
+    ++out_topology->cpu_count;
     out_topology->cpus[0] = {};
     out_topology->cpus[0].apic_id = bsp_apic_id;
     out_topology->cpus[0].acpi_processor_id = 0;
@@ -1480,6 +1526,15 @@ void SmpInit(const uint32_t multiboot_magic,
                             kMaxCanonicalIdentityAddress,  //
                             bsp_initial_apic_id,           //
                             &g_topology));
+
+  const int cpu_count = g_topology.cpu_count;
+  CHECK(cpu_count >= 1);
+  g_cpu_locals.reset(new CpuLocal[cpu_count]());
+  CHECK(g_cpu_locals != nullptr);
+  g_ap_ack_epoch.reset(new std::atomic<int64_t>[cpu_count]());
+  CHECK(g_ap_ack_epoch != nullptr);
+  g_ap_done_epoch.reset(new std::atomic<int64_t>[cpu_count]());
+  CHECK(g_ap_done_epoch != nullptr);
 
   CHECK(PagingMapBootstrapRange(g_topology.local_apic_phys_addr, kPageSize));
 
@@ -1699,7 +1754,7 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
   DCHECK(g_smp_initialized);
   DCHECK(work_fn != nullptr);
   const int cpu_count = g_topology.cpu_count;
-  DCHECK(cpu_count >= 1 && cpu_count <= kMaxCpus);
+  DCHECK(cpu_count >= 1);
   DCHECK(SmpOnlineCpuCount() == cpu_count);
   DCHECK(!g_dispatch_in_progress.exchange(true, std::memory_order_acq_rel));
 

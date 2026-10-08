@@ -4,14 +4,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <type_traits>
 
 #include "check.h"
 
 namespace protos {
 
-// Maximum number of CPUs tracked by the kernel topology table.
-constexpr int kMaxCpus = 64;
 // Number of 4 KiB physical frames allocated per Application Processor stack
 // (4 * 4 KiB = 16 KiB per AP).
 constexpr int64_t kApStackFrames = 4;
@@ -71,8 +70,9 @@ namespace internal {
 #if !__STDC_HOSTED__
 inline std::atomic<bool> g_cpu_local_bound{false};
 #else
-inline CpuLocal** HostCurrentCpuSlot() {
+[[gnu::noinline]] inline CpuLocal** HostCurrentCpuSlot() {
   thread_local CpuLocal* current_cpu = nullptr;
+  asm volatile("" : "+m"(current_cpu));
   return &current_cpu;
 }
 #endif
@@ -81,12 +81,12 @@ inline CpuLocal** HostCurrentCpuSlot() {
 
 // Binds `cpu` as the calling CPU's (or host thread's) active `CpuLocal` state
 // (`IA32_GS_BASE` MSR `0xC0000101` on bare metal, `thread_local` pointer on
-// host). Validates `cpu != nullptr`, `cpu->self == cpu`, and
-// `0 <= cpu->cpu_id < kMaxCpus` with `DCHECK`.
+// host). Validates `cpu != nullptr`, `cpu->self == cpu`, and `cpu->cpu_id >= 0`
+// with `DCHECK`.
 inline void BindCpuLocal(CpuLocal* const cpu) {
   DCHECK(cpu != nullptr);
   DCHECK(cpu->self == cpu);
-  DCHECK(cpu->cpu_id >= 0 && cpu->cpu_id < kMaxCpus);
+  DCHECK(cpu->cpu_id >= 0);
 #if !__STDC_HOSTED__
   const uint64_t addr = reinterpret_cast<uintptr_t>(cpu);
   const uint32_t low = static_cast<uint32_t>(addr & 0xFFFFFFFFu);
@@ -148,10 +148,10 @@ inline void ResetCpuLocalForTest() {
 
 // Discovered multiprocessor topology from ACPI MADT firmware tables.
 struct SmpTopology {
-  uintptr_t local_apic_phys_addr;
-  uint8_t bsp_apic_id;
-  int cpu_count;
-  CpuInfo cpus[kMaxCpus];
+  uintptr_t local_apic_phys_addr = 0;
+  uint8_t bsp_apic_id = 0;
+  int cpu_count = 0;
+  std::unique_ptr<CpuInfo[]> cpus;
 };
 
 // Scans a Multiboot2 information structure at non-zero `multiboot_info_addr`

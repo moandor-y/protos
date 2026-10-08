@@ -569,6 +569,33 @@ extern "C" {
 // (`= 0`); halts the kernel if an unimplemented pure virtual method is called.
 void __cxa_pure_virtual() { CHECK(false); }
 
+// Itanium C++ ABI DSO handle and atexit registration stub required by GCC for
+// file-scope objects with non-trivial destructors (such as the single global
+// `std::shared_ptr<TaskScheduler>` in `task.cpp`) under `-ffreestanding
+// -nostdlib`. The kernel never exits, so `__cxa_atexit` is a no-op returning 0.
+void* __dso_handle = nullptr;
+
+int __cxa_atexit(void (*const func)(void*),  //
+                 void* const arg,            //
+                 void* const dso_handle) noexcept {
+  (void)func;
+  (void)arg;
+  (void)dso_handle;
+  return 0;
+}
+
+// Weak freestanding `memset` implementation used when GCC synthesizes `memset`
+// calls for struct or array zero-initialization under `-ffreestanding`.
+[[gnu::weak, gnu::optimize("no-tree-loop-distribute-patterns")]] void* memset(
+    void* const dest, const int ch, const size_t count) {
+  uint8_t* const bytes = static_cast<uint8_t*>(dest);
+  const uint8_t value = static_cast<uint8_t>(ch);
+  for (size_t i = 0; i < count; ++i) {
+    bytes[i] = value;
+  }
+  return dest;
+}
+
 // Forces `libstdc++` reference counting (`std::shared_ptr`) to always use
 // thread-safe atomic instructions (`lock xadd`) in freestanding kernel builds.
 char __libc_single_threaded = 0;

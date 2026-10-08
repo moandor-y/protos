@@ -290,10 +290,10 @@ extern "C" void IdtDispatch(InterruptFrame* const frame) {
     if (cpu != nullptr) {
       cpu->timer_ticks.fetch_add(1, std::memory_order_relaxed);
     }
+    SmpSendLocalApicEoi();
     if (handler != nullptr) {
       handler(frame);
     }
-    SmpSendLocalApicEoi();
     return;
   }
 
@@ -302,10 +302,10 @@ extern "C" void IdtDispatch(InterruptFrame* const frame) {
     if (cpu != nullptr) {
       cpu->ipi_count.fetch_add(1, std::memory_order_relaxed);
     }
+    SmpSendLocalApicEoi();
     if (handler != nullptr) {
       handler(frame);
     }
-    SmpSendLocalApicEoi();
     return;
   }
 
@@ -316,10 +316,10 @@ extern "C" void IdtDispatch(InterruptFrame* const frame) {
     return;
   }
 
+  SmpSendLocalApicEoi();
   if (handler != nullptr) {
     handler(frame);
   }
-  SmpSendLocalApicEoi();
 }
 
 #if __STDC_HOSTED__

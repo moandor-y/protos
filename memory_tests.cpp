@@ -13,6 +13,7 @@
 #include "rbtree.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "task.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -871,7 +872,7 @@ struct MultiCpuStressContext {
   int expected_cpus = 0;
   std::atomic<int> start_barrier_count{0};
   int second_pass_count = 0;
-  bool per_cpu_ok[kMaxCpus] = {};
+  std::unique_ptr<bool[]> per_cpu_ok;
 };
 
 constexpr int kMultiCpuStressIterations = 64;
@@ -1052,14 +1053,18 @@ static bool TestSmpMultiCpuSyncStress() {
     return false;
   }
 
+  MultiCpuStressContext ctx = {};
+  ctx.expected_cpus = cpu_count;
+  ctx.per_cpu_ok.reset(new bool[cpu_count]());
+  if (ctx.per_cpu_ok == nullptr) {
+    return false;
+  }
+
   const int64_t pmm_free_before = PmmFreeFrameCount();
   const int64_t heap_free_before = HeapTotalFreeBytes();
   if (pmm_free_before <= 0 || heap_free_before <= 0) {
     return false;
   }
-
-  MultiCpuStressContext ctx = {};
-  ctx.expected_cpus = cpu_count;
 
   SmpRunOnAllCpus(MultiCpuStressWorker, &ctx);
   // Ensure cursor is at column 0 before LogTestResult writes the test summary.
@@ -1218,9 +1223,9 @@ static bool TriggerInt3AndVerifyAllRegisters() {
 
 struct IdtPerCpuAndTimerVerifyContext {
   int cpu_count = 0;
-  int64_t initial_ticks[kMaxCpus] = {};
-  int64_t initial_ipis[kMaxCpus] = {};
-  bool per_cpu_ok[kMaxCpus] = {};
+  std::unique_ptr<int64_t[]> initial_ticks;
+  std::unique_ptr<int64_t[]> initial_ipis;
+  std::unique_ptr<bool[]> per_cpu_ok;
 };
 
 constexpr int kMaxTimerWaitSpins = 200000000;
@@ -1305,6 +1310,13 @@ static bool TestIdtPerCpuAndLapicTimer() {
 
   IdtPerCpuAndTimerVerifyContext ctx = {};
   ctx.cpu_count = cpu_count;
+  ctx.initial_ticks.reset(new int64_t[cpu_count]());
+  ctx.initial_ipis.reset(new int64_t[cpu_count]());
+  ctx.per_cpu_ok.reset(new bool[cpu_count]());
+  if (ctx.initial_ticks == nullptr || ctx.initial_ipis == nullptr ||
+      ctx.per_cpu_ok == nullptr) {
+    return false;
+  }
   for (int i = 0; i < cpu_count; ++i) {
     const CpuLocal* const local = SmpGetCpuLocal(i);
     if (local == nullptr) {
@@ -1337,6 +1349,616 @@ static bool TestIdtPerCpuAndLapicTimer() {
   }
 
   return true;
+}
+
+constexpr int kWeightedTaskCount = 8;
+constexpr int kHighWeightTaskCount = 4;
+constexpr int kWeightedYieldIters = 16;
+constexpr int kStealTaskCount = 12;
+constexpr int kStealWorkerSlices = 8;
+constexpr int kPreemptProgressTasks = 2;
+constexpr int kStressTaskCount = 12;
+constexpr int kStressRounds = 32;
+constexpr int kStressChildSpawnInterval = 8;
+constexpr int kMaxPreemptCoordSpins = 200000000;
+constexpr int kLapicRegIdOffset = 0x020;
+constexpr int kLapicRegTimerInitCountOffset = 0x380;
+
+static void ProgramLocalApicTimerInitCount(const uint32_t init_count) {
+  const uintptr_t lapic_base = SmpLocalApicPhysAddr();
+  if (lapic_base == 0 || init_count == 0) {
+    return;
+  }
+  volatile uint32_t* const reg = reinterpret_cast<volatile uint32_t*>(
+      lapic_base + kLapicRegTimerInitCountOffset);
+  *reg = init_count;
+  const volatile uint32_t* const id_reg =
+      reinterpret_cast<const volatile uint32_t*>(lapic_base +
+                                                 kLapicRegIdOffset);
+  (void)*id_reg;
+}
+
+struct SchedulerTestContext {
+  Task* bootstrap_task = nullptr;
+  std::atomic<uint32_t> observed_cpu_mask{0};
+  std::atomic<uint32_t> stolen_cpu_mask{0};
+  std::atomic<int64_t> remote_steal_slices{0};
+  std::atomic<int> weighted_completed{0};
+  std::atomic<int> steal_completed{0};
+  std::atomic<int> stress_completed{0};
+  std::atomic<int64_t> stress_child_completed{0};
+  std::atomic<bool> stress_failed{false};
+  std::atomic<uint32_t> timer_boosted_mask{0};
+  std::atomic<uint32_t> timer_restored_mask{0};
+  std::atomic<uint32_t> spinner_started_mask{0};
+  std::unique_ptr<std::atomic<int64_t>[]> spinner_iters;
+  std::atomic<int> progress_done{0};
+  std::atomic<bool> preempt_verified{false};
+  std::atomic<bool> stop_spinners{false};
+  uint32_t expected_cpu_mask = 0;
+  uint32_t calibrated_timer_count = 0;
+  uint32_t stress_timer_count = 0;
+};
+
+struct WeightedWorkerArg {
+  SchedulerTestContext* ctx = nullptr;
+  int index = 0;
+  std::atomic<int> slices_done{0};
+  std::atomic<bool> aligned_ok{false};
+  std::atomic<bool> done{false};
+};
+
+struct StealWorkerArg {
+  SchedulerTestContext* ctx = nullptr;
+  int index = 0;
+  std::atomic<bool> done{false};
+};
+
+struct SpinnerWorkerArg {
+  SchedulerTestContext* ctx = nullptr;
+  int spinner_index = 0;
+  std::atomic<bool> done{false};
+};
+
+struct StressWorkerArg {
+  SchedulerTestContext* ctx = nullptr;
+  int worker_index = 0;
+  std::atomic<bool> done{false};
+};
+
+struct StressChildArg {
+  SchedulerTestContext* ctx = nullptr;
+  Task* parent_task = nullptr;
+  uint64_t expected_token = 0;
+  std::atomic<uint64_t> observed_token{0};
+};
+
+static void MaybeBoostCurrentCpuTimer(SchedulerTestContext* const ctx) {
+  const int cpu = CurrentCpuId();
+  const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
+  const uint32_t prev =
+      ctx->timer_boosted_mask.fetch_or(bit, std::memory_order_acq_rel);
+  if ((prev & bit) == 0 && ctx->stress_timer_count > 0) {
+    ProgramLocalApicTimerInitCount(ctx->stress_timer_count);
+  }
+}
+
+static void StressChildWorker(void* const raw_arg) {
+  StressChildArg* const arg = static_cast<StressChildArg*>(raw_arg);
+  if (arg == nullptr || arg->ctx == nullptr) {
+    return;
+  }
+  SchedulerTestContext* const ctx = arg->ctx;
+  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  Task* const self = scheduler->CurrentTask();
+  alignas(16) volatile uint64_t child_canary[4] = {
+      arg->expected_token ^ 0x1111111111111111ULL,
+      arg->expected_token ^ 0x2222222222222222ULL,
+      arg->expected_token ^ 0x4444444444444444ULL,
+      arg->expected_token ^ 0x8888888888888888ULL,
+  };
+  const uintptr_t canary_addr =
+      reinterpret_cast<uintptr_t>(const_cast<uint64_t*>(&child_canary[0]));
+  if (self == nullptr || self == ctx->bootstrap_task ||
+      self == arg->parent_task || (canary_addr & 0xFu) != 0 ||
+      !AreInterruptsEnabled()) {
+    ctx->stress_failed.store(true, std::memory_order_release);
+    return;
+  }
+
+  for (int step = 0; step < 2; ++step) {
+    MaybeBoostCurrentCpuTimer(ctx);
+    const int cpu = CurrentCpuId();
+    ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
+                                    std::memory_order_acq_rel);
+    scheduler->Yield();
+    if (scheduler->CurrentTask() != self || !AreInterruptsEnabled()) {
+      ctx->stress_failed.store(true, std::memory_order_release);
+      return;
+    }
+  }
+
+  if (child_canary[0] != (arg->expected_token ^ 0x1111111111111111ULL) ||
+      child_canary[1] != (arg->expected_token ^ 0x2222222222222222ULL) ||
+      child_canary[2] != (arg->expected_token ^ 0x4444444444444444ULL) ||
+      child_canary[3] != (arg->expected_token ^ 0x8888888888888888ULL)) {
+    ctx->stress_failed.store(true, std::memory_order_release);
+    return;
+  }
+
+  ctx->stress_child_completed.fetch_add(1, std::memory_order_acq_rel);
+  arg->observed_token.store(arg->expected_token, std::memory_order_release);
+}
+
+static void StressWorker(void* const raw_arg) {
+  StressWorkerArg* const arg = static_cast<StressWorkerArg*>(raw_arg);
+  if (arg == nullptr || arg->ctx == nullptr) {
+    return;
+  }
+  SchedulerTestContext* const ctx = arg->ctx;
+  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  const int cpu_count = SmpCpuCount();
+  Task* const self = scheduler->CurrentTask();
+
+  alignas(16) volatile uint64_t canaries[8] = {};
+  const uintptr_t canary_addr =
+      reinterpret_cast<uintptr_t>(const_cast<uint64_t*>(&canaries[0]));
+  if (self == nullptr || self == ctx->bootstrap_task ||
+      (canary_addr & 0xFu) != 0 || !AreInterruptsEnabled()) {
+    ctx->stress_failed.store(true, std::memory_order_release);
+    return;
+  }
+
+  const uint64_t seed =
+      (reinterpret_cast<uintptr_t>(self) ^
+       (static_cast<uint64_t>(arg->worker_index + 1) * 0x9E3779B97F4A7C15ULL));
+
+  for (int round = 0; round < kStressRounds; ++round) {
+    MaybeBoostCurrentCpuTimer(ctx);
+    const uint64_t round_tag =
+        seed ^ (static_cast<uint64_t>(round + 1) * 0xBF58476D1CE4E5B9ULL);
+    for (int k = 0; k < 8; ++k) {
+      canaries[k] = round_tag ^ (static_cast<uint64_t>(k) << 48);
+    }
+
+    const int cpu = CurrentCpuId();
+    ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
+                                    std::memory_order_acq_rel);
+
+    // Bombard a peer CPU with a wakeup/reschedule IPI (0x21) so asynchronous
+    // interrupt handlers collide frequently with active scheduler operations.
+    if (cpu_count > 1) {
+      const int target_cpu = (cpu + 1 + (round % (cpu_count - 1))) % cpu_count;
+      SmpSendIpi(target_cpu, kVectorWakeupIpi);
+    }
+
+    // Tight back-to-back scheduler API calls without `pause` delays.
+    if (scheduler->CurrentTask() != self || scheduler->RunqueueLoad(cpu) < 0 ||
+        !AreInterruptsEnabled()) {
+      ctx->stress_failed.store(true, std::memory_order_release);
+      return;
+    }
+    scheduler->Yield();
+
+    if (scheduler->CurrentTask() != self || !AreInterruptsEnabled()) {
+      ctx->stress_failed.store(true, std::memory_order_release);
+      return;
+    }
+
+    // Periodically spawn and `Join` a child task from whichever CPU (BSP or AP)
+    // this worker is currently running on.
+    if ((round % kStressChildSpawnInterval) == 0) {
+      StressChildArg child_arg = {};
+      child_arg.ctx = ctx;
+      child_arg.parent_task = self;
+      child_arg.expected_token = round_tag ^ 0xA5A5A5A55A5A5A5AULL;
+      Task* const child = scheduler->CreateTask(StressChildWorker, &child_arg,
+                                                kDefaultTaskWeight);
+      if (child == nullptr) {
+        ctx->stress_failed.store(true, std::memory_order_release);
+        return;
+      }
+      scheduler->Join(child);
+      if (child_arg.observed_token.load(std::memory_order_acquire) !=
+              child_arg.expected_token ||
+          scheduler->CurrentTask() != self || !AreInterruptsEnabled()) {
+        ctx->stress_failed.store(true, std::memory_order_release);
+        return;
+      }
+    }
+
+    // Verify stack canaries survived all context switches, interrupts, and
+    // cross-CPU migrations during this round.
+    for (int k = 0; k < 8; ++k) {
+      const uint64_t expected = round_tag ^ (static_cast<uint64_t>(k) << 48);
+      if (canaries[k] != expected) {
+        ctx->stress_failed.store(true, std::memory_order_release);
+        return;
+      }
+    }
+  }
+
+  arg->done.store(true, std::memory_order_release);
+  ctx->stress_completed.fetch_add(1, std::memory_order_acq_rel);
+}
+
+static void WeightedYieldWorker(void* const raw_arg) {
+  WeightedWorkerArg* const arg = static_cast<WeightedWorkerArg*>(raw_arg);
+  if (arg == nullptr || arg->ctx == nullptr) {
+    return;
+  }
+
+  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  alignas(16) volatile uint64_t stack_probe = 0xA5A55A5AULL;
+  const uintptr_t probe_addr =
+      reinterpret_cast<uintptr_t>(const_cast<uint64_t*>(&stack_probe));
+  Task* const self = scheduler->CurrentTask();
+  if (self == nullptr || self == arg->ctx->bootstrap_task ||
+      (probe_addr & 0xFu) != 0) {
+    return;
+  }
+  arg->aligned_ok.store(true, std::memory_order_release);
+
+  for (int i = 0; i < kWeightedYieldIters; ++i) {
+    const int cpu = CurrentCpuId();
+    arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
+                                         std::memory_order_acq_rel);
+    for (int spin = 0; spin < 400; ++spin) {
+      asm volatile("pause" : : : "memory");
+    }
+    scheduler->Yield();
+    if (scheduler->CurrentTask() != self) {
+      return;
+    }
+    arg->slices_done.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  const int cpu = CurrentCpuId();
+  arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
+                                       std::memory_order_acq_rel);
+  arg->done.store(true, std::memory_order_release);
+  arg->ctx->weighted_completed.fetch_add(1, std::memory_order_acq_rel);
+}
+
+static void StealWorker(void* const raw_arg) {
+  StealWorkerArg* const arg = static_cast<StealWorkerArg*>(raw_arg);
+  if (arg == nullptr || arg->ctx == nullptr) {
+    return;
+  }
+
+  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  for (int s = 0; s < kStealWorkerSlices; ++s) {
+    const int cpu = CurrentCpuId();
+    const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
+    arg->ctx->stolen_cpu_mask.fetch_or(bit, std::memory_order_acq_rel);
+    arg->ctx->observed_cpu_mask.fetch_or(bit, std::memory_order_acq_rel);
+    if (cpu != 0) {
+      arg->ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
+    }
+    for (int spin = 0; spin < 2000; ++spin) {
+      asm volatile("pause" : : : "memory");
+    }
+    scheduler->Yield();
+  }
+
+  const int cpu = CurrentCpuId();
+  const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
+  arg->ctx->stolen_cpu_mask.fetch_or(bit, std::memory_order_acq_rel);
+  arg->ctx->observed_cpu_mask.fetch_or(bit, std::memory_order_acq_rel);
+  if (cpu != 0) {
+    arg->ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
+  }
+  arg->done.store(true, std::memory_order_release);
+  arg->ctx->steal_completed.fetch_add(1, std::memory_order_acq_rel);
+}
+
+static void SpinnerWorker(void* const raw_arg) {
+  SpinnerWorkerArg* const arg = static_cast<SpinnerWorkerArg*>(raw_arg);
+  if (arg == nullptr || arg->ctx == nullptr) {
+    return;
+  }
+
+  const int idx = arg->spinner_index;
+  const int cpu = CurrentCpuId();
+  arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
+                                       std::memory_order_acq_rel);
+  arg->ctx->spinner_started_mask.fetch_or(1u << static_cast<uint32_t>(idx),
+                                          std::memory_order_acq_rel);
+
+  // CPU-bound spinner that NEVER calls Yield(); relies strictly on Local APIC
+  // timer (0x20) preemption so PreemptProgressWorker tasks can run.
+  for (int spin = 0; spin < kMaxPreemptCoordSpins &&
+                     !arg->ctx->stop_spinners.load(std::memory_order_acquire);
+       ++spin) {
+    const int cur_cpu = CurrentCpuId();
+    arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cur_cpu),
+                                         std::memory_order_relaxed);
+    const int64_t iters =
+        arg->ctx->spinner_iters[idx].fetch_add(1, std::memory_order_relaxed) +
+        1;
+    if (iters >= 64 &&
+        arg->ctx->spinner_started_mask.load(std::memory_order_acquire) ==
+            arg->ctx->expected_cpu_mask &&
+        arg->ctx->progress_done.load(std::memory_order_acquire) ==
+            kPreemptProgressTasks) {
+      arg->ctx->preempt_verified.store(true, std::memory_order_release);
+      arg->ctx->stop_spinners.store(true, std::memory_order_release);
+      break;
+    }
+    asm volatile("pause" : : : "memory");
+  }
+  arg->ctx->stop_spinners.store(true, std::memory_order_release);
+  arg->done.store(true, std::memory_order_release);
+}
+
+static void PreemptProgressWorker(void* const raw_arg) {
+  SchedulerTestContext* const ctx = static_cast<SchedulerTestContext*>(raw_arg);
+  if (ctx == nullptr) {
+    return;
+  }
+
+  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  while (ctx->spinner_started_mask.load(std::memory_order_acquire) !=
+             ctx->expected_cpu_mask &&
+         !ctx->stop_spinners.load(std::memory_order_acquire)) {
+    scheduler->Yield();
+  }
+
+  for (int step = 0; step < 4; ++step) {
+    const int cpu = CurrentCpuId();
+    ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
+                                    std::memory_order_acq_rel);
+    for (int spin = 0; spin < 4000; ++spin) {
+      asm volatile("pause" : : : "memory");
+    }
+  }
+  ctx->progress_done.fetch_add(1, std::memory_order_acq_rel);
+}
+
+static bool TestTaskSchedulerSmp() {
+  const int cpu_count = SmpCpuCount();
+  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  if (scheduler == nullptr || cpu_count < 1 ||
+      SmpOnlineCpuCount() != cpu_count) {
+    return false;
+  }
+
+  Task* const bootstrap = scheduler->CurrentTask();
+  if (bootstrap == nullptr || CurrentCpuId() != 0 ||
+      !scheduler->IsPreemptEnabled()) {
+    return false;
+  }
+
+  SchedulerTestContext ctx = {};
+  ctx.bootstrap_task = bootstrap;
+  ctx.observed_cpu_mask.fetch_or(1u, std::memory_order_relaxed);
+  ctx.calibrated_timer_count = SmpCalibratedTimerInitialCount();
+  ctx.stress_timer_count = (ctx.calibrated_timer_count > 32u)
+                               ? (ctx.calibrated_timer_count / 16u)
+                               : ctx.calibrated_timer_count;
+  ctx.spinner_iters.reset(new std::atomic<int64_t>[cpu_count]());
+  const std::unique_ptr<SpinnerWorkerArg[]> spinner_args(
+      new SpinnerWorkerArg[cpu_count]());
+  const std::unique_ptr<Task*[]> spinner_tasks(new Task*[cpu_count]());
+  if (ctx.spinner_iters == nullptr || spinner_args == nullptr ||
+      spinner_tasks == nullptr) {
+    return false;
+  }
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  if (pmm_free_before <= 0 || heap_free_before <= 0) {
+    return false;
+  }
+
+  // 1. Concurrent multi-task execution, Yield, Join, and weighted tasks
+  //    across online CPUs.
+  WeightedWorkerArg weighted_args[kWeightedTaskCount] = {};
+  Task* weighted_tasks[kWeightedTaskCount] = {};
+  for (int i = 0; i < kWeightedTaskCount; ++i) {
+    weighted_args[i].ctx = &ctx;
+    weighted_args[i].index = i;
+    const int64_t weight = (i < kHighWeightTaskCount)
+                               ? (kDefaultTaskWeight * 2)
+                               : (kDefaultTaskWeight / 2);
+    weighted_tasks[i] = scheduler->CreateTask(WeightedYieldWorker,  //
+                                              &weighted_args[i],    //
+                                              weight);
+    if (weighted_tasks[i] == nullptr) {
+      return false;
+    }
+  }
+  for (int i = 0; i < kWeightedTaskCount; ++i) {
+    scheduler->Join(weighted_tasks[i]);
+  }
+
+  if (ctx.weighted_completed.load(std::memory_order_acquire) !=
+      kWeightedTaskCount) {
+    return false;
+  }
+  for (int i = 0; i < kWeightedTaskCount; ++i) {
+    if (!weighted_args[i].done.load(std::memory_order_acquire) ||
+        !weighted_args[i].aligned_ok.load(std::memory_order_acquire) ||
+        weighted_args[i].slices_done.load(std::memory_order_acquire) !=
+            kWeightedYieldIters) {
+      return false;
+    }
+  }
+
+  // 2. Cross-CPU work stealing: enqueue all tasks onto CPU 0 while preemption
+  //    is temporarily disabled, then re-enable preemption and wake remote CPUs.
+  StealWorkerArg steal_args[kStealTaskCount] = {};
+  Task* steal_tasks[kStealTaskCount] = {};
+  scheduler->SetPreemptEnabled(false);
+  for (int i = 0; i < kStealTaskCount; ++i) {
+    steal_args[i].ctx = &ctx;
+    steal_args[i].index = i;
+    steal_tasks[i] = scheduler->CreateTaskOnCpu(StealWorker,         //
+                                                &steal_args[i],      //
+                                                kDefaultTaskWeight,  //
+                                                0);
+    if (steal_tasks[i] == nullptr) {
+      scheduler->SetPreemptEnabled(true);
+      return false;
+    }
+  }
+  scheduler->SetPreemptEnabled(true);
+  for (int c = 1; c < cpu_count; ++c) {
+    SmpSendIpi(c, kVectorWakeupIpi);
+  }
+
+  for (int i = 0; i < kStealTaskCount; ++i) {
+    scheduler->Join(steal_tasks[i]);
+  }
+
+  if (ctx.steal_completed.load(std::memory_order_acquire) != kStealTaskCount) {
+    return false;
+  }
+  for (int i = 0; i < kStealTaskCount; ++i) {
+    if (!steal_args[i].done.load(std::memory_order_acquire)) {
+      return false;
+    }
+  }
+  if (cpu_count > 1) {
+    if ((ctx.stolen_cpu_mask.load(std::memory_order_acquire) & ~1u) == 0 ||
+        ctx.remote_steal_slices.load(std::memory_order_acquire) <= 0) {
+      return false;
+    }
+  }
+
+  // 3. High-frequency interrupt + cross-CPU API stress phase:
+  //    With boosted Local APIC timer ticks and continuous cross-CPU wakeup IPIs
+  //    (`0x21`), `kStressTaskCount` workers tightly hammer `CurrentTask()`,
+  //    `Yield()`, `RunqueueLoad()`, `ReapZombies()`, stack-frame canary checks,
+  //    and dynamic child `CreateTask`/`Join` across all online CPUs.
+  MaybeBoostCurrentCpuTimer(&ctx);
+  StressWorkerArg stress_args[kStressTaskCount] = {};
+  Task* stress_tasks[kStressTaskCount] = {};
+  for (int i = 0; i < kStressTaskCount; ++i) {
+    stress_args[i].ctx = &ctx;
+    stress_args[i].worker_index = i;
+    const int64_t weight =
+        kDefaultTaskWeight + static_cast<int64_t>((i % 4) - 1) * 256;
+    stress_tasks[i] = scheduler->CreateTask(StressWorker,     //
+                                            &stress_args[i],  //
+                                            weight);
+    if (stress_tasks[i] == nullptr) {
+      ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
+      return false;
+    }
+  }
+  for (int i = 0; i < kStressTaskCount; ++i) {
+    scheduler->Join(stress_tasks[i]);
+  }
+
+  const int64_t expected_children =
+      static_cast<int64_t>(kStressTaskCount) *
+      static_cast<int64_t>((kStressRounds + kStressChildSpawnInterval - 1) /
+                           kStressChildSpawnInterval);
+  if (ctx.stress_failed.load(std::memory_order_acquire) ||
+      ctx.stress_completed.load(std::memory_order_acquire) !=
+          kStressTaskCount ||
+      ctx.stress_child_completed.load(std::memory_order_acquire) !=
+          expected_children) {
+    ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
+    return false;
+  }
+  for (int i = 0; i < kStressTaskCount; ++i) {
+    if (!stress_args[i].done.load(std::memory_order_acquire)) {
+      ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
+      return false;
+    }
+  }
+
+  // 4. Preemptive scheduling driven by Local APIC timer (0x20): spawn
+  //    `cpu_count` non-yielding CPU-bound spinners plus progress tasks, and
+  //    restore the calibrated Local APIC timer count on each CPU as its spinner
+  //    exits.
+  const uint32_t expected_cpu_mask =
+      (cpu_count >= 32) ? 0xFFFFFFFFu
+                        : ((1u << static_cast<uint32_t>(cpu_count)) - 1u);
+  ctx.expected_cpu_mask = expected_cpu_mask;
+  Task* progress_tasks[kPreemptProgressTasks] = {};
+
+  for (int i = 0; i < cpu_count; ++i) {
+    spinner_args[i].ctx = &ctx;
+    spinner_args[i].spinner_index = i;
+    spinner_tasks[i] = scheduler->CreateTask(SpinnerWorker,     //
+                                             &spinner_args[i],  //
+                                             kDefaultTaskWeight);
+    if (spinner_tasks[i] == nullptr) {
+      ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
+      return false;
+    }
+  }
+  for (int i = 0; i < kPreemptProgressTasks; ++i) {
+    progress_tasks[i] = scheduler->CreateTask(PreemptProgressWorker,  //
+                                              &ctx,                   //
+                                              kDefaultTaskWeight);
+    if (progress_tasks[i] == nullptr) {
+      ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
+      return false;
+    }
+  }
+
+  for (int i = 0; i < kPreemptProgressTasks; ++i) {
+    scheduler->Join(progress_tasks[i]);
+  }
+  for (int i = 0; i < cpu_count; ++i) {
+    scheduler->Join(spinner_tasks[i]);
+  }
+  ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
+
+  if (!ctx.preempt_verified.load(std::memory_order_acquire) ||
+      CurrentCpuId() != 0 || scheduler->CurrentTask() != bootstrap) {
+    return false;
+  }
+  for (int i = 0; i < cpu_count; ++i) {
+    if (!spinner_args[i].done.load(std::memory_order_acquire) ||
+        ctx.spinner_iters[i].load(std::memory_order_acquire) <= 0) {
+      return false;
+    }
+  }
+  if ((ctx.observed_cpu_mask.load(std::memory_order_acquire) &
+       expected_cpu_mask) != expected_cpu_mask) {
+    return false;
+  }
+
+  // 5. Unjoined zombie reaping and zero memory leaks: spawn a detached task,
+  //    let it exit without Join(), reap it via ReapZombies(), and verify PMM
+  //    and Heap free counts match their exact pre-test baselines.
+  std::atomic<bool> detached_ran{false};
+  Task* const detached = scheduler->CreateTask(
+      [](void* const arg) {
+        static_cast<std::atomic<bool>*>(arg)->store(true,
+                                                    std::memory_order_release);
+      },
+      &detached_ran, kDefaultTaskWeight);
+  if (detached == nullptr) {
+    return false;
+  }
+  while (!detached_ran.load(std::memory_order_acquire)) {
+    scheduler->Yield();
+  }
+  while (scheduler->ReapZombies() == 0) {
+    scheduler->Yield();
+  }
+  const int64_t pmm_free_after = PmmFreeFrameCount();
+  const int64_t heap_free_after = HeapTotalFreeBytes();
+
+  UartWrite("[SCHED] remote_steal_slices=");
+  UartWriteDec(static_cast<uint64_t>(
+      ctx.remote_steal_slices.load(std::memory_order_acquire)));
+  UartWrite(", progress_done=");
+  UartWriteDec(
+      static_cast<uint64_t>(ctx.progress_done.load(std::memory_order_acquire)));
+  UartWrite(", cpu_mask=");
+  UartWriteHex(ctx.observed_cpu_mask.load(std::memory_order_acquire));
+  UartWrite("\n");
+
+  return pmm_free_after == pmm_free_before &&
+         heap_free_after == heap_free_before &&
+         SmpOnlineCpuCount() == cpu_count;
 }
 
 }  // namespace
@@ -1388,10 +2010,17 @@ void RunBootVerificationSuite() {
   const bool idt_timer_ok = TestIdtPerCpuAndLapicTimer();
   LogTestResult("idt_percpu_and_lapic_timer", idt_timer_ok);
 
+  const bool task_sched_ok = TestTaskSchedulerSmp();
+  UartWrite("[TEST] task_scheduler_smp: ");
+  UartWrite(task_sched_ok ? "PASS\n" : "FAIL\n");
+  VgaWrite("[TEST] task_scheduler_smp: ");
+  VgaWrite(task_sched_ok ? "PASS\r" : "FAIL\r");
+
   if (pmm_ok && alloc_bounds_ok && free_reuse_ok && varied_ok && pattern_ok &&
-      cpp_ok && stress_ok && edge_ok && smp_ok && smp_sync_ok && idt_timer_ok) {
+      cpp_ok && stress_ok && edge_ok && smp_ok && smp_sync_ok && idt_timer_ok &&
+      task_sched_ok) {
     UartWrite("[TEST] ALL MEMORY TESTS PASSED\n");
-    VgaWrite("[TEST] ALL MEMORY TESTS PASSED");
+    VgaWrite("[TEST] ALL MEMORY TESTS PASSED ");
   } else {
     UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");
     VgaWrite("[TEST] MEMORY VERIFICATION FAILED");

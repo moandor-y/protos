@@ -391,6 +391,54 @@ isr_common_stub:
     add rsp, 16
     iretq
 
+/* =========================================================================
+ * Kernel Task Context Switch & Entry Trampoline
+ *
+ * void TaskContextSwitch(uintptr_t* prev_rsp, uintptr_t next_rsp)
+ *   rdi = &prev->rsp
+ *   rsi = next->rsp
+ *
+ * Saves System V AMD64 ABI callee-saved registers (rbp, rbx, r12..r15) on
+ * the outgoing stack, stores RSP into *prev_rsp, loads next_rsp into RSP,
+ * restores callee-saved registers from the incoming stack, and returns to
+ * the incoming task's saved RIP (Schedule() or TaskEntryTrampoline).
+ * ========================================================================= */
+.align 16
+.global TaskContextSwitch
+.type TaskContextSwitch, @function
+TaskContextSwitch:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov qword ptr [rdi], rsp
+    mov rsp, rsi
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+.align 16
+.global TaskEntryTrampoline
+.type TaskEntryTrampoline, @function
+TaskEntryTrampoline:
+    xor rbp, rbp
+    and rsp, -16
+    mov rdi, r12
+    .extern TaskStartupEntry
+    call TaskStartupEntry
+.Ltask_exit_halt:
+    cli
+    hlt
+    jmp .Ltask_exit_halt
+
 /* CPU Exceptions 0..31 (error code pushed by CPU on 8, 10..14, 17, 21, 29, 30) */
 ISR_NOERR_STUB 0
 ISR_NOERR_STUB 1

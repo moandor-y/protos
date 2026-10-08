@@ -628,11 +628,12 @@ TEST(SmpTest, ParseMadtHandlesMalformedEntriesAndClampsMaxCpus) {
   WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
   EXPECT_FALSE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 0, &topo));
 
-  // MADT with more than kMaxCpus enabled processors must clamp to kMaxCpus,
-  // and if the BSP appears after the first kMaxCpus entries, its real MADT
-  // acpi_processor_id must still be preserved at index 0.
+  // MADT with a large number of enabled processors (e.g. 128 CPUs) must
+  // dynamically allocate and preserve all CPUs without clamping, placing the
+  // BSP at index 0.
   recs.clear();
-  for (int i = 1; i <= kMaxCpus + 10; ++i) {
+  constexpr int kLargeCpuCount = 128;
+  for (int i = 1; i < kLargeCpuCount; ++i) {
     AppendLapicRecord(&recs,                    //
                       static_cast<uint8_t>(i),  //
                       static_cast<uint8_t>(i),  //
@@ -641,10 +642,14 @@ TEST(SmpTest, ParseMadtHandlesMalformedEntriesAndClampsMaxCpus) {
   AppendLapicRecord(&recs, 0x77, 0, 1);
   WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
   ASSERT_TRUE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 0, &topo));
-  EXPECT_THAT(topo.cpu_count, t::Eq(kMaxCpus));
+  EXPECT_THAT(topo.cpu_count, t::Eq(kLargeCpuCount));
   EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(0));
   EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(0x77));
   EXPECT_TRUE(topo.cpus[0].is_bsp);
+  for (int i = 1; i < kLargeCpuCount; ++i) {
+    EXPECT_THAT(topo.cpus[i].apic_id, t::Eq(static_cast<uint8_t>(i)));
+    EXPECT_FALSE(topo.cpus[i].is_bsp);
+  }
 }
 
 TEST(SmpTest, DiscoverTopologyAndSmpInitEndToEndAndPanicsOnFailure) {

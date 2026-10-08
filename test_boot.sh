@@ -56,6 +56,7 @@ REQUIRED_MARKERS=(
   "[TEST] smp_discovery_and_ap_bringup: PASS"
   "[TEST] smp_multicpu_sync_stress: PASS"
   "[TEST] idt_percpu_and_lapic_timer: PASS"
+  "[TEST] task_scheduler_smp: PASS"
   "[TEST] ALL MEMORY TESTS PASSED"
 )
 

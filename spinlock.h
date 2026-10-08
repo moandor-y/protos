@@ -66,8 +66,9 @@ inline IrqSpinLock** TopHeldLockSlot() {
   return &g_per_cpu_top_lock[CurrentCpuApicId()];
 }
 #else
-inline bool* HostInterruptEnabledSlot() {
+[[gnu::noinline]] inline bool* HostInterruptEnabledSlot() {
   thread_local bool interrupts_enabled = true;
+  asm volatile("" : "+m"(interrupts_enabled));
   return &interrupts_enabled;
 }
 
@@ -90,13 +91,15 @@ inline void LocalRestoreInterrupts(const bool previously_enabled) {
   }
 }
 
-inline uintptr_t CurrentOwnerId() {
-  thread_local const uint8_t thread_token = 0;
+[[gnu::noinline]] inline uintptr_t CurrentOwnerId() {
+  thread_local uint8_t thread_token = 0;
+  asm volatile("" : "+m"(thread_token));
   return reinterpret_cast<uintptr_t>(&thread_token);
 }
 
-inline IrqSpinLock** TopHeldLockSlot() {
+[[gnu::noinline]] inline IrqSpinLock** TopHeldLockSlot() {
   thread_local IrqSpinLock* top_lock = nullptr;
+  asm volatile("" : "+m"(top_lock));
   return &top_lock;
 }
 #endif
