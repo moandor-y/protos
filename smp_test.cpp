@@ -4,12 +4,15 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "idt.h"
 #include "paging.h"
 #include "pmm.h"
 #include "spinlock.h"
@@ -108,6 +111,7 @@ static uintptr_t OffsetAddr(const int64_t offset) {
 static void ResetState(const uintptr_t acpi32_arena = 0) {
   g_state = FakeHostState{};
   std::memset(g_fake_ram, 0, sizeof(g_fake_ram));
+  IdtResetForTest();
   SmpSetHostTestHooks(0, 0, 0, acpi32_arena, nullptr);
 }
 
@@ -309,6 +313,14 @@ void VgaWriteDec(const uint64_t value) {
                 static_cast<unsigned long long>(value));
   g_state.vga_log.append(buf);
 }
+
+void UartPanicWrite(const char* const str) { UartWrite(str); }
+
+void UartPanicWriteDec(const uint64_t value) { UartWriteDec(value); }
+
+void VgaPanicWrite(const char* const str) { VgaWrite(str); }
+
+void VgaPanicWriteDec(const uint64_t value) { VgaWriteDec(value); }
 
 namespace {
 
@@ -805,8 +817,147 @@ TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(SmpCpuCount(), "Check failed");
   EXPECT_DEATH(SmpOnlineCpuCount(), "Check failed");
   EXPECT_DEATH(SmpGetCpuInfo(0), "Check failed");
+  EXPECT_DEATH(SmpGetCpuLocal(0), "Check failed");
   EXPECT_DEATH(SmpLocalApicPhysAddr(), "Check failed");
+  EXPECT_DEATH(SmpCalibratedTimerInitialCount(), "Check failed");
+  EXPECT_DEATH(SmpSendIpi(0, kVectorWakeupIpi), "Check failed");
   EXPECT_DEATH(SmpRunOnAllCpus([](int, void*) {}, nullptr), "Check failed");
+  EXPECT_DEATH(BindCpuLocal(nullptr), "Check failed");
+  CpuLocal invalid_self = {};
+  EXPECT_DEATH(BindCpuLocal(&invalid_self), "Check failed");
+  EXPECT_DEATH(CurrentCpu(), "Check failed");
+  EXPECT_DEATH(CurrentCpuId(), "Check failed");
+  EXPECT_DEATH(ComputeApicTimerInitialCount(1000, 0, 100), "Check failed");
+  EXPECT_DEATH(ComputeApicTimerInitialCount(1000, 0x10000, 100),
+               "Check failed");
+  EXPECT_DEATH(ComputeApicTimerInitialCount(1000, 10000, 0), "Check failed");
+}
+
+TEST(SmpTest, CpuLocalLayoutAlignmentAndThreadLocalBinding) {
+  static_assert(alignof(CpuLocal) == 64, "CpuLocal must be 64-byte aligned");
+  static_assert(offsetof(CpuLocal, self) == 0,
+                "CpuLocal::self must be at offset 0 for gs:[0] access");
+
+  ResetState();
+  EXPECT_THAT(CurrentCpuOrNull(), t::IsNull());
+
+  constexpr int kThreadCount = 4;
+  alignas(64) CpuLocal locals[kThreadCount] = {};
+  std::atomic<int> ready{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+
+  for (int i = 0; i < kThreadCount; ++i) {
+    locals[i].self = &locals[i];
+    locals[i].cpu_id = i;
+    locals[i].apic_id = static_cast<uint8_t>(i + 10);
+    locals[i].online = true;
+    threads.emplace_back([i, &locals, &ready]() {
+      BindCpuLocal(&locals[i]);
+      ready.fetch_add(1, std::memory_order_acq_rel);
+      while (ready.load(std::memory_order_acquire) < kThreadCount) {
+        asm volatile("pause" : : : "memory");
+      }
+      for (int iter = 0; iter < 200; ++iter) {
+        ASSERT_THAT(CurrentCpuOrNull(), t::Eq(&locals[i]));
+        ASSERT_THAT(CurrentCpu(), t::Eq(&locals[i]));
+        ASSERT_THAT(CurrentCpu()->self, t::Eq(&locals[i]));
+        ASSERT_THAT(CurrentCpuId(), t::Eq(i));
+        ASSERT_THAT(CurrentCpu()->apic_id, t::Eq(static_cast<uint8_t>(i + 10)));
+        CurrentCpu()->timer_ticks.fetch_add(1, std::memory_order_relaxed);
+      }
+      ResetCpuLocalForTest();
+    });
+  }
+
+  for (std::thread& th : threads) {
+    th.join();
+  }
+  for (int i = 0; i < kThreadCount; ++i) {
+    EXPECT_THAT(locals[i].timer_ticks.load(std::memory_order_acquire),
+                t::Eq(200));
+  }
+}
+
+TEST(SmpTest,
+     CalibratedTimerIpiAndEoiUpdatePerCpuStateAndEnforcePreconditions) {
+  ResetState(BaseAddr());
+  EXPECT_THAT(ComputeApicTimerInitialCount(0, 11932, 100), t::Eq(0u));
+  EXPECT_THAT(ComputeApicTimerInitialCount(50000, 11932, 100), t::Eq(49999u));
+  EXPECT_THAT(ComputeApicTimerInitialCount(0xFFFFFFFFu, 1, 1),
+              t::Eq(0xFFFFFFFFu));
+  EXPECT_THAT(ComputeApicTimerInitialCount(UINT64_MAX, 11932, 250),
+              t::Eq(0xFFFFFFFFu));
+
+  const uintptr_t rsdt_addr = OffsetAddr(0x6100);
+  const uintptr_t madt_addr = OffsetAddr(0x6400);
+  const uintptr_t bios_rom_base = OffsetAddr(0x7000);
+
+  std::vector<uint8_t> recs;
+  AppendLapicRecord(&recs, 0, 2, 1);
+  AppendLapicRecord(&recs, 1, 5, 1);
+  WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
+  WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
+  WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
+
+  IdtInit();
+  SmpSetHostTestHooks(2, 0, bios_rom_base, BaseAddr(), nullptr);
+  SmpSetHostTimerCalibrationTicksForTest(60000);
+  SmpInit(kMultiboot1Magic, 0);
+
+  const uint32_t expected_initial = ComputeApicTimerInitialCount(
+      60000, kPitCalibrationReloadCount, kApicTimerTargetHz);
+  EXPECT_THAT(SmpCalibratedTimerInitialCount(), t::Eq(expected_initial));
+  // IdtLoad called once by IdtInit (BSP) and once by SmpInit for AP 1.
+  EXPECT_THAT(IdtGetHostLoadCountForTest(), t::Eq(2));
+
+  for (int i = 0; i < SmpCpuCount(); ++i) {
+    const CpuLocal* const cpu_local = SmpGetCpuLocal(i);
+    ASSERT_THAT(cpu_local, t::NotNull());
+    EXPECT_THAT(cpu_local->self, t::Eq(cpu_local));
+    EXPECT_THAT(cpu_local->cpu_id, t::Eq(i));
+    EXPECT_THAT(cpu_local->apic_id, t::Eq(SmpGetCpuInfo(i)->apic_id));
+    EXPECT_THAT(cpu_local->stack_base, t::Eq(SmpGetCpuInfo(i)->stack_base));
+    EXPECT_THAT(cpu_local->stack_top, t::Eq(SmpGetCpuInfo(i)->stack_top));
+    EXPECT_TRUE(cpu_local->online);
+    EXPECT_GE(cpu_local->timer_ticks.load(std::memory_order_acquire), 1);
+  }
+  EXPECT_THAT(CurrentCpu(), t::Eq(SmpGetCpuLocal(0)));
+  EXPECT_THAT(CurrentCpuId(), t::Eq(0));
+
+  // Verify SmpSendLocalApicEoi increments host EOI count.
+  SmpResetHostEoiCountForTest();
+  SmpSendLocalApicEoi();
+  EXPECT_THAT(SmpGetHostEoiCountForTest(), t::Eq(1));
+
+  // Verify SmpSendIpi increments target CpuLocal::ipi_count on vector 0x21 and
+  // sends EOI.
+  const int64_t ap_ipi_before =
+      SmpGetCpuLocal(1)->ipi_count.load(std::memory_order_acquire);
+  SmpSendIpi(1, kVectorWakeupIpi);
+  EXPECT_THAT(SmpGetCpuLocal(1)->ipi_count.load(std::memory_order_acquire),
+              t::Eq(ap_ipi_before + 1));
+  EXPECT_THAT(SmpGetHostEoiCountForTest(), t::Eq(2));
+
+  // Out-of-range SmpGetCpuLocal or SmpSendIpi arguments must trigger DCHECK.
+  EXPECT_DEATH(SmpGetCpuLocal(-1), "Check failed");
+  EXPECT_DEATH(SmpGetCpuLocal(SmpCpuCount()), "Check failed");
+  EXPECT_DEATH(SmpSendIpi(-1, kVectorWakeupIpi), "Check failed");
+  EXPECT_DEATH(SmpSendIpi(SmpCpuCount(), kVectorWakeupIpi), "Check failed");
+  EXPECT_DEATH(SmpSendIpi(1, 0x1F), "Check failed");
+
+  // Zero calibrated timer initial count must trigger CHECK failure in SmpInit.
+  EXPECT_DEATH(
+      {
+        ResetState(BaseAddr());
+        WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
+        WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
+        WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
+        SmpSetHostTestHooks(2, 0, bios_rom_base, BaseAddr(), nullptr);
+        SmpSetHostTimerCalibrationTicksForTest(0);
+        SmpInit(kMultiboot1Magic, 0);
+      },
+      "Check failed");
 }
 
 TEST(SmpTest,
@@ -822,6 +973,7 @@ TEST(SmpTest,
   WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, single_recs);
   WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
   WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
+  IdtInit();
   SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
   SmpInit(kMultiboot1Magic, 0);
   ASSERT_THAT(SmpCpuCount(), t::Eq(1));
@@ -830,6 +982,8 @@ TEST(SmpTest,
   SmpRunOnAllCpus(
       [](const int cpu_index, void* const ctx) {
         EXPECT_THAT(cpu_index, t::Eq(0));
+        EXPECT_THAT(CurrentCpuId(), t::Eq(0));
+        EXPECT_THAT(CurrentCpu(), t::Eq(SmpGetCpuLocal(0)));
         ++(*static_cast<int*>(ctx));
       },
       &single_cpu_calls);
@@ -857,6 +1011,7 @@ TEST(SmpTest,
   WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, multi_recs);
   WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
   WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
+  IdtInit();
   SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
   SmpInit(kMultiboot1Magic, 0);
   ASSERT_THAT(SmpCpuCount(), t::Eq(4));
@@ -877,6 +1032,9 @@ TEST(SmpTest,
               static_cast<DispatchTestState*>(raw_ctx);
           ASSERT_GE(cpu_index, 0);
           ASSERT_LT(cpu_index, 4);
+          EXPECT_THAT(CurrentCpu(), t::Eq(SmpGetCpuLocal(cpu_index)));
+          EXPECT_THAT(CurrentCpu()->self, t::Eq(CurrentCpu()));
+          EXPECT_THAT(CurrentCpuId(), t::Eq(cpu_index));
 
           // Wait for all 4 CPUs to arrive concurrently.
           st->arrived.fetch_add(1, std::memory_order_acq_rel);
@@ -896,6 +1054,9 @@ TEST(SmpTest,
 
   EXPECT_THAT(dispatch_state.total_counter, t::Eq(3 * 4 * 500));
   EXPECT_THAT(dispatch_state.per_cpu_runs, t::ElementsAre(3, 3, 3, 3));
+  for (int i = 1; i < 4; ++i) {
+    EXPECT_GE(SmpGetCpuLocal(i)->ipi_count.load(std::memory_order_acquire), 3);
+  }
 }
 
 }  // namespace

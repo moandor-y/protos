@@ -6,6 +6,7 @@
 #include <new>
 
 #include "heap.h"
+#include "idt.h"
 #include "multiboot.h"
 #include "paging.h"
 #include "pmm.h"
@@ -1088,6 +1089,256 @@ static bool TestSmpMultiCpuSyncStress() {
          SmpOnlineCpuCount() == cpu_count;
 }
 
+constexpr uint64_t kInt3CanaryBase = 0x1111222233334440ULL;
+
+std::atomic<int> g_int3_handler_hits{0};
+std::atomic<bool> g_int3_frame_ok{false};
+
+static void Int3VerificationHandler(InterruptFrame* const frame) {
+  if (frame == nullptr) {
+    return;
+  }
+  const bool ok = frame->vector == static_cast<uint64_t>(kVectorBreakpoint) &&
+                  frame->error_code == 0 &&
+                  frame->cs == kIdtKernelCodeSelector &&
+                  frame->rax == (kInt3CanaryBase + 0) &&
+                  frame->rbx == (kInt3CanaryBase + 1) &&
+                  frame->rcx == (kInt3CanaryBase + 2) &&
+                  frame->rdx == (kInt3CanaryBase + 3) &&
+                  frame->rsi == (kInt3CanaryBase + 4) &&
+                  frame->rdi == (kInt3CanaryBase + 5) &&
+                  frame->rbp == (kInt3CanaryBase + 6) &&
+                  frame->r8 == (kInt3CanaryBase + 7) &&
+                  frame->r9 == (kInt3CanaryBase + 8) &&
+                  frame->r10 == (kInt3CanaryBase + 9) &&
+                  frame->r11 == (kInt3CanaryBase + 10) &&
+                  frame->r12 == (kInt3CanaryBase + 11) &&
+                  frame->r13 == (kInt3CanaryBase + 12) &&
+                  frame->r14 == (kInt3CanaryBase + 13) &&
+                  frame->r15 == (kInt3CanaryBase + 14);
+  if (ok) {
+    g_int3_frame_ok.store(true, std::memory_order_release);
+  }
+  g_int3_handler_hits.fetch_add(1, std::memory_order_acq_rel);
+}
+
+static bool TriggerInt3AndVerifyAllRegisters() {
+  g_int3_handler_hits.store(0, std::memory_order_release);
+  g_int3_frame_ok.store(false, std::memory_order_release);
+  IdtRegisterHandler(kVectorBreakpoint, Int3VerificationHandler);
+
+  uint64_t post_regs[15] = {};
+  uint64_t* const out_ptr = post_regs;
+  // End-to-end hardware trap test for all 15 general-purpose registers:
+  // 1. Save callee-saved registers (`rbp`, `rbx`, `r12`..`r15`) that GCC
+  //    forbids listing in the clobber list (especially `rbp`/`rbx`), and push
+  //    `out_ptr` (`&post_regs[0]`) onto the stack before overwriting all 15
+  //    GPRs (`rax`..`r15`) so we still have `out_ptr` afterwards.
+  // 2. Reserve a 120-byte scratch area on the stack (`15 * 8` bytes, at
+  //    `[rsp + 0 .. 112]`) to dump the post-`iretq` register values, while
+  //    `out_ptr` sits right above it at `[rsp + 120]`.
+  // 3. Load distinct 64-bit canary values (`kInt3CanaryBase + 0..14`) into all
+  //    15 GPRs and execute `int3` (Vector 3 `#BP`), trapping into `isr_stub_3`
+  //    -> `isr_common_stub` -> `IdtDispatch` -> `Int3VerificationHandler`.
+  // 4. Immediately after `iretq` returns from the interrupt, store all 15 GPRs
+  //    into the `[rsp + 0 .. 112]` scratch buffer before touching any register,
+  //    then copy those 15 qwords (`rep movsq`) into `out_ptr` (`post_regs`).
+  // 5. Reclaim the 128 bytes of stack space (`120` scratch + `8` for `out_ptr`)
+  //    and restore the caller's callee-saved registers.
+  asm volatile(
+      "push rbp\n\t"
+      "push rbx\n\t"
+      "push r12\n\t"
+      "push r13\n\t"
+      "push r14\n\t"
+      "push r15\n\t"
+      "push %[out]\n\t"
+      "sub rsp, 120\n\t"
+      "mov rax, 0x1111222233334440\n\t"
+      "mov rbx, 0x1111222233334441\n\t"
+      "mov rcx, 0x1111222233334442\n\t"
+      "mov rdx, 0x1111222233334443\n\t"
+      "mov rsi, 0x1111222233334444\n\t"
+      "mov rdi, 0x1111222233334445\n\t"
+      "mov rbp, 0x1111222233334446\n\t"
+      "mov r8,  0x1111222233334447\n\t"
+      "mov r9,  0x1111222233334448\n\t"
+      "mov r10, 0x1111222233334449\n\t"
+      "mov r11, 0x111122223333444A\n\t"
+      "mov r12, 0x111122223333444B\n\t"
+      "mov r13, 0x111122223333444C\n\t"
+      "mov r14, 0x111122223333444D\n\t"
+      "mov r15, 0x111122223333444E\n\t"
+      "int3\n\t"
+      "mov qword ptr [rsp + 0],   rax\n\t"
+      "mov qword ptr [rsp + 8],   rbx\n\t"
+      "mov qword ptr [rsp + 16],  rcx\n\t"
+      "mov qword ptr [rsp + 24],  rdx\n\t"
+      "mov qword ptr [rsp + 32],  rsi\n\t"
+      "mov qword ptr [rsp + 40],  rdi\n\t"
+      "mov qword ptr [rsp + 48],  rbp\n\t"
+      "mov qword ptr [rsp + 56],  r8\n\t"
+      "mov qword ptr [rsp + 64],  r9\n\t"
+      "mov qword ptr [rsp + 72],  r10\n\t"
+      "mov qword ptr [rsp + 80],  r11\n\t"
+      "mov qword ptr [rsp + 88],  r12\n\t"
+      "mov qword ptr [rsp + 96],  r13\n\t"
+      "mov qword ptr [rsp + 104], r14\n\t"
+      "mov qword ptr [rsp + 112], r15\n\t"
+      "mov rdi, qword ptr [rsp + 120]\n\t"
+      "mov rsi, rsp\n\t"
+      "mov rcx, 15\n\t"
+      "cld\n\t"
+      "rep movsq\n\t"
+      "add rsp, 128\n\t"
+      "pop r15\n\t"
+      "pop r14\n\t"
+      "pop r13\n\t"
+      "pop r12\n\t"
+      "pop rbx\n\t"
+      "pop rbp"
+      :
+      : [out] "r"(out_ptr)
+      : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory",
+        "cc");
+
+  IdtUnregisterHandler(kVectorBreakpoint);
+  if (IdtGetHandler(kVectorBreakpoint) != nullptr ||
+      g_int3_handler_hits.load(std::memory_order_acquire) != 1 ||
+      !g_int3_frame_ok.load(std::memory_order_acquire)) {
+    return false;
+  }
+  for (int i = 0; i < 15; ++i) {
+    if (post_regs[i] != (kInt3CanaryBase + static_cast<uint64_t>(i))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct IdtPerCpuAndTimerVerifyContext {
+  int cpu_count = 0;
+  int64_t initial_ticks[kMaxCpus] = {};
+  int64_t initial_ipis[kMaxCpus] = {};
+  bool per_cpu_ok[kMaxCpus] = {};
+};
+
+constexpr int kMaxTimerWaitSpins = 200000000;
+
+static uint64_t ReadGsBaseMsr() {
+  uint32_t low = 0;
+  uint32_t high = 0;
+  asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(kMsrIa32GsBase));
+  return (static_cast<uint64_t>(high) << 32) | low;
+}
+
+static void IdtPerCpuAndTimerVerifyWorker(const int cpu_index,
+                                          void* const raw_ctx) {
+  IdtPerCpuAndTimerVerifyContext* const ctx =
+      static_cast<IdtPerCpuAndTimerVerifyContext*>(raw_ctx);
+  if (ctx == nullptr || cpu_index < 0 || cpu_index >= ctx->cpu_count) {
+    return;
+  }
+
+  CpuLocal* const local = CurrentCpu();
+  const CpuInfo* const info = SmpGetCpuInfo(cpu_index);
+  if (local == nullptr || info == nullptr ||
+      local != SmpGetCpuLocal(cpu_index) || local->self != local ||
+      (reinterpret_cast<uintptr_t>(local) & 63u) != 0 ||
+      ReadGsBaseMsr() != reinterpret_cast<uintptr_t>(local) ||
+      CurrentCpuId() != cpu_index || local->cpu_id != cpu_index ||
+      local->apic_id != info->apic_id || !local->online ||
+      local->stack_base != info->stack_base ||
+      local->stack_top != info->stack_top) {
+    ctx->per_cpu_ok[cpu_index] = false;
+    return;
+  }
+
+  // Send a cross-CPU wakeup IPI (vector 0x21) to the next CPU in ring order so
+  // every online CPU (including CPU 0) receives at least one 0x21 IPI.
+  const int target_cpu = (cpu_index + 1) % ctx->cpu_count;
+  SmpSendIpi(target_cpu, kVectorWakeupIpi);
+
+  const int64_t target_ticks = ctx->initial_ticks[cpu_index] + 2;
+  const int64_t target_ipis = ctx->initial_ipis[cpu_index] + 1;
+  bool advanced = false;
+  for (int spin = 0; spin < kMaxTimerWaitSpins; ++spin) {
+    if (local->timer_ticks.load(std::memory_order_acquire) >= target_ticks &&
+        local->ipi_count.load(std::memory_order_acquire) >= target_ipis) {
+      advanced = true;
+      break;
+    }
+    asm volatile("sti; pause" : : : "memory", "cc");
+  }
+
+  ctx->per_cpu_ok[cpu_index] = advanced;
+}
+
+static bool TestIdtPerCpuAndLapicTimer() {
+  if (!IdtIsInitialized() || SmpCalibratedTimerInitialCount() == 0) {
+    return false;
+  }
+
+  const IdtPointer idtr = IdtGetPointer();
+  if (idtr.limit != sizeof(IdtGateDescriptor) * kIdtEntryCount - 1 ||
+      idtr.base != reinterpret_cast<uint64_t>(IdtGetGate(0))) {
+    return false;
+  }
+  for (int v = 0; v < kIdtEntryCount; ++v) {
+    const IdtGateDescriptor* const gate = IdtGetGate(v);
+    if (gate == nullptr || gate->selector != kIdtKernelCodeSelector ||
+        gate->ist != 0 || gate->type_attr != kIdtInterruptGateAttr ||
+        gate->reserved != 0 ||
+        IdtDecodeGateOffset(*gate) != g_isr_stub_table[v]) {
+      return false;
+    }
+  }
+
+  if (!TriggerInt3AndVerifyAllRegisters()) {
+    return false;
+  }
+
+  const int cpu_count = SmpCpuCount();
+  if (cpu_count < 1 || SmpOnlineCpuCount() != cpu_count) {
+    return false;
+  }
+
+  IdtPerCpuAndTimerVerifyContext ctx = {};
+  ctx.cpu_count = cpu_count;
+  for (int i = 0; i < cpu_count; ++i) {
+    const CpuLocal* const local = SmpGetCpuLocal(i);
+    if (local == nullptr) {
+      return false;
+    }
+    ctx.initial_ticks[i] = local->timer_ticks.load(std::memory_order_acquire);
+    ctx.initial_ipis[i] = local->ipi_count.load(std::memory_order_acquire);
+  }
+
+  SmpRunOnAllCpus(IdtPerCpuAndTimerVerifyWorker, &ctx);
+
+  for (int i = 0; i < cpu_count; ++i) {
+    const CpuLocal* const local = SmpGetCpuLocal(i);
+    const int64_t final_ticks =
+        local->timer_ticks.load(std::memory_order_acquire);
+    const int64_t final_ipis = local->ipi_count.load(std::memory_order_acquire);
+    if (!ctx.per_cpu_ok[i] || final_ticks <= ctx.initial_ticks[i] ||
+        final_ipis <= ctx.initial_ipis[i]) {
+      return false;
+    }
+    UartWrite("[TIMER] CPU ");
+    UartWriteDec(static_cast<uint64_t>(i));
+    UartWrite(" (APIC ID ");
+    UartWriteDec(local->apic_id);
+    UartWrite("): timer_ticks=");
+    UartWriteDec(static_cast<uint64_t>(final_ticks));
+    UartWrite(", ipi_count=");
+    UartWriteDec(static_cast<uint64_t>(final_ipis));
+    UartWrite("\n");
+  }
+
+  return true;
+}
+
 }  // namespace
 
 void RunBootVerificationSuite() {
@@ -1134,8 +1385,11 @@ void RunBootVerificationSuite() {
   const bool smp_sync_ok = TestSmpMultiCpuSyncStress();
   LogTestResult("smp_multicpu_sync_stress", smp_sync_ok);
 
+  const bool idt_timer_ok = TestIdtPerCpuAndLapicTimer();
+  LogTestResult("idt_percpu_and_lapic_timer", idt_timer_ok);
+
   if (pmm_ok && alloc_bounds_ok && free_reuse_ok && varied_ok && pattern_ok &&
-      cpp_ok && stress_ok && edge_ok && smp_ok && smp_sync_ok) {
+      cpp_ok && stress_ok && edge_ok && smp_ok && smp_sync_ok && idt_timer_ok) {
     UartWrite("[TEST] ALL MEMORY TESTS PASSED\n");
     VgaWrite("[TEST] ALL MEMORY TESTS PASSED");
   } else {

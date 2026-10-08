@@ -34,14 +34,16 @@ TEST_SAN_ENV_tsan := TSAN_OPTIONS=halt_on_error=1
 HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp))
 HOST_TESTS := $(patsubst %.cpp,%,$(HOST_TEST_SRCS))
 TEST_EXTRA_SRCS_heap_test := heap.cpp
+TEST_EXTRA_SRCS_idt_test := idt.cpp
 TEST_EXTRA_SRCS_pmm_test := pmm.cpp multiboot.cpp
-TEST_EXTRA_SRCS_smp_test := smp.cpp
+TEST_EXTRA_SRCS_smp_test := smp.cpp idt.cpp
 
 BUILD_DIR := build
 
 CXX_SRCS := \
     uart.cpp \
     vga.cpp \
+    idt.cpp \
     multiboot.cpp \
     paging.cpp \
     pmm.cpp \
@@ -55,6 +57,7 @@ CXX_HDRS := \
     spinlock.h \
     uart.h \
     vga.h \
+    idt.h \
     multiboot.h \
     paging.h \
     pmm.h \
@@ -87,7 +90,7 @@ DOCKER_RUN :=
 DOCKER_DEPS :=
 endif
 
-.PHONY: all clean test test-host test-rbtree test-spinlock test-heap test-pmm test-smp run-boot-test
+.PHONY: all clean test test-host test-rbtree test-spinlock test-heap test-idt test-pmm test-smp run-boot-test
 
 ifeq ($(IN_DOCKER),)
 all: $(DOCKER_STAMP)
@@ -155,6 +158,7 @@ $(foreach t,$(HOST_TESTS),$(eval $(call DEFINE_HOST_TEST_SUITE,$(t))))
 test-rbtree: test-rbtree_test
 test-spinlock: test-spinlock_test
 test-heap: test-heap_test
+test-idt: test-idt_test
 test-pmm: test-pmm_test
 test-smp: test-smp_test
 

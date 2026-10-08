@@ -324,6 +324,132 @@ ap_long_mode_entry:
 
 
 /* =========================================================================
+ * 256-Entry 64-Bit Interrupt & Exception Service Routine (ISR) Stubs
+ * Normalizes error codes across all 256 vectors, saves all 15 general-purpose
+ * registers into an InterruptFrame, aligns RSP to 16 bytes per the System V
+ * AMD64 ABI, calls IdtDispatch(InterruptFrame* frame), restores registers,
+ * and returns via iretq.
+ * ========================================================================= */
+.macro ISR_NOERR_STUB vec
+.align 16
+.global isr_stub_\vec
+isr_stub_\vec:
+    push 0
+    push \vec
+    jmp isr_common_stub
+.endm
+
+.macro ISR_ERR_STUB vec
+.align 16
+.global isr_stub_\vec
+isr_stub_\vec:
+    push \vec
+    jmp isr_common_stub
+.endm
+
+.align 16
+.extern IdtDispatch
+isr_common_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    cld
+    mov rdi, rsp
+    mov rbp, rsp
+    and rsp, -16
+    call IdtDispatch
+    mov rsp, rbp
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    iretq
+
+/* CPU Exceptions 0..31 (error code pushed by CPU on 8, 10..14, 17, 21, 29, 30) */
+ISR_NOERR_STUB 0
+ISR_NOERR_STUB 1
+ISR_NOERR_STUB 2
+ISR_NOERR_STUB 3
+ISR_NOERR_STUB 4
+ISR_NOERR_STUB 5
+ISR_NOERR_STUB 6
+ISR_NOERR_STUB 7
+ISR_ERR_STUB   8
+ISR_NOERR_STUB 9
+ISR_ERR_STUB   10
+ISR_ERR_STUB   11
+ISR_ERR_STUB   12
+ISR_ERR_STUB   13
+ISR_ERR_STUB   14
+ISR_NOERR_STUB 15
+ISR_NOERR_STUB 16
+ISR_ERR_STUB   17
+ISR_NOERR_STUB 18
+ISR_NOERR_STUB 19
+ISR_NOERR_STUB 20
+ISR_ERR_STUB   21
+ISR_NOERR_STUB 22
+ISR_NOERR_STUB 23
+ISR_NOERR_STUB 24
+ISR_NOERR_STUB 25
+ISR_NOERR_STUB 26
+ISR_NOERR_STUB 27
+ISR_NOERR_STUB 28
+ISR_ERR_STUB   29
+ISR_ERR_STUB   30
+ISR_NOERR_STUB 31
+
+/* External / APIC / Software Interrupt Vectors 32..255 */
+.irp vec, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
+    ISR_NOERR_STUB \vec
+.endr
+.irp vec, 64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95
+    ISR_NOERR_STUB \vec
+.endr
+.irp vec, 96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127
+    ISR_NOERR_STUB \vec
+.endr
+.irp vec, 128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159
+    ISR_NOERR_STUB \vec
+.endr
+.irp vec, 160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191
+    ISR_NOERR_STUB \vec
+.endr
+.irp vec, 192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223
+    ISR_NOERR_STUB \vec
+.endr
+.irp vec, 224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+    ISR_NOERR_STUB \vec
+.endr
+
+
+/* =========================================================================
  * 64-Bit Global Descriptor Table & IDT Pointer (Read-Only Data)
  * ========================================================================= */
 .section .rodata
@@ -343,6 +469,34 @@ gdt64_pointer:
 idt64_pointer:
     .word 32 * 16 - 1           /* 16-bit Limit (32 gate descriptors) */
     .quad idt64                 /* 64-bit Base Address */
+
+.align 16
+.global g_isr_stub_table
+g_isr_stub_table:
+.irp vec, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    .quad isr_stub_\vec
+.endr
+.irp vec, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63
+    .quad isr_stub_\vec
+.endr
+.irp vec, 64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95
+    .quad isr_stub_\vec
+.endr
+.irp vec, 96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127
+    .quad isr_stub_\vec
+.endr
+.irp vec, 128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159
+    .quad isr_stub_\vec
+.endr
+.irp vec, 160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191
+    .quad isr_stub_\vec
+.endr
+.irp vec, 192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223
+    .quad isr_stub_\vec
+.endr
+.irp vec, 224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+    .quad isr_stub_\vec
+.endr
 
 
 /* =========================================================================

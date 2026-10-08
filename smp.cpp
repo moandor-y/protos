@@ -8,8 +8,10 @@
 #endif
 
 #include "check.h"
+#include "idt.h"
 #include "paging.h"
 #include "pmm.h"
+#include "spinlock.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -60,6 +62,7 @@ constexpr uint32_t kMadtLapicFlagEnabled = 1u << 0;
 constexpr uint32_t kMadtLapicFlagOnlineCapable = 1u << 1;
 constexpr uint32_t kMadtLapicUsableMask =
     kMadtLapicFlagEnabled | kMadtLapicFlagOnlineCapable;
+constexpr int kMaxPitReloadCount = 0xFFFF;
 
 #if !__STDC_HOSTED__
 constexpr uint32_t kMsrIa32ApicBase = 0x0000001B;
@@ -75,19 +78,37 @@ constexpr uint64_t kPteAddressMask = 0x000FFFFFFFFFF000ULL;
 
 constexpr int kLapicRegId = 0x020;
 constexpr int kLapicRegTpr = 0x080;
+constexpr int kLapicRegEoi = 0x0B0;
 constexpr int kLapicRegSvr = 0x0F0;
 constexpr int kLapicRegEsr = 0x280;
 constexpr int kLapicRegIcrLow = 0x300;
 constexpr int kLapicRegIcrHigh = 0x310;
+constexpr int kLapicRegLvtTimer = 0x320;
+constexpr int kLapicRegTimerInitCount = 0x380;
+constexpr int kLapicRegTimerCurrCount = 0x390;
+constexpr int kLapicRegTimerDivConfig = 0x3E0;
 
 constexpr uint32_t kLapicSvrSoftwareEnable = 1u << 8;
 constexpr uint32_t kLapicSpuriousVector = 0xFFu;
-constexpr uint32_t kIcrDeliveryNmi = 0x00000400u;
+constexpr uint32_t kLapicTimerDivBy16 = 0x03u;
+constexpr uint32_t kLapicTimerMaskBit = 1u << 16;
+constexpr uint32_t kLapicTimerPeriodicMode = 1u << 17;
+
+constexpr uint32_t kIcrDeliveryFixed = 0x00000000u;
 constexpr uint32_t kIcrDeliveryInit = 0x00000500u;
 constexpr uint32_t kIcrDeliveryStartup = 0x00000600u;
 constexpr uint32_t kIcrDeliveryPending = 1u << 12;
 constexpr uint32_t kIcrLevelAssert = 1u << 14;
 constexpr uint32_t kIcrTriggerLevel = 1u << 15;
+
+constexpr uint16_t kPitChannel2DataPort = 0x42;
+constexpr uint16_t kPitCommandPort = 0x43;
+constexpr uint16_t kPitSpeakerPort = 0x61;
+constexpr uint8_t kPitCmdChannel2Mode0 = 0xB0;
+constexpr uint8_t kPitSpeakerGate2Bit = 1u << 0;
+constexpr uint8_t kPitSpeakerEnableMask = 0x03u;
+constexpr uint8_t kPitSpeakerOut2Bit = 1u << 5;
+constexpr int kPitCalibrationPollLimit = 50000000;
 
 constexpr int64_t kMaxTrampolineBytes = 512;
 constexpr int kIcrIdlePollLimit = 1000000;
@@ -95,7 +116,7 @@ constexpr int kInitDelayIterations = 50000;
 constexpr int kFirstSipiPollLimit = 200000;
 #endif
 constexpr int kSecondSipiPollLimit = 50000000;
-constexpr int kNmiRetryPollInterval = 4096;
+constexpr int kIpiRetryPollInterval = 4096;
 
 struct [[gnu::packed]] Multiboot2InfoHeader {
   uint32_t total_size;
@@ -169,6 +190,10 @@ struct [[gnu::packed]] AcpiMadtLocalX2Apic {
 
 // Discovered CPU topology and per-CPU runtime state populated during SmpInit().
 SmpTopology g_topology = {};
+// Cache-line-aligned per-CPU state blocks (`0 .. SmpCpuCount() - 1`).
+alignas(64) CpuLocal g_cpu_locals[kMaxCpus] = {};
+// Calibrated periodic Local APIC timer initial count computed on the BSP.
+uint32_t g_calibrated_timer_initial_count = 0;
 // Number of CPUs (BSP + APs) that have completed initialization and come
 // online.
 std::atomic<int> g_online_cpu_count{0};
@@ -186,25 +211,29 @@ std::atomic<bool> g_dispatch_in_progress{false};
 std::atomic<SmpWorkFn> g_work_fn{nullptr};
 std::atomic<void*> g_work_context{nullptr};
 // Monotonically increasing dispatch epoch incremented by the BSP to announce a
-// new work item before waking halted APs via NMI IPIs.
+// new work item before waking halted APs via maskable `0x21` IPIs.
 std::atomic<int64_t> g_work_epoch{0};
 // Set by the BSP to `g_work_epoch` once all APs have acknowledged the wakeup,
 // releasing all CPUs to execute `g_work_fn` simultaneously.
 std::atomic<int64_t> g_work_start_epoch{0};
 // Per-CPU epoch acknowledgment written by AP `i` upon waking from `hlt`, so the
-// BSP knows whether an AP received the NMI IPI or needs a retry.
+// BSP knows whether an AP received the wakeup IPI or needs a retry.
 std::atomic<int64_t> g_ap_ack_epoch[kMaxCpus] = {};
 // Per-CPU completion epoch written by AP `i` after `g_work_fn` returns, before
-// the AP goes back to `cli; hlt`.
+// the AP goes back to `sti; hlt`.
 std::atomic<int64_t> g_ap_done_epoch[kMaxCpus] = {};
 
 #if __STDC_HOSTED__
+constexpr uint64_t kDefaultHostCalibrationTicks = 625000;
+
 // Host unit-test overrides configured via SmpSetHostTestHooks().
 uint8_t g_host_bsp_apic_id = 0;
 uintptr_t g_host_ebda_base = 0;
 uintptr_t g_host_bios_rom_base = 0;
 uintptr_t g_host_acpi32_high_bits = 0;
 SmpHostApBootSimFn g_host_ap_sim_fn = nullptr;
+uint64_t g_host_calibration_ticks = kDefaultHostCalibrationTicks;
+std::atomic<int64_t> g_host_eoi_count{0};
 
 struct HostApRunner {
   std::thread threads[kMaxCpus];
@@ -612,11 +641,49 @@ static bool TryDiscoverFromMemoryRange(const uintptr_t range_start,        //
   return false;
 }
 
+static void ResetCpuLocalSlot(const int cpu_index) {
+  DCHECK(cpu_index >= 0 && cpu_index < kMaxCpus);
+  CpuLocal& slot = g_cpu_locals[cpu_index];
+  slot.self = nullptr;
+  slot.cpu_id = 0;
+  slot.apic_id = 0;
+  slot.online = false;
+  slot.stack_base = 0;
+  slot.stack_top = 0;
+  slot.timer_ticks.store(0, std::memory_order_relaxed);
+  slot.ipi_count.store(0, std::memory_order_relaxed);
+}
+
+static void InitCpuLocalSlot(const int cpu_index,         //
+                             const uint8_t apic_id,       //
+                             const bool online,           //
+                             const uintptr_t stack_base,  //
+                             const uintptr_t stack_top) {
+  DCHECK(cpu_index >= 0 && cpu_index < kMaxCpus);
+  CpuLocal& slot = g_cpu_locals[cpu_index];
+  slot.self = &slot;
+  slot.cpu_id = cpu_index;
+  slot.apic_id = apic_id;
+  slot.online = online;
+  slot.stack_base = stack_base;
+  slot.stack_top = stack_top;
+  slot.timer_ticks.store(0, std::memory_order_relaxed);
+  slot.ipi_count.store(0, std::memory_order_relaxed);
+}
+
 static void ResetSmpState() {
 #if __STDC_HOSTED__
   g_host_ap_runner.Reset();
+  ResetCpuLocalForTest();
+  g_host_eoi_count.store(0, std::memory_order_relaxed);
+#else
+  internal::g_cpu_local_bound.store(false, std::memory_order_release);
 #endif
   g_topology = {};
+  for (int i = 0; i < kMaxCpus; ++i) {
+    ResetCpuLocalSlot(i);
+  }
+  g_calibrated_timer_initial_count = 0;
   g_online_cpu_count.store(0, std::memory_order_seq_cst);
   g_ap_boot_done.store(0, std::memory_order_seq_cst);
   g_ap_boot_started.store(0, std::memory_order_seq_cst);
@@ -635,6 +702,16 @@ static void ResetSmpState() {
 }
 
 #if !__STDC_HOSTED__
+static inline void Outb(const uint16_t port, const uint8_t value) {
+  asm volatile("out %1, %0" : : "a"(value), "Nd"(port) : "memory");
+}
+
+static inline uint8_t Inb(const uint16_t port) {
+  uint8_t value = 0;
+  asm volatile("in %0, %1" : "=a"(value) : "Nd"(port) : "memory");
+  return value;
+}
+
 static uint64_t ReadMsr(const uint32_t msr) {
   uint32_t low = 0;
   uint32_t high = 0;
@@ -758,6 +835,80 @@ static bool WaitForIcrIdle(const uintptr_t lapic_base) {
   return (LapicRead(lapic_base, kLapicRegIcrLow) & kIcrDeliveryPending) == 0;
 }
 
+static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
+  DCHECK(lapic_base != 0);
+  LapicWrite(lapic_base, kLapicRegTimerDivConfig, kLapicTimerDivBy16);
+  LapicWrite(lapic_base,         //
+             kLapicRegLvtTimer,  //
+             kLapicTimerMaskBit | static_cast<uint32_t>(kVectorApicTimer));
+
+  const uint8_t speaker_initial = Inb(kPitSpeakerPort);
+  const uint8_t gate_disabled =
+      static_cast<uint8_t>(speaker_initial & ~kPitSpeakerEnableMask);
+  Outb(kPitSpeakerPort, gate_disabled);
+
+  Outb(kPitCommandPort, kPitCmdChannel2Mode0);
+  Outb(kPitChannel2DataPort,
+       static_cast<uint8_t>(kPitCalibrationReloadCount & 0xFF));
+  Outb(kPitChannel2DataPort,
+       static_cast<uint8_t>((kPitCalibrationReloadCount >> 8) & 0xFF));
+
+  // Rising edge on GATE2 starts the 8254 Channel 2 Mode 0 one-shot countdown.
+  Outb(kPitSpeakerPort,
+       static_cast<uint8_t>(gate_disabled | kPitSpeakerGate2Bit));
+  LapicWrite(lapic_base, kLapicRegTimerInitCount, 0xFFFFFFFFu);
+
+  bool terminal_count_reached = false;
+  for (int poll = 0; poll < kPitCalibrationPollLimit; ++poll) {
+    if ((Inb(kPitSpeakerPort) & kPitSpeakerOut2Bit) != 0) {
+      terminal_count_reached = true;
+      break;
+    }
+    asm volatile("pause" : : : "memory");
+  }
+
+  const uint32_t current_count = LapicRead(lapic_base, kLapicRegTimerCurrCount);
+  LapicWrite(lapic_base, kLapicRegTimerInitCount, 0);
+  Outb(kPitSpeakerPort, gate_disabled);
+  CHECK(terminal_count_reached);
+
+  const uint64_t elapsed_ticks = 0xFFFFFFFFULL - current_count;
+  const uint32_t initial_count =
+      ComputeApicTimerInitialCount(elapsed_ticks,               //
+                                   kPitCalibrationReloadCount,  //
+                                   kApicTimerTargetHz);
+  CHECK(initial_count > 0);
+  return initial_count;
+}
+
+static void StartLocalApicTimer(const uintptr_t lapic_base,
+                                const uint32_t initial_count) {
+  DCHECK(lapic_base != 0);
+  DCHECK(initial_count > 0);
+  LapicWrite(lapic_base, kLapicRegTimerDivConfig, kLapicTimerDivBy16);
+  LapicWrite(lapic_base,         //
+             kLapicRegLvtTimer,  //
+             kLapicTimerPeriodicMode | static_cast<uint32_t>(kVectorApicTimer));
+  LapicWrite(lapic_base, kLapicRegTimerInitCount, initial_count);
+}
+
+static void SendFixedIpi(const uintptr_t lapic_base,  //
+                         const uint8_t apic_id,       //
+                         const uint8_t vector) {
+  DCHECK(lapic_base != 0);
+  DCHECK(apic_id != kInvalidXapicId);
+  DCHECK(vector >= static_cast<uint8_t>(kCpuExceptionCount));
+  const uint32_t icr_dest = static_cast<uint32_t>(apic_id) << 24;
+  LapicWrite(lapic_base, kLapicRegEsr, 0);
+  (void)LapicRead(lapic_base, kLapicRegEsr);
+  LapicWrite(lapic_base, kLapicRegIcrHigh, icr_dest);
+  LapicWrite(
+      lapic_base,       //
+      kLapicRegIcrLow,  //
+      kIcrDeliveryFixed | kIcrLevelAssert | static_cast<uint32_t>(vector));
+  CHECK(WaitForIcrIdle(lapic_base));
+}
+
 static void DelayLoop(const int iterations) {
   DCHECK(iterations >= 0);
   for (int i = 0; i < iterations; ++i) {
@@ -875,6 +1026,9 @@ static bool RunPendingApWork(const int cpu_index,
   if (epoch <= *completed_epoch) {
     return false;
   }
+#if !__STDC_HOSTED__
+  asm volatile("sti" : : : "memory", "cc");
+#endif
   g_ap_ack_epoch[cpu_index].store(epoch, std::memory_order_release);
   while (g_work_start_epoch.load(std::memory_order_acquire) != epoch) {
     asm volatile("pause" : : : "memory");
@@ -888,22 +1042,15 @@ static bool RunPendingApWork(const int cpu_index,
   return true;
 }
 
-static void SendNmiIpi(const uintptr_t lapic_base,  //
-                       const int cpu_index,         //
-                       const uint8_t apic_id) {
+static void SendWakeupIpi(const uintptr_t lapic_base,  //
+                          const int cpu_index,         //
+                          const uint8_t apic_id) {
   DCHECK(lapic_base != 0);
   DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
   DCHECK(apic_id != kInvalidXapicId);
 #if !__STDC_HOSTED__
   (void)cpu_index;
-  const uint32_t icr_dest = static_cast<uint32_t>(apic_id) << 24;
-  LapicWrite(lapic_base, kLapicRegEsr, 0);
-  (void)LapicRead(lapic_base, kLapicRegEsr);
-  LapicWrite(lapic_base, kLapicRegIcrHigh, icr_dest);
-  LapicWrite(lapic_base,       //
-             kLapicRegIcrLow,  //
-             kIcrDeliveryNmi | kIcrLevelAssert);
-  CHECK(WaitForIcrIdle(lapic_base));
+  SendFixedIpi(lapic_base, apic_id, kVectorWakeupIpi);
 #else
   (void)lapic_base;
   (void)apic_id;
@@ -916,6 +1063,14 @@ static void SendNmiIpi(const uintptr_t lapic_base,  //
   }
   g_host_ap_runner.spawned_epoch[cpu_index] = target_epoch;
   g_host_ap_runner.threads[cpu_index] = std::thread([cpu_index]() {
+    BindCpuLocal(&g_cpu_locals[cpu_index]);
+    SetInterruptsEnabledForTest(true);
+    InterruptFrame ipi_frame = {};
+    ipi_frame.vector = kVectorWakeupIpi;
+    IdtDispatch(&ipi_frame);
+    InterruptFrame timer_frame = {};
+    timer_frame.vector = kVectorApicTimer;
+    IdtDispatch(&timer_frame);
     while (!RunPendingApWork(cpu_index,
                              &g_host_ap_runner.completed_epoch[cpu_index])) {
       asm volatile("pause" : : : "memory");
@@ -932,6 +1087,10 @@ extern "C" void ApKernelEntry(const int cpu_index) {
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
   DCHECK(lapic_base != 0);
   DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
+
+  IdtLoad();
+  g_cpu_locals[cpu_index].online = true;
+  BindCpuLocal(&g_cpu_locals[cpu_index]);
   EnableLocalApic(lapic_base);
 
   CpuInfo& cpu = g_topology.cpus[cpu_index];
@@ -941,15 +1100,18 @@ extern "C" void ApKernelEntry(const int cpu_index) {
   cpu.long_mode_active = IsHardwareLongModeActive();
   cpu.online = true;
 
+  StartLocalApicTimer(lapic_base, g_calibrated_timer_initial_count);
+
   g_online_cpu_count.fetch_add(1, std::memory_order_seq_cst);
   g_ap_boot_done.store(1, std::memory_order_release);
 
   int64_t completed_epoch = 0;
   for (;;) {
+    asm volatile("cli" : : : "memory", "cc");
     if (RunPendingApWork(cpu_index, &completed_epoch)) {
       continue;
     }
-    asm volatile("cli; hlt" : : : "memory");
+    asm volatile("sti; hlt" : : : "memory", "cc");
   }
 #else
   (void)cpu_index;
@@ -1264,9 +1426,34 @@ bool SmpDiscoverTopology(const uint32_t multiboot_magic,      //
   return false;
 }
 
+uint32_t ComputeApicTimerInitialCount(const uint64_t elapsed_apic_ticks,  //
+                                      const int pit_reload_count,         //
+                                      const int target_hz) {
+  DCHECK(pit_reload_count > 0 && pit_reload_count <= kMaxPitReloadCount);
+  DCHECK(target_hz > 0 && target_hz <= kPitBaseFrequencyHz);
+  if (elapsed_apic_ticks == 0) {
+    return 0;
+  }
+  const uint64_t freq_hz = static_cast<uint64_t>(kPitBaseFrequencyHz);
+  if (elapsed_apic_ticks > UINT64_MAX / freq_hz) {
+    return 0xFFFFFFFFu;
+  }
+  const uint64_t numerator = elapsed_apic_ticks * freq_hz;
+  const uint64_t denominator = static_cast<uint64_t>(pit_reload_count) *
+                               static_cast<uint64_t>(target_hz);
+  const uint64_t ticks_per_period = numerator / denominator;
+  if (ticks_per_period > 0xFFFFFFFFULL) {
+    return 0xFFFFFFFFu;
+  }
+  return static_cast<uint32_t>(ticks_per_period);
+}
+
 void SmpInit(const uint32_t multiboot_magic,
              const uint64_t multiboot_info_addr) {
   ResetSmpState();
+  if (!IdtIsInitialized()) {
+    IdtInit();
+  }
 
 #if !__STDC_HOSTED__
   const uint8_t bsp_initial_apic_id = ReadCpuidInitialApicId();
@@ -1316,7 +1503,24 @@ void SmpInit(const uint32_t multiboot_magic,
 #endif
   g_topology.cpus[0].is_bsp = true;
   g_topology.cpus[0].online = true;
+  InitCpuLocalSlot(0,                              //
+                   g_topology.cpus[0].apic_id,     //
+                   true,                           //
+                   g_topology.cpus[0].stack_base,  //
+                   g_topology.cpus[0].stack_top);
+  BindCpuLocal(&g_cpu_locals[0]);
   g_online_cpu_count.store(1, std::memory_order_seq_cst);
+
+#if !__STDC_HOSTED__
+  g_calibrated_timer_initial_count =
+      CalibrateLocalApicTimer(g_topology.local_apic_phys_addr);
+#else
+  g_calibrated_timer_initial_count =
+      ComputeApicTimerInitialCount(g_host_calibration_ticks,    //
+                                   kPitCalibrationReloadCount,  //
+                                   kApicTimerTargetHz);
+  CHECK(g_calibrated_timer_initial_count > 0);
+#endif
 
   ConsoleWrite("[SMP] Discovered CPUs: ");
   ConsoleWriteDec(g_topology.cpu_count);
@@ -1336,6 +1540,11 @@ void SmpInit(const uint32_t multiboot_magic,
       CHECK(stack_phys != 0);
       g_topology.cpus[i].stack_base = stack_phys;
       g_topology.cpus[i].stack_top = stack_phys + kApStackSize;
+      InitCpuLocalSlot(i,                              //
+                       g_topology.cpus[i].apic_id,     //
+                       false,                          //
+                       g_topology.cpus[i].stack_base,  //
+                       g_topology.cpus[i].stack_top);
     }
 
 #if !__STDC_HOSTED__
@@ -1365,9 +1574,17 @@ void SmpInit(const uint32_t multiboot_magic,
         woke_ok = true;
       }
       CHECK(woke_ok);
+      IdtLoad();
+      g_cpu_locals[i].online = true;
+      BindCpuLocal(&g_cpu_locals[i]);
+      InterruptFrame ap_timer_frame = {};
+      ap_timer_frame.vector = kVectorApicTimer;
+      IdtDispatch(&ap_timer_frame);
+      BindCpuLocal(&g_cpu_locals[0]);
       g_online_cpu_count.fetch_add(1, std::memory_order_seq_cst);
 #endif
       CHECK(g_topology.cpus[i].online);
+      CHECK(g_cpu_locals[i].online);
 
       UartWrite("[SMP] CPU ");
       UartWriteDec(i);
@@ -1381,13 +1598,36 @@ void SmpInit(const uint32_t multiboot_magic,
 #endif
   }
 
+#if !__STDC_HOSTED__
+  StartLocalApicTimer(g_topology.local_apic_phys_addr,
+                      g_calibrated_timer_initial_count);
+#else
+  BindCpuLocal(&g_cpu_locals[0]);
+  InterruptFrame bsp_timer_frame = {};
+  bsp_timer_frame.vector = kVectorApicTimer;
+  IdtDispatch(&bsp_timer_frame);
+#endif
+
   g_smp_initialized = true;
   CHECK(SmpOnlineCpuCount() == g_topology.cpu_count);
-  ConsoleWrite("[SMP] Online CPUs: ");
-  ConsoleWriteDec(SmpOnlineCpuCount());
-  ConsoleWrite("/");
-  ConsoleWriteDec(g_topology.cpu_count);
-  ConsoleWrite("\n");
+
+#if !__STDC_HOSTED__
+  asm volatile("sti" : : : "memory", "cc");
+#else
+  SetInterruptsEnabledForTest(true);
+#endif
+
+  UartWrite("[SMP] Local APIC timer calibrated: initial_count=");
+  UartWriteDec(g_calibrated_timer_initial_count);
+  UartWrite(", target_hz=");
+  UartWriteDec(kApicTimerTargetHz);
+  UartWrite("\n");
+
+  UartWrite("[SMP] Online CPUs: ");
+  UartWriteDec(SmpOnlineCpuCount());
+  UartWrite("/");
+  UartWriteDec(g_topology.cpu_count);
+  UartWrite("\n");
 }
 
 int SmpCpuCount() {
@@ -1406,9 +1646,53 @@ const CpuInfo* SmpGetCpuInfo(const int index) {
   return &g_topology.cpus[index];
 }
 
+CpuLocal* SmpGetCpuLocal(const int cpu_index) {
+  DCHECK(g_smp_initialized);
+  DCHECK(cpu_index >= 0 && cpu_index < g_topology.cpu_count);
+  return &g_cpu_locals[cpu_index];
+}
+
 uintptr_t SmpLocalApicPhysAddr() {
   DCHECK(g_smp_initialized);
   return g_topology.local_apic_phys_addr;
+}
+
+uint32_t SmpCalibratedTimerInitialCount() {
+  DCHECK(g_smp_initialized);
+  return g_calibrated_timer_initial_count;
+}
+
+void SmpSendLocalApicEoi() {
+#if !__STDC_HOSTED__
+  const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
+  DCHECK(lapic_base != 0);
+  LapicWrite(lapic_base, kLapicRegEoi, 0);
+#else
+  g_host_eoi_count.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+void SmpSendIpi(const int target_cpu_index, const uint8_t vector) {
+  DCHECK(g_smp_initialized);
+  DCHECK(target_cpu_index >= 0 && target_cpu_index < g_topology.cpu_count);
+  DCHECK(vector >= static_cast<uint8_t>(kCpuExceptionCount));
+#if !__STDC_HOSTED__
+  SendFixedIpi(g_topology.local_apic_phys_addr,            //
+               g_topology.cpus[target_cpu_index].apic_id,  //
+               vector);
+#else
+  if (vector == kVectorWakeupIpi) {
+    g_cpu_locals[target_cpu_index].ipi_count.fetch_add(
+        1, std::memory_order_relaxed);
+    SmpSendLocalApicEoi();
+  } else if (vector == kVectorApicTimer) {
+    g_cpu_locals[target_cpu_index].timer_ticks.fetch_add(
+        1, std::memory_order_relaxed);
+    SmpSendLocalApicEoi();
+  } else if (vector != kVectorSpurious) {
+    SmpSendLocalApicEoi();
+  }
+#endif
 }
 
 void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
@@ -1418,6 +1702,13 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
   DCHECK(cpu_count >= 1 && cpu_count <= kMaxCpus);
   DCHECK(SmpOnlineCpuCount() == cpu_count);
   DCHECK(!g_dispatch_in_progress.exchange(true, std::memory_order_acq_rel));
+
+#if __STDC_HOSTED__
+  BindCpuLocal(&g_cpu_locals[0]);
+  InterruptFrame bsp_timer_frame = {};
+  bsp_timer_frame.vector = kVectorApicTimer;
+  IdtDispatch(&bsp_timer_frame);
+#endif
 
   if (cpu_count == 1) {
     work_fn(0, context);
@@ -1433,7 +1724,7 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
       g_work_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
 
   for (int i = 1; i < cpu_count; ++i) {
-    SendNmiIpi(lapic_base, i, g_topology.cpus[i].apic_id);
+    SendWakeupIpi(lapic_base, i, g_topology.cpus[i].apic_id);
   }
 
   for (int poll = 0;; ++poll) {
@@ -1441,8 +1732,8 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
     for (int i = 1; i < cpu_count; ++i) {
       if (g_ap_ack_epoch[i].load(std::memory_order_acquire) != epoch) {
         all_acked = false;
-        if (poll > 0 && (poll % kNmiRetryPollInterval) == 0) {
-          SendNmiIpi(lapic_base, i, g_topology.cpus[i].apic_id);
+        if (poll > 0 && (poll % kIpiRetryPollInterval) == 0) {
+          SendWakeupIpi(lapic_base, i, g_topology.cpus[i].apic_id);
         }
       }
     }
@@ -1478,6 +1769,19 @@ void SmpSetHostTestHooks(const uint8_t bsp_apic_id,      //
   g_host_bios_rom_base = bios_rom_base;
   g_host_acpi32_high_bits = acpi32_arena & ~0xFFFFFFFFULL;
   g_host_ap_sim_fn = sim_fn;
+  g_host_calibration_ticks = kDefaultHostCalibrationTicks;
+}
+
+void SmpSetHostTimerCalibrationTicksForTest(const uint64_t elapsed_apic_ticks) {
+  g_host_calibration_ticks = elapsed_apic_ticks;
+}
+
+int64_t SmpGetHostEoiCountForTest() {
+  return g_host_eoi_count.load(std::memory_order_relaxed);
+}
+
+void SmpResetHostEoiCountForTest() {
+  g_host_eoi_count.store(0, std::memory_order_relaxed);
 }
 #endif
 

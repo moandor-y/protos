@@ -2,6 +2,7 @@
 
 #include "check.h"
 #include "heap.h"
+#include "idt.h"
 #include "memory_tests.h"
 #include "pmm.h"
 #include "smp.h"
@@ -20,6 +21,7 @@ extern "C" [[noreturn]] void kernel_main(const uint32_t multiboot_magic,
   UartInit();
   UartWrite(kGreeting);
 
+  IdtInit();
   PmmInit(multiboot_magic, multiboot_info_addr);
   HeapInit();
   SmpInit(multiboot_magic, multiboot_info_addr);
