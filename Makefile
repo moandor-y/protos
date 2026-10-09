@@ -31,7 +31,7 @@ TEST_SAN_ENV_ubsan := UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 TEST_SAN_ENV_lsan := LSAN_OPTIONS=print_suppressions=0
 TEST_SAN_ENV_tsan := TSAN_OPTIONS=halt_on_error=1
 
-HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp))
+HOST_TEST_SRCS := $(filter-out stress_test.cpp,$(sort $(wildcard *_test.cpp)))
 HOST_TESTS := $(patsubst %.cpp,%,$(HOST_TEST_SRCS))
 TASK_LAYER_SRCS := \
     core_runqueue_scheduler.cpp \
@@ -54,6 +54,7 @@ TEST_EXTRA_SRCS_work_stealing_scheduler_test := work_stealing_scheduler.cpp
 TEST_EXTRA_SRCS_join_lifecycle_scheduler_test := join_lifecycle_scheduler.cpp
 TEST_EXTRA_SRCS_preemptive_scheduler_test := preemptive_scheduler.cpp
 TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) task.cpp idt.cpp
+TEST_EXTRA_SRCS_stress_test_test := stress_test.cpp $(TASK_LAYER_SRCS) task.cpp idt.cpp
 
 BUILD_DIR := build
 
@@ -69,6 +70,7 @@ CXX_SRCS := \
     $(TASK_LAYER_SRCS) \
     task.cpp \
     memory_tests.cpp \
+    stress_test.cpp \
     kernel.cpp
 
 CXX_HDRS := \
@@ -85,7 +87,8 @@ CXX_HDRS := \
     task.h \
     $(TASK_LAYER_HDRS) \
     rbtree.h \
-    memory_tests.h
+    memory_tests.h \
+    stress_test.h
 
 CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
 OBJS := $(BUILD_DIR)/boot.o $(CXX_OBJS)
@@ -111,7 +114,7 @@ DOCKER_RUN :=
 DOCKER_DEPS :=
 endif
 
-.PHONY: all clean test test-host test-rbtree test-spinlock test-heap test-idt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task run-boot-test
+.PHONY: all clean test test-host test-rbtree test-spinlock test-heap test-idt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-stress_test test-stress run-boot-test
 
 ifeq ($(IN_DOCKER),)
 all: $(DOCKER_STAMP)
@@ -187,6 +190,8 @@ test-work-stealing-scheduler: test-work_stealing_scheduler_test
 test-join-lifecycle-scheduler: test-join_lifecycle_scheduler_test
 test-preemptive-scheduler: test-preemptive_scheduler_test
 test-task: test-task_test
+test-stress_test: test-stress_test_test
+test-stress: test-stress_test_test
 
 ifeq ($(IN_DOCKER),)
 test-host: $(DOCKER_STAMP)

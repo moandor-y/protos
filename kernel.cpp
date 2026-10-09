@@ -6,6 +6,7 @@
 #include "memory_tests.h"
 #include "pmm.h"
 #include "smp.h"
+#include "stress_test.h"
 #include "task.h"
 #include "uart.h"
 #include "vga.h"
@@ -31,7 +32,7 @@ extern "C" [[noreturn]] void kernel_main(const uint32_t multiboot_magic,
   RunBootVerificationSuite();
 
   for (;;) {
-    asm volatile("cli; hlt");
+    RunRandomMultiCpuStressTest();
   }
 }
 

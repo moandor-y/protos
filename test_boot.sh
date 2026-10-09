@@ -9,6 +9,7 @@ BUILD_DIR="build"
 ISO_FILE="${1:-${BUILD_DIR}/kernel.iso}"
 EXPECTED_STRING="Hello, x86-64 Kernel World!"
 COMPLETION_MARKER="[TEST] ALL MEMORY TESTS PASSED"
+STRESS_MARKER="[STRESS] random_multicpu_stress: PASS"
 FAILURE_MARKER="FAIL"
 
 BIOS_SERIAL_LOG="${BUILD_DIR}/serial_bios_output.log"
@@ -58,6 +59,7 @@ REQUIRED_MARKERS=(
   "[TEST] idt_percpu_and_lapic_timer: PASS"
   "[TEST] task_scheduler_smp: PASS"
   "[TEST] ALL MEMORY TESTS PASSED"
+  "[STRESS] random_multicpu_stress: PASS"
 )
 
 # =========================================================================
@@ -79,12 +81,13 @@ run_bios_pass() {
     >/dev/null 2>&1 &
   qemu_pid=$!
 
-  # Poll up to 10 seconds (100 * 0.1s) for the greeting and memory test completion marker on COM1
+  # Poll up to 10 seconds (100 * 0.1s) for the greeting and memory/stress test completion markers on COM1
   local matched=0
   for ((i = 0; i < 100; i++)); do
     if [[ -f "${BIOS_SERIAL_LOG}" ]] && \
        grep -Fq "${EXPECTED_STRING}" "${BIOS_SERIAL_LOG}" 2>/dev/null && \
-       grep -Fq "${COMPLETION_MARKER}" "${BIOS_SERIAL_LOG}" 2>/dev/null; then
+       grep -Fq "${COMPLETION_MARKER}" "${BIOS_SERIAL_LOG}" 2>/dev/null && \
+       grep -Fq "${STRESS_MARKER}" "${BIOS_SERIAL_LOG}" 2>/dev/null; then
       matched=1
       break
     fi
@@ -98,7 +101,7 @@ run_bios_pass() {
   done
 
   if [[ "${matched}" -ne 1 ]]; then
-    echo "FAIL: Expected greeting '${EXPECTED_STRING}' and '${COMPLETION_MARKER}' not found in serial output within timeout." >&2
+    echo "FAIL: Expected greeting '${EXPECTED_STRING}', '${COMPLETION_MARKER}', and '${STRESS_MARKER}' not found in serial output within timeout." >&2
     if [[ -f "${BIOS_SERIAL_LOG}" ]]; then
       echo "Captured serial output:" >&2
       cat "${BIOS_SERIAL_LOG}" >&2
@@ -198,7 +201,8 @@ run_uefi_pass() {
   for ((i = 0; i < 150; i++)); do
     if [[ -f "${UEFI_SERIAL_LOG}" ]] && \
        grep -Fq "${EXPECTED_STRING}" "${UEFI_SERIAL_LOG}" 2>/dev/null && \
-       grep -Fq "${COMPLETION_MARKER}" "${UEFI_SERIAL_LOG}" 2>/dev/null; then
+       grep -Fq "${COMPLETION_MARKER}" "${UEFI_SERIAL_LOG}" 2>/dev/null && \
+       grep -Fq "${STRESS_MARKER}" "${UEFI_SERIAL_LOG}" 2>/dev/null; then
       uefi_matched=1
       break
     fi
@@ -212,7 +216,7 @@ run_uefi_pass() {
   done
 
   if [[ "${uefi_matched}" -ne 1 ]]; then
-    echo "FAIL: UEFI boot did not produce '${EXPECTED_STRING}' and '${COMPLETION_MARKER}' within timeout." >&2
+    echo "FAIL: UEFI boot did not produce '${EXPECTED_STRING}', '${COMPLETION_MARKER}', and '${STRESS_MARKER}' within timeout." >&2
     if [[ -f "${UEFI_SERIAL_LOG}" ]]; then
       cat "${UEFI_SERIAL_LOG}" >&2
     fi
