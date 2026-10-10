@@ -94,8 +94,7 @@ class PreemptiveTaskScheduler final : public TaskScheduler {
     if (!preempt_enabled_.load(std::memory_order_acquire)) {
       return false;
     }
-    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-    if (top_slot != nullptr && *top_slot != nullptr) {
+    if (internal::TopHeldLock() != nullptr) {
       return false;
     }
 #if !__STDC_HOSTED__

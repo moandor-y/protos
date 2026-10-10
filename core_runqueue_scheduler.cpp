@@ -546,8 +546,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
 
   [[gnu::noinline]] void Yield() override {
     DCHECK(initialized_.load(std::memory_order_acquire));
-    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-    DCHECK(top_slot == nullptr || *top_slot == nullptr);
+    DCHECK(internal::TopHeldLock() == nullptr);
 
     {
       const ScopedIrqDisable irq_guard;
@@ -578,8 +577,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     DCHECK(!task->is_idle);
     DCHECK(!task->is_bootstrap);
     DCHECK(!self->is_idle);
-    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-    DCHECK(top_slot == nullptr || *top_slot == nullptr);
+    DCHECK(internal::TopHeldLock() == nullptr);
 
     while (task->state.load(std::memory_order_acquire) != TaskState::kExited) {
       const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
@@ -769,8 +767,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     DCHECK(self != nullptr);
     DCHECK(!self->is_idle);
     DCHECK(!self->is_bootstrap);
-    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-    DCHECK(top_slot == nullptr || *top_slot == nullptr);
+    DCHECK(internal::TopHeldLock() == nullptr);
 
     (void)Schedule(TaskState::kExited);
     CHECK(false);
@@ -784,8 +781,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
   // to the PMM on task exit.
   [[gnu::noinline]] void FinishContextSwitch() {
     DCHECK(!AreInterruptsEnabled());
-    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-    DCHECK(top_slot == nullptr || *top_slot == nullptr);
+    DCHECK(internal::TopHeldLock() == nullptr);
 
     const int cpu_id = GetCurrentCpuId();
     DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
@@ -983,10 +979,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
 
     // Make sure no locks are held and interrupts are disabled.
     DCHECK(!AreInterruptsEnabled());
-    {
-      IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-      DCHECK(top_slot == nullptr || *top_slot == nullptr);
-    }
+    DCHECK(internal::TopHeldLock() == nullptr);
 
     // Do the context switch.
     TaskContextSwitch(prev_rsp_ptr, next_rsp_val);
@@ -997,8 +990,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     // Check the preconditions again.
     DCHECK(!AreInterruptsEnabled());
     {
-      IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-      DCHECK(top_slot == nullptr || *top_slot == nullptr);
+      DCHECK(internal::TopHeldLock() == nullptr);
       const int resumed_cpu_id = GetCurrentCpuId();
       DCHECK(resumed_cpu_id >= 0 && resumed_cpu_id < cpu_count_);
       DCHECK(prev->running_cpu.load(std::memory_order_relaxed) ==

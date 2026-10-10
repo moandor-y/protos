@@ -489,8 +489,7 @@ TEST(PreemptiveSchedulerTest,
         if (cpu == nullptr || !cpu->online || !AreInterruptsEnabled()) {
           safety_violation.store(true, std::memory_order_relaxed);
         }
-        IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-        if (top_slot != nullptr && *top_slot != nullptr) {
+        if (internal::TopHeldLock() != nullptr) {
           safety_violation.store(true, std::memory_order_relaxed);
         }
         if (frame != nullptr && frame->rflags != 0 &&
@@ -506,8 +505,7 @@ TEST(PreemptiveSchedulerTest,
         if (cpu == nullptr || !cpu->online || !AreInterruptsEnabled()) {
           safety_violation.store(true, std::memory_order_relaxed);
         }
-        IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-        if (top_slot != nullptr && *top_slot != nullptr) {
+        if (internal::TopHeldLock() != nullptr) {
           safety_violation.store(true, std::memory_order_relaxed);
         }
         if (frame != nullptr && frame->rflags != 0 &&

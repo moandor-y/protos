@@ -94,8 +94,7 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
     Task* const self = inner_->CurrentTask();
     DCHECK(self != nullptr);
     DCHECK(task != self);
-    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-    DCHECK(top_slot == nullptr || *top_slot == nullptr);
+    DCHECK(internal::TopHeldLock() == nullptr);
 
     TaskJoinRecord* rec = nullptr;
     {
@@ -207,8 +206,7 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
     DCHECK(rec->entry != nullptr);
     rec->entry(rec->arg);
 
-    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-    DCHECK(top_slot == nullptr || *top_slot == nullptr);
+    DCHECK(internal::TopHeldLock() == nullptr);
 
     rec->owner->MarkRecordExited(rec);
   }

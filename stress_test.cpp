@@ -674,9 +674,10 @@ static void RunNonYieldingSpinBurst(StressSharedState* const shared,  //
   DCHECK(last_cpu != nullptr);
 
   shared->preemptive_spin_bursts.fetch_add(1, std::memory_order_acq_rel);
-  const int cpu_before = CurrentCpuId();
+  const CpuLocal* const cpu_before_local = CurrentCpu();
+  const int cpu_before = cpu_before_local->cpu_id;
   const int64_t ticks_before =
-      CurrentCpu()->timer_ticks.load(std::memory_order_relaxed);
+      cpu_before_local->timer_ticks.load(std::memory_order_relaxed);
   const int spin_iters = prng->NextIntRange(128, 640);
 
   uint64_t accumulator = prng->NextU64();
@@ -694,10 +695,11 @@ static void RunNonYieldingSpinBurst(StressSharedState* const shared,  //
   }
 
   RecordCpuAndMigration(shared, last_cpu);
-  const int cpu_after = CurrentCpuId();
+  const CpuLocal* const cpu_after_local = CurrentCpu();
+  const int cpu_after = cpu_after_local->cpu_id;
   const int64_t ticks_after =
-      CurrentCpu()->timer_ticks.load(std::memory_order_relaxed);
-  if (ticks_after > ticks_before) {
+      cpu_after_local->timer_ticks.load(std::memory_order_relaxed);
+  if (cpu_after == cpu_before && ticks_after > ticks_before) {
     shared->timer_preemptions_observed.fetch_add(ticks_after - ticks_before,
                                                  std::memory_order_acq_rel);
   } else if (cpu_after != cpu_before) {

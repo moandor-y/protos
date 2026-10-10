@@ -1450,6 +1450,7 @@ struct StressChildArg {
 };
 
 static void MaybeBoostCurrentCpuTimer(SchedulerTestContext* const ctx) {
+  const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
   const int cpu = CurrentCpuId();
   const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
   const uint32_t prev =
@@ -1457,6 +1458,7 @@ static void MaybeBoostCurrentCpuTimer(SchedulerTestContext* const ctx) {
   if ((prev & bit) == 0 && ctx->stress_timer_count > 0) {
     ProgramLocalApicTimerInitCount(ctx->stress_timer_count);
   }
+  internal::LocalRestoreInterrupts(saved_irq);
 }
 
 static void StressChildWorker(void* const raw_arg) {

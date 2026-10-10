@@ -292,20 +292,29 @@ TEST(SpinLockTest, OwnershipAndTopHeldLockTrackingWithCpuLocalBoundAndUnbound) {
 
   // 1. Unbound fallback path (`CurrentCpuOrNull() == nullptr`).
   EXPECT_THAT(*internal::TopHeldLockSlot(), t::IsNull());
+  EXPECT_THAT(internal::TopHeldLock(), t::IsNull());
+  EXPECT_TRUE(AreInterruptsEnabled());
   {
     const IrqSpinLockGuard guard_a(lock_a);
     EXPECT_TRUE(lock_a.IsLocked());
     EXPECT_TRUE(lock_a.IsLockedByCurrentCpu());
     EXPECT_THAT(*internal::TopHeldLockSlot(), t::Eq(&lock_a));
+    EXPECT_THAT(internal::TopHeldLock(), t::Eq(&lock_a));
+    EXPECT_FALSE(AreInterruptsEnabled());
     {
       const IrqSpinLockGuard guard_b(lock_b);
       EXPECT_TRUE(lock_b.IsLocked());
       EXPECT_TRUE(lock_b.IsLockedByCurrentCpu());
       EXPECT_THAT(*internal::TopHeldLockSlot(), t::Eq(&lock_b));
+      EXPECT_THAT(internal::TopHeldLock(), t::Eq(&lock_b));
+      EXPECT_FALSE(AreInterruptsEnabled());
     }
     EXPECT_THAT(*internal::TopHeldLockSlot(), t::Eq(&lock_a));
+    EXPECT_THAT(internal::TopHeldLock(), t::Eq(&lock_a));
   }
   EXPECT_THAT(*internal::TopHeldLockSlot(), t::IsNull());
+  EXPECT_THAT(internal::TopHeldLock(), t::IsNull());
+  EXPECT_TRUE(AreInterruptsEnabled());
 
   // 2. Bound `CpuLocal` fast path (`CurrentCpuOrNull() != nullptr`).
   alignas(64) CpuLocal cpu0 = {};
@@ -324,30 +333,40 @@ TEST(SpinLockTest, OwnershipAndTopHeldLockTrackingWithCpuLocalBoundAndUnbound) {
   ASSERT_THAT(CurrentCpuOrNull(), t::Eq(&cpu0));
   EXPECT_THAT(internal::CurrentOwnerId(), t::Eq(uintptr_t{1}));
   EXPECT_THAT(internal::TopHeldLockSlot(), t::Eq(&cpu0.top_held_lock));
+  EXPECT_THAT(internal::TopHeldLock(), t::IsNull());
   EXPECT_THAT(cpu0.top_held_lock, t::IsNull());
 
   lock_a.Lock();
   EXPECT_TRUE(lock_a.IsLocked());
   EXPECT_TRUE(lock_a.IsLockedByCurrentCpu());
   EXPECT_THAT(cpu0.top_held_lock, t::Eq(&lock_a));
+  EXPECT_THAT(internal::TopHeldLock(), t::Eq(&lock_a));
 
   lock_b.Lock();
   EXPECT_TRUE(lock_b.IsLockedByCurrentCpu());
   EXPECT_THAT(cpu0.top_held_lock, t::Eq(&lock_b));
+  EXPECT_THAT(internal::TopHeldLock(), t::Eq(&lock_b));
 
   // Switching to a different CpuLocal shows lock_a/lock_b are NOT owned by
   // cpu2, and cpu2 has its own independent top_held_lock slot.
   BindCpuLocal(&cpu2);
+  SetInterruptsEnabledForTest(true);
   EXPECT_THAT(internal::CurrentOwnerId(), t::Eq(uintptr_t{3}));
   EXPECT_FALSE(lock_a.IsLockedByCurrentCpu());
   EXPECT_FALSE(lock_b.IsLockedByCurrentCpu());
   EXPECT_THAT(cpu2.top_held_lock, t::IsNull());
+  EXPECT_THAT(internal::TopHeldLock(), t::IsNull());
+  EXPECT_TRUE(AreInterruptsEnabled());
 
+  SetInterruptsEnabledForTest(false);
   BindCpuLocal(&cpu0);
   lock_b.Unlock();
   EXPECT_THAT(cpu0.top_held_lock, t::Eq(&lock_a));
+  EXPECT_THAT(internal::TopHeldLock(), t::Eq(&lock_a));
   lock_a.Unlock();
   EXPECT_THAT(cpu0.top_held_lock, t::IsNull());
+  EXPECT_THAT(internal::TopHeldLock(), t::IsNull());
+  EXPECT_TRUE(AreInterruptsEnabled());
 
   ResetCpuLocalForTest();
   EXPECT_THAT(CurrentCpuOrNull(), t::IsNull());

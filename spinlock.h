@@ -112,6 +112,18 @@ inline void LocalRestoreInterrupts(const bool previously_enabled) {
 }
 #endif
 
+// Reads the calling CPU's top held `IrqSpinLock*` with local interrupts
+// disabled so task preemption and cross-CPU work-stealing migration cannot
+// occur between resolving the current CPU's `CpuLocal` and reading its
+// `top_held_lock` field.
+inline IrqSpinLock* TopHeldLock() {
+  const bool saved_irq = LocalSaveAndDisableInterrupts();
+  IrqSpinLock** const top_slot = TopHeldLockSlot();
+  IrqSpinLock* const top_lock = (top_slot != nullptr) ? *top_slot : nullptr;
+  LocalRestoreInterrupts(saved_irq);
+  return top_lock;
+}
+
 }  // namespace internal
 
 // Returns true if local interrupts are currently enabled on the calling CPU
@@ -202,7 +214,11 @@ class IrqSpinLock {
   bool IsLocked() const { return owner_.load(std::memory_order_acquire) != 0; }
 
   bool IsLockedByCurrentCpu() const {
-    return owner_.load(std::memory_order_relaxed) == internal::CurrentOwnerId();
+    const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
+    const bool owned =
+        owner_.load(std::memory_order_relaxed) == internal::CurrentOwnerId();
+    internal::LocalRestoreInterrupts(saved_irq);
+    return owned;
   }
 
   int64_t NextTicket() const {
