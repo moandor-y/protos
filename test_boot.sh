@@ -192,6 +192,7 @@ run_uefi_pass() {
   echo "Running 64-bit UEFI (OVMF) + 4 GiB RAM boot verification..."
   qemu-system-x86_64 \
     -bios "${ovmf_bios}" \
+    -cpu qemu64,+x2apic \
     -smp 4 \
     -m 4G \
     -cdrom "${ISO_FILE}" \

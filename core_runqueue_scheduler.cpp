@@ -657,13 +657,16 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       return false;
     }
 
+    const int64_t src_min_vruntime = src_rq.min_vruntime;
+    const int64_t rel_vruntime = (stolen->vruntime > src_min_vruntime)
+                                     ? (stolen->vruntime - src_min_vruntime)
+                                     : 0;
+
     src_rq.tree.Erase(stolen);
     src_rq.runnable_count.fetch_sub(1, std::memory_order_release);
     UpdateRunqueueMinVruntime(&src_rq);
 
-    if (stolen->vruntime < dst_rq.min_vruntime) {
-      stolen->vruntime = dst_rq.min_vruntime;
-    }
+    stolen->vruntime = dst_rq.min_vruntime + rel_vruntime;
     stolen->migrations.fetch_add(1, std::memory_order_relaxed);
     EnqueueTaskLocked(&dst_rq, stolen, false);
     return true;

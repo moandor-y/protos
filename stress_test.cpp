@@ -38,11 +38,6 @@ constexpr int kMaxPmmAllocFramesLimit = 8;
 constexpr int kMaxActiveDetachedChildren = 64;
 constexpr int kPreemptProbeMaxSpins = 50000000;
 
-#if !__STDC_HOSTED__
-constexpr int kLapicRegIdOffset = 0x020;
-constexpr int kLapicRegTimerInitCountOffset = 0x380;
-#endif
-
 constexpr uint64_t kHeapObjectMagic = 0x5354524553534F42ULL;  // "STRESSOB"
 constexpr uint64_t kHeapObjectPoison = 0xDEAD535452455353ULL;
 
@@ -57,17 +52,7 @@ std::atomic<RdrandTestHookFn> g_rdrand_hook_fn{nullptr};
 
 #if !__STDC_HOSTED__
 static void ProgramLocalApicTimerInitCount(const uint32_t init_count) {
-  const uintptr_t lapic_base = SmpLocalApicPhysAddr();
-  if (lapic_base == 0 || init_count == 0) {
-    return;
-  }
-  volatile uint32_t* const reg = reinterpret_cast<volatile uint32_t*>(
-      lapic_base + kLapicRegTimerInitCountOffset);
-  *reg = init_count;
-  const volatile uint32_t* const id_reg =
-      reinterpret_cast<const volatile uint32_t*>(lapic_base +
-                                                 kLapicRegIdOffset);
-  (void)*id_reg;
+  SmpSetLocalApicTimerInitialCount(init_count);
 }
 
 static void ProgramLapicTimerOnCpuCallback(const int /*cpu_index*/,

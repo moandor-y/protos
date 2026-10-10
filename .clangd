@@ -17,8 +17,10 @@ CompileFlags:
     - -fcheck-new
     - -fno-rtti
     - -mno-red-zone
+    - -mgeneral-regs-only
     - -fno-stack-protector
     - -fno-pie
+    - -Ibuild/include
 
 ---
 If:

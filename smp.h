@@ -283,6 +283,11 @@ uintptr_t SmpLocalApicPhysAddr();
 // during `SmpInit`. Validates with `DCHECK` that `SmpInit` has completed.
 uint32_t SmpCalibratedTimerInitialCount();
 
+// Programs the calling CPU's Local APIC timer initial count register (`0x380`
+// in xAPIC MMIO mode or MSR `0x838` in x2APIC mode) to `initial_count` if
+// `initial_count > 0`.
+void SmpSetLocalApicTimerInitialCount(uint32_t initial_count);
+
 // Writes End-Of-Interrupt (`0`) to the Local APIC EOI register (`0x0B0`).
 void SmpSendLocalApicEoi();
 

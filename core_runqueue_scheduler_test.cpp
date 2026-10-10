@@ -429,6 +429,31 @@ TEST(CoreRunqueueSchedulerTest,
   }
   EXPECT_THAT(max_consecutive_migrated, t::Le(2));
 
+  // (c) High-to-low min_vruntime migration normalization: create a task on
+  //     high-min_vruntime CPU 0, steal it onto low-min_vruntime CPU 1 (where
+  //     min_vruntime == 0), then create `cpu1_peer` on CPU 1. Because
+  //     `StealTask(1, 0)` normalizes `from_high_cpu`'s `vruntime` to CPU 1's
+  //     `min_vruntime` (0), `from_high_cpu` (enqueued first on CPU 1) remains
+  //     at the head of CPU 1's runqueue ahead of `cpu1_peer` instead of being
+  //     stranded behind it with CPU 0's inflated `vruntime`.
+  ctx.migrate_trace.clear();
+  Task* const from_high_cpu = core->CreateTaskOnCpu(MigratedFloorWorker,  //
+                                                    &ctx,                 //
+                                                    kDefaultTaskWeight,   //
+                                                    0);
+  EXPECT_TRUE(core->StealTask(1, 0));
+  Task* const cpu1_peer = core->CreateTaskOnCpu(LocalPeerFloorWorker,  //
+                                                &ctx,                  //
+                                                kDefaultTaskWeight,    //
+                                                1);
+  EXPECT_TRUE(core->StealTask(0, 1));
+  core->Join(from_high_cpu);
+  EXPECT_TRUE(core->StealTask(0, 1));
+  core->Join(cpu1_peer);
+  ASSERT_THAT(static_cast<int>(ctx.migrate_trace.size()), t::Eq(8));
+  EXPECT_THAT(ctx.migrate_trace[0], t::Eq(20));
+  EXPECT_THAT(ctx.migrate_trace[4], t::Eq(10));
+
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }

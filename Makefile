@@ -1,12 +1,14 @@
 AS := as
 CXX := g++
 LD := ld
+BUILD_DIR := build
 
 ASFLAGS := --64
 CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra -Werror \
             -ffreestanding -nostdlib -fno-builtin \
             -fno-exceptions -fcheck-new -fno-rtti -mno-red-zone \
-            -fno-stack-protector -fno-pie
+            -mgeneral-regs-only -fno-stack-protector -fno-pie \
+            -I$(BUILD_DIR)/include
 LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 --no-warn-rwx-segments -T linker.ld
 
 TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra -Werror -MMD -MP
@@ -56,8 +58,6 @@ TEST_EXTRA_SRCS_preemptive_scheduler_test := preemptive_scheduler.cpp
 TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) task.cpp idt.cpp
 TEST_EXTRA_SRCS_stress_test_test := stress_test.cpp $(TASK_LAYER_SRCS) task.cpp idt.cpp
 
-BUILD_DIR := build
-
 CXX_SRCS := \
     uart.cpp \
     vga.cpp \
@@ -92,6 +92,7 @@ CXX_HDRS := \
 
 CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
 OBJS := $(BUILD_DIR)/boot.o $(CXX_OBJS)
+FREESTANDING_CXX_CONFIG := $(BUILD_DIR)/include/bits/c++config.h
 
 DOCKER ?= docker
 DOCKER_IMAGE ?= x86-64-kernel-build
@@ -151,10 +152,14 @@ $(DOCKER_STAMP): Dockerfile | $(BUILD_DIR)
 	$(DOCKER_RUN) cp -r /usr/include/gmock /usr/include/gtest $(BUILD_DIR)/include/
 	touch $(DOCKER_STAMP)
 
+$(FREESTANDING_CXX_CONFIG): Makefile | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	printf '#ifndef PROTOS_BITS_CXXCONFIG_H_\n#define PROTOS_BITS_CXXCONFIG_H_\n#pragma GCC system_header\n#include_next <bits/c++config.h>\n#undef _GLIBCXX_HOSTED\n#define _GLIBCXX_HOSTED 1\n#endif\n' > $@
+
 $(BUILD_DIR)/boot.o: boot.S $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(AS) $(ASFLAGS) $< -o $@
 
-$(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(DOCKER_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(FREESTANDING_CXX_CONFIG) $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(DOCKER_DEPS) | $(BUILD_DIR)

@@ -1377,21 +1377,9 @@ constexpr int kStressTaskCount = 12;
 constexpr int kStressRounds = 32;
 constexpr int kStressChildSpawnInterval = 8;
 constexpr int kMaxPreemptCoordSpins = 200000000;
-constexpr int kLapicRegIdOffset = 0x020;
-constexpr int kLapicRegTimerInitCountOffset = 0x380;
 
 static void ProgramLocalApicTimerInitCount(const uint32_t init_count) {
-  const uintptr_t lapic_base = SmpLocalApicPhysAddr();
-  if (lapic_base == 0 || init_count == 0) {
-    return;
-  }
-  volatile uint32_t* const reg = reinterpret_cast<volatile uint32_t*>(
-      lapic_base + kLapicRegTimerInitCountOffset);
-  *reg = init_count;
-  const volatile uint32_t* const id_reg =
-      reinterpret_cast<const volatile uint32_t*>(lapic_base +
-                                                 kLapicRegIdOffset);
-  (void)*id_reg;
+  SmpSetLocalApicTimerInitialCount(init_count);
 }
 
 struct SchedulerTestContext {
@@ -1457,6 +1445,18 @@ static void MaybeBoostCurrentCpuTimer(SchedulerTestContext* const ctx) {
       ctx->timer_boosted_mask.fetch_or(bit, std::memory_order_acq_rel);
   if ((prev & bit) == 0 && ctx->stress_timer_count > 0) {
     ProgramLocalApicTimerInitCount(ctx->stress_timer_count);
+  }
+  internal::LocalRestoreInterrupts(saved_irq);
+}
+
+static void MaybeRestoreCurrentCpuTimer(SchedulerTestContext* const ctx) {
+  const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
+  const int cpu = CurrentCpuId();
+  const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
+  const uint32_t prev =
+      ctx->timer_restored_mask.fetch_or(bit, std::memory_order_acq_rel);
+  if ((prev & bit) == 0 && ctx->calibrated_timer_count > 0) {
+    ProgramLocalApicTimerInitCount(ctx->calibrated_timer_count);
   }
   internal::LocalRestoreInterrupts(saved_irq);
 }
@@ -1676,6 +1676,7 @@ static void SpinnerWorker(void* const raw_arg) {
     return;
   }
 
+  MaybeBoostCurrentCpuTimer(arg->ctx);
   const int idx = arg->spinner_index;
   const int cpu = CurrentCpuId();
   arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
@@ -1706,6 +1707,7 @@ static void SpinnerWorker(void* const raw_arg) {
     asm volatile("pause" : : : "memory");
   }
   arg->ctx->stop_spinners.store(true, std::memory_order_release);
+  MaybeRestoreCurrentCpuTimer(arg->ctx);
   arg->done.store(true, std::memory_order_release);
 }
 
@@ -1901,9 +1903,10 @@ static bool TestTaskSchedulerSmp() {
   for (int i = 0; i < cpu_count; ++i) {
     spinner_args[i].ctx = &ctx;
     spinner_args[i].spinner_index = i;
-    spinner_tasks[i] = scheduler->CreateTask(SpinnerWorker,     //
-                                             &spinner_args[i],  //
-                                             kDefaultTaskWeight);
+    spinner_tasks[i] = scheduler->CreateTaskOnCpu(SpinnerWorker,        //
+                                                  &spinner_args[i],     //
+                                                  kDefaultTaskWeight,   //
+                                                  i);
     if (spinner_tasks[i] == nullptr) {
       ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
       return false;
