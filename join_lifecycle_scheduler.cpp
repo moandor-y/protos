@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <new>
 #include <utility>
 #if !__STDC_HOSTED__
 #pragma GCC optimize("no-tree-loop-distribute-patterns")
@@ -11,12 +12,12 @@
 #endif
 
 #include "check.h"
+#include "heap.h"
+#include "rbtree.h"
 #include "spinlock.h"
 
 namespace protos {
 namespace {
-
-constexpr int kMaxJoinRecords = 1024;
 
 class JoinLifecycleTaskScheduler;
 
@@ -26,11 +27,25 @@ struct TaskJoinRecord {
   void* arg = nullptr;
   Task* task = nullptr;
   Task* joiner = nullptr;
-  bool ready = false;
   bool exited = false;
   bool joined = false;
-  bool in_use = false;
+  bool in_list = false;
+  bool in_tree = false;
+  RbNode tree_node{};
+  TaskJoinRecord* prev = nullptr;
+  TaskJoinRecord* next = nullptr;
 };
+
+struct TaskJoinRecordRbTraits {
+  static uintptr_t GetKey(const TaskJoinRecord& rec) {
+    return reinterpret_cast<uintptr_t>(rec.task);
+  }
+
+  static bool Less(const uintptr_t a, const uintptr_t b) { return a < b; }
+};
+
+using TaskJoinRecordTree =
+    RbTree<TaskJoinRecord, &TaskJoinRecord::tree_node, TaskJoinRecordRbTraits>;
 
 class JoinLifecycleTaskScheduler final : public TaskScheduler {
  public:
@@ -39,14 +54,10 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
     DCHECK(inner_ != nullptr);
   }
 
+  ~JoinLifecycleTaskScheduler() override { ClearAllRecords(); }
+
   void Init() override {
-    {
-      const IrqSpinLockGuard join_guard(join_lock_);
-      for (int i = 0; i < kMaxJoinRecords; ++i) {
-        join_records_[i] = {};
-      }
-      next_join_slot_ = 0;
-    }
+    ClearAllRecords();
     inner_->Init();
   }
 
@@ -54,23 +65,12 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
                    void* const arg,     //
                    const int64_t weight) override {
     DCHECK(entry != nullptr);
-    int slot = -1;
-    {
-      const IrqSpinLockGuard join_guard(join_lock_);
-      slot = AllocateJoinRecordLocked(entry, arg);
-    }
+    TaskJoinRecord* const rec = AllocateJoinRecord(entry, arg);
     Task* const task =
         inner_->CreateTask(&JoinLifecycleTaskScheduler::TaskEntryWrapper,  //
-                           &join_records_[slot],                           //
+                           rec,                                            //
                            weight);
-    const IrqSpinLockGuard join_guard(join_lock_);
-    if (task == nullptr) {
-      join_records_[slot] = {};
-      return nullptr;
-    }
-    join_records_[slot].task = task;
-    join_records_[slot].ready = true;
-    return task;
+    return FinalizeJoinRecord(rec, task);
   }
 
   Task* CreateTaskOnCpu(const TaskFn entry,    //
@@ -78,24 +78,13 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
                         const int64_t weight,  //
                         const int target_cpu) override {
     DCHECK(entry != nullptr);
-    int slot = -1;
-    {
-      const IrqSpinLockGuard join_guard(join_lock_);
-      slot = AllocateJoinRecordLocked(entry, arg);
-    }
+    TaskJoinRecord* const rec = AllocateJoinRecord(entry, arg);
     Task* const task = inner_->CreateTaskOnCpu(
         &JoinLifecycleTaskScheduler::TaskEntryWrapper,  //
-        &join_records_[slot],                           //
+        rec,                                            //
         weight,                                         //
         target_cpu);
-    const IrqSpinLockGuard join_guard(join_lock_);
-    if (task == nullptr) {
-      join_records_[slot] = {};
-      return nullptr;
-    }
-    join_records_[slot].task = task;
-    join_records_[slot].ready = true;
-    return task;
+    return FinalizeJoinRecord(rec, task);
   }
 
   void Yield() override { inner_->Yield(); }
@@ -108,19 +97,18 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
     IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
     DCHECK(top_slot == nullptr || *top_slot == nullptr);
 
-    int task_slot = -1;
+    TaskJoinRecord* rec = nullptr;
     {
       const IrqSpinLockGuard join_guard(join_lock_);
-      task_slot = FindJoinRecordLocked(task);
-      DCHECK(task_slot >= 0);
-      TaskJoinRecord& rec = join_records_[task_slot];
-      DCHECK(rec.in_use && rec.task == task);
-      DCHECK(!rec.joined);
-      DCHECK(rec.joiner == nullptr);
-      rec.joiner = self;
+      rec = task_tree_.Find(reinterpret_cast<uintptr_t>(task));
+      DCHECK(rec != nullptr);
+      DCHECK(rec->in_list && rec->in_tree && rec->task == task);
+      DCHECK(!rec->joined);
+      DCHECK(rec->joiner == nullptr);
+      rec->joiner = self;
     }
 
-    while (!IsTaskExited(task_slot, task)) {
+    while (!IsRecordExited(rec, task)) {
       inner_->Yield();
 #if __STDC_HOSTED__
       std::this_thread::yield();
@@ -131,40 +119,54 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
 
     {
       const IrqSpinLockGuard join_guard(join_lock_);
-      TaskJoinRecord& rec = join_records_[task_slot];
-      DCHECK(rec.in_use && rec.task == task);
-      DCHECK(rec.exited);
-      DCHECK(!rec.joined);
-      DCHECK(rec.joiner == self);
-      rec.joined = true;
-      rec.joiner = nullptr;
-      rec.task = nullptr;
-      rec.in_use = false;
+      DCHECK(rec->in_list && rec->in_tree && rec->task == task);
+      DCHECK(rec->exited);
+      DCHECK(!rec->joined);
+      DCHECK(rec->joiner == self);
+      rec->joined = true;
+      rec->joiner = nullptr;
+      EraseFromTreeLocked(rec);
+      UnlinkRecordLocked(rec);
     }
+    FreeJoinRecord(rec);
 
     inner_->Join(task);
   }
 
   int ReapZombies() override {
-    Task* to_free[kMaxJoinRecords];
+    TaskJoinRecord* reap_head = nullptr;
+    TaskJoinRecord* reap_tail = nullptr;
     int count = 0;
 
     {
       const IrqSpinLockGuard join_guard(join_lock_);
-      for (int i = 0; i < kMaxJoinRecords; ++i) {
-        TaskJoinRecord& rec = join_records_[i];
-        if (rec.in_use && rec.exited && !rec.joined && rec.joiner == nullptr &&
-            rec.task != nullptr) {
-          to_free[count++] = rec.task;
-          rec.joined = true;
-          rec.task = nullptr;
-          rec.in_use = false;
+      TaskJoinRecord* curr = records_head_;
+      while (curr != nullptr) {
+        TaskJoinRecord* const next = curr->next;
+        if (curr->exited && !curr->joined && curr->joiner == nullptr &&
+            curr->task != nullptr) {
+          curr->joined = true;
+          EraseFromTreeLocked(curr);
+          UnlinkRecordLocked(curr);
+          if (reap_tail != nullptr) {
+            reap_tail->next = curr;
+          } else {
+            reap_head = curr;
+          }
+          reap_tail = curr;
+          ++count;
         }
+        curr = next;
       }
     }
 
-    for (int i = 0; i < count; ++i) {
-      inner_->Join(to_free[i]);
+    TaskJoinRecord* curr = reap_head;
+    while (curr != nullptr) {
+      TaskJoinRecord* const next = curr->next;
+      Task* const task_to_join = curr->task;
+      FreeJoinRecord(curr);
+      inner_->Join(task_to_join);
+      curr = next;
     }
     return count;
   }
@@ -212,68 +214,120 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
   }
 
   void MarkRecordExited(TaskJoinRecord* const rec) {
-    for (;;) {
+    DCHECK(rec != nullptr);
+    const IrqSpinLockGuard join_guard(join_lock_);
+    DCHECK(rec->in_list);
+    DCHECK(!rec->exited);
+    rec->exited = true;
+  }
+
+  TaskJoinRecord* AllocateJoinRecord(const TaskFn entry, void* const arg) {
+    void* const raw = Kmalloc(sizeof(TaskJoinRecord));
+    CHECK(raw != nullptr);
+    TaskJoinRecord* const rec = new (raw) TaskJoinRecord();
+    rec->owner = this;
+    rec->entry = entry;
+    rec->arg = arg;
+    {
+      const IrqSpinLockGuard join_guard(join_lock_);
+      LinkRecordLocked(rec);
+    }
+    return rec;
+  }
+
+  Task* FinalizeJoinRecord(TaskJoinRecord* const rec, Task* const task) {
+    DCHECK(rec != nullptr);
+    if (task == nullptr) {
       {
         const IrqSpinLockGuard join_guard(join_lock_);
-        if (rec->ready) {
-          DCHECK(rec->in_use && rec->task != nullptr);
-          rec->exited = true;
-          return;
-        }
+        UnlinkRecordLocked(rec);
       }
-#if __STDC_HOSTED__
-      std::this_thread::yield();
-#else
-      asm volatile("pause" : : : "memory");
-#endif
+      FreeJoinRecord(rec);
+      return nullptr;
     }
-  }
-
-  int FindJoinRecordLocked(const Task* const task) const {
-    for (int i = 0; i < kMaxJoinRecords; ++i) {
-      if (join_records_[i].in_use && join_records_[i].ready &&
-          join_records_[i].task == task) {
-        return i;
-      }
-    }
-    return -1;
-  }
-
-  int AllocateJoinRecordLocked(const TaskFn entry, void* const arg) {
-    int free_slot = -1;
-    for (int i = 0; i < kMaxJoinRecords; ++i) {
-      const int idx = (next_join_slot_ + i) % kMaxJoinRecords;
-      if (!join_records_[idx].in_use) {
-        free_slot = idx;
-        break;
-      }
-    }
-    CHECK(free_slot >= 0);
-    next_join_slot_ = (free_slot + 1) % kMaxJoinRecords;
-    TaskJoinRecord& rec = join_records_[free_slot];
-    rec.owner = this;
-    rec.entry = entry;
-    rec.arg = arg;
-    rec.task = nullptr;
-    rec.joiner = nullptr;
-    rec.ready = false;
-    rec.exited = false;
-    rec.joined = false;
-    rec.in_use = true;
-    return free_slot;
-  }
-
-  bool IsTaskExited(const int slot, const Task* const task) {
     const IrqSpinLockGuard join_guard(join_lock_);
-    const TaskJoinRecord& rec = join_records_[slot];
-    DCHECK(rec.in_use && rec.task == task);
-    return rec.exited;
+    DCHECK(rec->in_list);
+    rec->task = task;
+    const bool inserted = task_tree_.Insert(rec);
+    DCHECK(inserted);
+    rec->in_tree = true;
+    return task;
+  }
+
+  static void FreeJoinRecord(TaskJoinRecord* const rec) {
+    DCHECK(rec != nullptr);
+    rec->~TaskJoinRecord();
+    Kfree(rec);
+  }
+
+  void LinkRecordLocked(TaskJoinRecord* const rec) {
+    DCHECK(rec != nullptr);
+    DCHECK(!rec->in_list);
+    rec->prev = records_tail_;
+    rec->next = nullptr;
+    if (records_tail_ != nullptr) {
+      records_tail_->next = rec;
+    } else {
+      records_head_ = rec;
+    }
+    records_tail_ = rec;
+    rec->in_list = true;
+  }
+
+  void UnlinkRecordLocked(TaskJoinRecord* const rec) {
+    DCHECK(rec != nullptr);
+    DCHECK(rec->in_list);
+    if (rec->prev != nullptr) {
+      rec->prev->next = rec->next;
+    } else {
+      records_head_ = rec->next;
+    }
+    if (rec->next != nullptr) {
+      rec->next->prev = rec->prev;
+    } else {
+      records_tail_ = rec->prev;
+    }
+    rec->prev = nullptr;
+    rec->next = nullptr;
+    rec->in_list = false;
+  }
+
+  void EraseFromTreeLocked(TaskJoinRecord* const rec) {
+    DCHECK(rec != nullptr);
+    if (rec->in_tree) {
+      task_tree_.Erase(rec);
+      rec->in_tree = false;
+    }
+  }
+
+  void ClearAllRecords() {
+    TaskJoinRecord* head = nullptr;
+    {
+      const IrqSpinLockGuard join_guard(join_lock_);
+      head = records_head_;
+      records_head_ = nullptr;
+      records_tail_ = nullptr;
+      task_tree_.Clear();
+    }
+    while (head != nullptr) {
+      TaskJoinRecord* const next = head->next;
+      FreeJoinRecord(head);
+      head = next;
+    }
+  }
+
+  bool IsRecordExited(const TaskJoinRecord* const rec, const Task* const task) {
+    const IrqSpinLockGuard join_guard(join_lock_);
+    DCHECK(rec != nullptr);
+    DCHECK(rec->in_list && rec->task == task);
+    return rec->exited;
   }
 
   const std::shared_ptr<TaskScheduler> inner_;
   IrqSpinLock join_lock_;
-  TaskJoinRecord join_records_[kMaxJoinRecords] = {};
-  int next_join_slot_ = 0;
+  TaskJoinRecordTree task_tree_;
+  TaskJoinRecord* records_head_ = nullptr;
+  TaskJoinRecord* records_tail_ = nullptr;
 };
 
 }  // namespace

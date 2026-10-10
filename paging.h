@@ -26,6 +26,11 @@ bool PagingMapBootstrapRange(uintptr_t phys_addr, int64_t size);
 // Returns true if the entire `[0, max_physical_addr)` range is mapped.
 bool PagingExtendIdentityMap(uintptr_t max_physical_addr);
 
+// Marks the single 4 KiB identity-mapped physical page containing `phys_addr`
+// as uncacheable (`PWT | PCD`), splitting the enclosing 2 MiB huge-page PD
+// entry into 512 4 KiB PT entries if necessary.
+bool PagingMarkPageUncacheable(uintptr_t phys_addr);
+
 // Walks the active CR3 page tables and returns true if `addr` is mapped as an
 // identity-mapped (`virtual == physical`) writable page.
 bool PagingIsIdentityMapped(uintptr_t addr);

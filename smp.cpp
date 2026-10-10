@@ -65,6 +65,7 @@ constexpr uint32_t kMadtLapicFlagOnlineCapable = 1u << 1;
 constexpr uint32_t kMadtLapicUsableMask =
     kMadtLapicFlagEnabled | kMadtLapicFlagOnlineCapable;
 constexpr int kMaxPitReloadCount = 0xFFFF;
+constexpr uint8_t kPitSpeakerOut2Bit = 1u << 5;
 
 #if !__STDC_HOSTED__
 constexpr uint32_t kMsrIa32ApicBase = 0x0000001B;
@@ -72,11 +73,6 @@ constexpr uint32_t kMsrIa32Efer = 0xC0000080;
 constexpr uint64_t kApicBaseGlobalEnable = 1ULL << 11;
 constexpr uint64_t kEferLongModeActive = 1ULL << 10;
 constexpr uint64_t kKernelCodeSelector = 0x08;
-
-constexpr uint64_t kPtePresent = 1ULL << 0;
-constexpr uint64_t kPteWriteThrough = 1ULL << 3;
-constexpr uint64_t kPteCacheDisable = 1ULL << 4;
-constexpr uint64_t kPteAddressMask = 0x000FFFFFFFFFF000ULL;
 
 constexpr int kLapicRegId = 0x020;
 constexpr int kLapicRegTpr = 0x080;
@@ -109,8 +105,6 @@ constexpr uint16_t kPitSpeakerPort = 0x61;
 constexpr uint8_t kPitCmdChannel2Mode0 = 0xB0;
 constexpr uint8_t kPitSpeakerGate2Bit = 1u << 0;
 constexpr uint8_t kPitSpeakerEnableMask = 0x03u;
-constexpr uint8_t kPitSpeakerOut2Bit = 1u << 5;
-constexpr int kPitCalibrationPollLimit = 50000000;
 
 constexpr int64_t kMaxTrampolineBytes = 512;
 constexpr int kIcrIdlePollLimit = 1000000;
@@ -665,6 +659,7 @@ static void InitCpuLocalSlot(const int cpu_index,         //
   slot.online = online;
   slot.stack_base = stack_base;
   slot.stack_top = stack_top;
+  slot.top_held_lock = nullptr;
   slot.timer_ticks.store(0, std::memory_order_relaxed);
   slot.ipi_count.store(0, std::memory_order_relaxed);
 }
@@ -731,33 +726,10 @@ static uintptr_t ReadCr3() {
   return cr3;
 }
 
-static void WriteCr3(const uintptr_t cr3_phys) {
-  const uint64_t value = cr3_phys;
-  asm volatile("mov cr3, %0" : : "r"(value) : "memory");
-}
-
 static void MarkMmioPageUncacheable(const uintptr_t phys_addr) {
   DCHECK(phys_addr != 0);
   DCHECK(phys_addr < kMaxCanonicalIdentityAddress);
-  const uintptr_t pml4_phys = ReadCr3() & kPteAddressMask;
-  DCHECK(pml4_phys != 0);
-  const int pml4_idx = (phys_addr >> 39) & 0x1FF;
-  const int pdpt_idx = (phys_addr >> 30) & 0x1FF;
-  const int pd_idx = (phys_addr >> 21) & 0x1FF;
-
-  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(pml4_phys);
-  DCHECK((pml4[pml4_idx] & kPtePresent) != 0);
-  uint64_t* const pdpt =
-      reinterpret_cast<uint64_t*>(pml4[pml4_idx] & kPteAddressMask);
-  DCHECK((pdpt[pdpt_idx] & kPtePresent) != 0);
-  uint64_t* const pd =
-      reinterpret_cast<uint64_t*>(pdpt[pdpt_idx] & kPteAddressMask);
-  DCHECK((pd[pd_idx] & kPtePresent) != 0);
-  constexpr uint64_t kUcFlags = kPteWriteThrough | kPteCacheDisable;
-  if ((pd[pd_idx] & kUcFlags) != kUcFlags) {
-    pd[pd_idx] |= kUcFlags;
-    WriteCr3(pml4_phys);
-  }
+  CHECK(PagingMarkPageUncacheable(phys_addr));
 }
 
 static uint16_t ReadCs() {
@@ -829,6 +801,12 @@ static bool WaitForIcrIdle(const uintptr_t lapic_base) {
   return (LapicRead(lapic_base, kLapicRegIcrLow) & kIcrDeliveryPending) == 0;
 }
 
+static uint8_t ReadPitSpeakerPort() { return Inb(kPitSpeakerPort); }
+
+static uint32_t ReadLapicTimerCurrentCount(const uintptr_t lapic_base) {
+  return LapicRead(lapic_base, kLapicRegTimerCurrCount);
+}
+
 static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
   DCHECK(lapic_base != 0);
   LapicWrite(lapic_base, kLapicRegTimerDivConfig, kLapicTimerDivBy16);
@@ -852,25 +830,14 @@ static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
        static_cast<uint8_t>(gate_disabled | kPitSpeakerGate2Bit));
   LapicWrite(lapic_base, kLapicRegTimerInitCount, 0xFFFFFFFFu);
 
-  bool terminal_count_reached = false;
-  for (int poll = 0; poll < kPitCalibrationPollLimit; ++poll) {
-    if ((Inb(kPitSpeakerPort) & kPitSpeakerOut2Bit) != 0) {
-      terminal_count_reached = true;
-      break;
-    }
-    asm volatile("pause" : : : "memory");
-  }
+  const uint32_t initial_count =
+      CalibrateApicTimerCount(lapic_base,                //
+                              kPitCalibrationPollLimit,  //
+                              ReadPitSpeakerPort,        //
+                              ReadLapicTimerCurrentCount);
 
-  const uint32_t current_count = LapicRead(lapic_base, kLapicRegTimerCurrCount);
   LapicWrite(lapic_base, kLapicRegTimerInitCount, 0);
   Outb(kPitSpeakerPort, gate_disabled);
-  CHECK(terminal_count_reached);
-
-  const uint64_t elapsed_ticks = 0xFFFFFFFFULL - current_count;
-  const uint32_t initial_count =
-      ComputeApicTimerInitialCount(elapsed_ticks,               //
-                                   kPitCalibrationReloadCount,  //
-                                   kApicTimerTargetHz);
   CHECK(initial_count > 0);
   return initial_count;
 }
@@ -1492,6 +1459,37 @@ uint32_t ComputeApicTimerInitialCount(const uint64_t elapsed_apic_ticks,  //
     return 0xFFFFFFFFu;
   }
   return static_cast<uint32_t>(ticks_per_period);
+}
+
+uint32_t CalibrateApicTimerCount(
+    const uintptr_t lapic_base,               //
+    const int max_polls,                      //
+    const PitSpeakerReadFn read_pit_speaker,  //
+    const ApicTimerCurrentCountReadFn read_apic_current_count) {
+  DCHECK(max_polls > 0);
+  DCHECK(read_pit_speaker != nullptr);
+  DCHECK(read_apic_current_count != nullptr);
+
+  bool terminal_count_reached = false;
+  for (int poll = 0; poll < max_polls; ++poll) {
+    if ((read_pit_speaker() & kPitSpeakerOut2Bit) != 0) {
+      terminal_count_reached = true;
+      break;
+    }
+    asm volatile("pause" : : : "memory");
+  }
+
+  const uint32_t current_count = read_apic_current_count(lapic_base);
+  if (!terminal_count_reached) {
+    return kFallbackApicTimerInitialCount;
+  }
+
+  const uint64_t elapsed_ticks = 0xFFFFFFFFULL - current_count;
+  const uint32_t initial_count =
+      ComputeApicTimerInitialCount(elapsed_ticks,               //
+                                   kPitCalibrationReloadCount,  //
+                                   kApicTimerTargetHz);
+  return (initial_count > 0) ? initial_count : kFallbackApicTimerInitialCount;
 }
 
 void SmpInit(const uint32_t multiboot_magic,

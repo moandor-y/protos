@@ -21,6 +21,7 @@ int g_cursor_row = 0;
 int g_cursor_col = 0;
 char g_text_shadow[kVgaHeight][kVgaWidth];
 
+bool g_fb_active = false;
 uintptr_t g_fb_addr = 0;
 int g_fb_pitch = 0;
 int g_fb_width = 0;
@@ -131,7 +132,7 @@ constexpr uint64_t kAsciiFont8x8[95] = {
 static void RenderCellToFramebuffer(const int row,  //
                                     const int col,  //
                                     const char ch) {
-  if (g_fb_addr == 0 || (g_fb_bpp != 32 && g_fb_bpp != 24)) {
+  if (!g_fb_active || g_fb_addr == 0 || (g_fb_bpp != 32 && g_fb_bpp != 24)) {
     return;
   }
   const int base_x = col * kGlyphWidth;
@@ -167,14 +168,23 @@ static void RenderCellToFramebuffer(const int row,  //
   }
 }
 
+static void UpdateCursor() {
+  if (g_fb_active) {
+    return;
+  }
+}
+
 static void WriteCell(const int row, const int col, const char ch) {
   g_text_shadow[row][col] = ch;
+  if (g_fb_active) {
+    RenderCellToFramebuffer(row, col, ch);
+    return;
+  }
   volatile uint16_t* const vga =
       reinterpret_cast<volatile uint16_t*>(kVgaBufferAddress);
   vga[row * kVgaWidth + col] =
       (static_cast<uint16_t>(kVgaColorWhiteOnBlack) << 8) |
       static_cast<uint8_t>(ch);
-  RenderCellToFramebuffer(row, col, ch);
 }
 
 static void ScrollUpOneRow() {
@@ -197,6 +207,7 @@ static void VgaPutcLocked(const char ch) {
   }
   if (ch == '\r') {
     g_cursor_col = 0;
+    UpdateCursor();
     return;
   }
   if (ch == '\n') {
@@ -206,6 +217,7 @@ static void VgaPutcLocked(const char ch) {
       ScrollUpOneRow();
       g_cursor_row = kVgaHeight - 1;
     }
+    UpdateCursor();
     return;
   }
   WriteCell(g_cursor_row, g_cursor_col, ch);
@@ -218,6 +230,7 @@ static void VgaPutcLocked(const char ch) {
       g_cursor_row = kVgaHeight - 1;
     }
   }
+  UpdateCursor();
 }
 
 static void VgaWriteLocked(const char* const str) {
@@ -259,6 +272,7 @@ void VgaClear() {
       WriteCell(r, c, ' ');
     }
   }
+  UpdateCursor();
 }
 
 void VgaPutc(const char ch) {
@@ -302,11 +316,11 @@ void VgaPanicWrite(const char* const str) { VgaWriteLocked(str); }
 
 void VgaPanicWriteDec(const uint64_t value) { VgaWriteDecLocked(value); }
 
-void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
-                          const int pitch,               //
-                          const int width,               //
-                          const int height,              //
-                          const int bpp) {
+void VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
+                        const int pitch,               //
+                        const int width,               //
+                        const int height,              //
+                        const int bpp) {
   const IrqSpinLockGuard lock_guard(g_vga_lock);
   if (fb_phys_addr == 0 || pitch <= 0 || width < kVgaWidth * kGlyphWidth ||
       height < kVgaHeight * kGlyphHeight || (bpp != 32 && bpp != 24)) {
@@ -321,6 +335,7 @@ void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
   g_fb_width = width;
   g_fb_height = height;
   g_fb_bpp = bpp;
+  g_fb_active = true;
 
   for (int r = 0; r < kVgaHeight; ++r) {
     for (int c = 0; c < kVgaWidth; ++c) {
@@ -328,6 +343,14 @@ void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
       RenderCellToFramebuffer(r, c, ch);
     }
   }
+}
+
+void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
+                          const int pitch,               //
+                          const int width,               //
+                          const int height,              //
+                          const int bpp) {
+  VgaInitFramebuffer(fb_phys_addr, pitch, width, height, bpp);
 }
 
 }  // namespace protos

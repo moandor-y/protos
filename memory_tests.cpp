@@ -637,12 +637,18 @@ static bool TestRbTreeEdgeCases() {
 
   const auto& const_tree = tree;
   bool saw_foreign_address = false;
-  const KernelRbAugNode* const match16 =
-      const_tree.FindFirstAugmented([&](const KernelRbAugNode& node) {
+  const KernelRbAugNode* const match16 = const_tree.FindFirstAugmented(
+      [&](const KernelRbAugNode& node) {
         if (&node != &group.n0 && &node != &group.n1 && &node != &group.n2) {
           saw_foreign_address = true;
         }
         return node.max_subtree_span >= 12;
+      },
+      [&](const KernelRbAugNode& node) {
+        if (&node != &group.n0 && &node != &group.n1 && &node != &group.n2) {
+          saw_foreign_address = true;
+        }
+        return node.span >= 12;
       });
   if (saw_foreign_address || match16 != &group.n2) {
     return false;
@@ -653,12 +659,19 @@ static bool TestRbTreeEdgeCases() {
   tree.Erase(group.n1);
   tree.Erase(group.n1);
   const KernelRbAugNode* const match_after_erase =
-      const_tree.FindFirstAugmented([&](const KernelRbAugNode& node) {
-        if (&node != &group.n0 && &node != &group.n2) {
-          saw_foreign_address = true;
-        }
-        return node.max_subtree_span >= 12;
-      });
+      const_tree.FindFirstAugmented(
+          [&](const KernelRbAugNode& node) {
+            if (&node != &group.n0 && &node != &group.n2) {
+              saw_foreign_address = true;
+            }
+            return node.max_subtree_span >= 12;
+          },
+          [&](const KernelRbAugNode& node) {
+            if (&node != &group.n0 && &node != &group.n2) {
+              saw_foreign_address = true;
+            }
+            return node.span >= 12;
+          });
   if (saw_foreign_address || match_after_erase != &group.n2) {
     return false;
   }
@@ -787,9 +800,12 @@ static bool TestEdgeCasesAndOom() {
 static bool TestSmpDiscoveryAndApBringup() {
   const int cpu_count = SmpCpuCount();
   const int online_count = SmpOnlineCpuCount();
-  if (cpu_count < 1 || online_count != cpu_count ||
-      SmpLocalApicPhysAddr() == 0 ||
-      !PagingIsIdentityMapped(SmpLocalApicPhysAddr())) {
+  const uintptr_t lapic_phys = SmpLocalApicPhysAddr();
+  const uintptr_t lapic_neighbor_phys =
+      (lapic_phys & ~(static_cast<uintptr_t>(kHugePageSize) - 1)) + kPageSize;
+  if (cpu_count < 1 || online_count != cpu_count || lapic_phys == 0 ||
+      !PagingIsIdentityMapped(lapic_phys) ||
+      !PagingIsIdentityMapped(lapic_neighbor_phys)) {
     return false;
   }
 

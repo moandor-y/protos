@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "pmm.h"
+#include "spinlock.h"
 
 namespace protos {
 
@@ -10,11 +11,15 @@ namespace {
 
 constexpr int kEntriesPerPageTable = 512;
 constexpr int kMaxBootstrapPageTables = 16;
-constexpr uint64_t kPtePresent = 1 << 0;
-constexpr uint64_t kPteWritable = 1 << 1;
-constexpr uint64_t kPteHugePage = 1 << 7;
-constexpr uint64_t kPteAddressMask = 0x000FFFFFFFFFF000;
-constexpr uint64_t kHugePageAddressMask = 0x000FFFFFFFE00000;
+constexpr uint64_t kPtePresent = 1ULL << 0;
+constexpr uint64_t kPteWritable = 1ULL << 1;
+constexpr uint64_t kPteWriteThrough = 1ULL << 3;
+constexpr uint64_t kPteCacheDisable = 1ULL << 4;
+constexpr uint64_t kPteHugePage = 1ULL << 7;
+constexpr uint64_t kPteAddressMask = 0x000FFFFFFFFFF000ULL;
+constexpr uint64_t kHugePageAddressMask = 0x000FFFFFFFE00000ULL;
+
+IrqSpinLock g_paging_lock;
 
 // Static fallback pool of 4 KiB-aligned page tables in `.bss` used when
 // mapping high-memory bootloader structures (e.g., UEFI Multiboot2 info,
@@ -65,9 +70,9 @@ static uintptr_t AllocZeroedPageTable(const bool use_pmm) {
   return frame_phys;
 }
 
-static bool MapHugePageRange(const uintptr_t phys_addr,  //
-                             const int64_t size,         //
-                             const bool use_pmm) {
+static bool MapHugePageRangeLocked(const uintptr_t phys_addr,  //
+                                   const int64_t size,         //
+                                   const bool use_pmm) {
   if (size <= 0) {
     return size == 0;
   }
@@ -133,17 +138,19 @@ static bool MapHugePageRange(const uintptr_t phys_addr,  //
 }  // namespace
 
 bool PagingMapBootstrapRange(const uintptr_t phys_addr, const int64_t size) {
-  return MapHugePageRange(phys_addr, size, false);
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  return MapHugePageRangeLocked(phys_addr, size, false);
 }
 
 bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
   if (max_physical_addr == 0 ||
       max_physical_addr > kMaxCanonicalIdentityAddress - kHugePageSize) {
     return false;
   }
 
   const uintptr_t target_end = AlignUp(max_physical_addr, kHugePageSize);
-  if (!MapHugePageRange(0, target_end, true)) {
+  if (!MapHugePageRangeLocked(0, target_end, true)) {
     return false;
   }
   if (target_end > g_identity_mapped_limit) {
@@ -152,7 +159,68 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
   return true;
 }
 
+bool PagingMarkPageUncacheable(const uintptr_t phys_addr) {
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  if (phys_addr == 0 || phys_addr >= kMaxCanonicalIdentityAddress) {
+    return false;
+  }
+  const uintptr_t pml4_phys = ReadCr3();
+  if (pml4_phys == 0) {
+    return false;
+  }
+
+  const int pml4_idx = (phys_addr >> 39) & 0x1FF;
+  const int pdpt_idx = (phys_addr >> 30) & 0x1FF;
+  const int pd_idx = (phys_addr >> 21) & 0x1FF;
+  const int pt_idx = (phys_addr >> 12) & 0x1FF;
+
+  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(pml4_phys);
+  if ((pml4[pml4_idx] & kPtePresent) == 0) {
+    return false;
+  }
+  uint64_t* const pdpt =
+      reinterpret_cast<uint64_t*>(pml4[pml4_idx] & kPteAddressMask);
+  if ((pdpt[pdpt_idx] & kPtePresent) == 0) {
+    return false;
+  }
+  uint64_t* const pd =
+      reinterpret_cast<uint64_t*>(pdpt[pdpt_idx] & kPteAddressMask);
+  const uint64_t pde = pd[pd_idx];
+  if ((pde & kPtePresent) == 0) {
+    return false;
+  }
+
+  constexpr uint64_t kUcFlags = kPteWriteThrough | kPteCacheDisable;
+  if ((pde & kPteHugePage) != 0) {
+    const uintptr_t pt_phys = AllocZeroedPageTable(true);
+    if (pt_phys == 0) {
+      return false;
+    }
+    uint64_t* const pt = reinterpret_cast<uint64_t*>(pt_phys);
+    const uintptr_t huge_base = pde & kHugePageAddressMask;
+    const uint64_t base_flags = pde & (kPtePresent | kPteWritable | kUcFlags);
+    for (int i = 0; i < kEntriesPerPageTable; ++i) {
+      pt[i] = (huge_base + static_cast<uintptr_t>(i) * kPageSize) | base_flags;
+    }
+    pt[pt_idx] |= kUcFlags;
+    pd[pd_idx] = pt_phys | kPtePresent | kPteWritable;
+    WriteCr3(pml4_phys);
+    return true;
+  }
+
+  uint64_t* const pt = reinterpret_cast<uint64_t*>(pde & kPteAddressMask);
+  if ((pt[pt_idx] & kPtePresent) == 0) {
+    return false;
+  }
+  if ((pt[pt_idx] & kUcFlags) != kUcFlags) {
+    pt[pt_idx] |= kUcFlags;
+    WriteCr3(pml4_phys);
+  }
+  return true;
+}
+
 bool PagingIsIdentityMapped(const uintptr_t addr) {
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
   // Reject non-canonical lower-half addresses beyond the 48-bit identity limit.
   if (addr >= kMaxCanonicalIdentityAddress) {
     return false;
@@ -186,26 +254,40 @@ bool PagingIsIdentityMapped(const uintptr_t addr) {
   }
 
   // Follow the PDPT entry to the Page Directory (PD) and verify that the PD
-  // entry is a present, writable 2 MiB huge page (PS=1).
+  // entry is present and writable.
   const uint64_t* const pd =
       reinterpret_cast<const uint64_t*>(pdpte & kPteAddressMask);
   const uint64_t pde = pd[pd_idx];
-  {
-    constexpr uint64_t kRequiredFlags =
-        kPtePresent | kPteWritable | kPteHugePage;
-    if ((pde & kRequiredFlags) != kRequiredFlags) {
-      return false;
-    }
+  if ((pde & (kPtePresent | kPteWritable)) != (kPtePresent | kPteWritable)) {
+    return false;
   }
 
-  // Confirm identity mapping by checking that the physical 2 MiB huge-page
-  // base address encoded in the PD entry matches the 2 MiB-aligned virtual
-  // address.
-  const uintptr_t mapped_base = pde & kHugePageAddressMask;
-  const uintptr_t expected_base = addr & ~(kHugePageSize - 1);
-  return mapped_base == expected_base;
+  if ((pde & kPteHugePage) != 0) {
+    // Confirm identity mapping by checking that the physical 2 MiB huge-page
+    // base address encoded in the PD entry matches the 2 MiB-aligned virtual
+    // address.
+    const uintptr_t mapped_base = pde & kHugePageAddressMask;
+    const uintptr_t expected_base = addr & ~(kHugePageSize - 1);
+    return mapped_base == expected_base;
+  }
+
+  // 4 KiB page table (`PS == 0`): walk the PT entry for `addr`.
+  const int pt_idx = (addr >> 12) & 0x1FF;
+  const uint64_t* const pt =
+      reinterpret_cast<const uint64_t*>(pde & kPteAddressMask);
+  const uint64_t pte = pt[pt_idx];
+  if ((pte & (kPtePresent | kPteWritable)) != (kPtePresent | kPteWritable)) {
+    return false;
+  }
+  const uintptr_t mapped_page = pte & kPteAddressMask;
+  const uintptr_t expected_page =
+      addr & ~(static_cast<uintptr_t>(kPageSize) - 1);
+  return mapped_page == expected_page;
 }
 
-uintptr_t PagingIdentityMappedLimit() { return g_identity_mapped_limit; }
+uintptr_t PagingIdentityMappedLimit() {
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  return g_identity_mapped_limit;
+}
 
 }  // namespace protos

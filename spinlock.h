@@ -8,6 +8,7 @@
 #endif
 
 #include "check.h"
+#include "smp.h"
 
 namespace protos {
 
@@ -18,16 +19,7 @@ namespace internal {
 constexpr uint64_t kRflagsInterruptEnableBit = 1ULL << 9;
 
 #if !__STDC_HOSTED__
-inline IrqSpinLock* g_per_cpu_top_lock[256] = {};
-
-inline uint8_t CurrentCpuApicId() {
-  uint32_t eax = 1;
-  uint32_t ebx = 0;
-  uint32_t ecx = 0;
-  uint32_t edx = 0;
-  asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : : "cc");
-  return static_cast<uint8_t>((ebx >> 24) & 0xFFu);
-}
+inline IrqSpinLock* g_bootstrap_top_lock = nullptr;
 
 inline bool LocalAreInterruptsEnabled() {
   uint64_t rflags = 0;
@@ -59,11 +51,19 @@ inline void LocalRestoreInterrupts(const bool previously_enabled) {
 }
 
 inline uintptr_t CurrentOwnerId() {
-  return static_cast<uintptr_t>(CurrentCpuApicId()) + 1u;
+  const CpuLocal* const cpu = CurrentCpuOrNull();
+  if (cpu != nullptr) {
+    return static_cast<uintptr_t>(cpu->cpu_id) + 1u;
+  }
+  return 1u;
 }
 
 inline IrqSpinLock** TopHeldLockSlot() {
-  return &g_per_cpu_top_lock[CurrentCpuApicId()];
+  CpuLocal* const cpu = CurrentCpuOrNull();
+  if (cpu != nullptr) {
+    return &cpu->top_held_lock;
+  }
+  return &g_bootstrap_top_lock;
 }
 #else
 [[gnu::noinline]] inline bool* HostInterruptEnabledSlot() {
@@ -92,12 +92,20 @@ inline void LocalRestoreInterrupts(const bool previously_enabled) {
 }
 
 [[gnu::noinline]] inline uintptr_t CurrentOwnerId() {
+  const CpuLocal* const cpu = CurrentCpuOrNull();
+  if (cpu != nullptr) {
+    return static_cast<uintptr_t>(cpu->cpu_id) + 1u;
+  }
   thread_local uint8_t thread_token = 0;
   asm volatile("" : "+m"(thread_token));
   return reinterpret_cast<uintptr_t>(&thread_token);
 }
 
 [[gnu::noinline]] inline IrqSpinLock** TopHeldLockSlot() {
+  CpuLocal* const cpu = CurrentCpuOrNull();
+  if (cpu != nullptr) {
+    return &cpu->top_held_lock;
+  }
   thread_local IrqSpinLock* top_lock = nullptr;
   asm volatile("" : "+m"(top_lock));
   return &top_lock;

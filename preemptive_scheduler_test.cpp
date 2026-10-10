@@ -11,111 +11,12 @@
 #include <thread>
 #include <vector>
 
-#include "idt.h"
-#include "smp.h"
-#include "spinlock.h"
-#include "task.h"
-#include "uart.h"
-#include "vga.h"
+#include "scheduler_test_support.h"
 
 namespace protos {
 namespace {
 
 namespace t = ::testing;
-
-constexpr uintptr_t kFakeStackBase = 0x200000;
-
-struct FakePreemptEnv {
-  int cpu_count = 1;
-  std::unique_ptr<CpuLocal[]> cpu_locals;
-  std::string uart_panic_log;
-  std::string vga_panic_log;
-};
-
-FakePreemptEnv g_env;
-
-static void SetupEnv(const int num_cpus) {
-  CHECK(num_cpus >= 1);
-  ResetCpuLocalForTest();
-  SetInterruptsEnabledForTest(true);
-
-  g_env.cpu_count = num_cpus;
-  g_env.uart_panic_log.clear();
-  g_env.vga_panic_log.clear();
-
-  g_env.cpu_locals.reset(new CpuLocal[num_cpus]());
-
-  for (int i = 0; i < num_cpus; ++i) {
-    const uintptr_t stack_base =
-        kFakeStackBase + static_cast<uintptr_t>(i) * kTaskStackSize;
-    const uintptr_t stack_top = stack_base + kTaskStackSize;
-
-    CpuLocal& local = g_env.cpu_locals[i];
-    local.self = &local;
-    local.cpu_id = i;
-    local.apic_id = static_cast<uint8_t>(i);
-    local.online = true;
-    local.stack_base = stack_base;
-    local.stack_top = stack_top;
-  }
-
-  BindCpuLocal(&g_env.cpu_locals[0]);
-}
-
-static void NoopTask(void* const /*arg*/) {}
-
-class MockTaskScheduler : public TaskScheduler {
- public:
-  MOCK_METHOD(void, Init, (), (override));
-  MOCK_METHOD(Task*, CreateTask, (TaskFn, void*, int64_t), (override));
-  MOCK_METHOD(Task*, CreateTaskOnCpu, (TaskFn, void*, int64_t, int),
-              (override));
-  MOCK_METHOD(void, Yield, (), (override));
-  MOCK_METHOD(void, Join, (Task*), (override));
-  MOCK_METHOD(int, ReapZombies, (), (override));
-  MOCK_METHOD(bool, PollIdleCpu, (int), (override));
-  MOCK_METHOD(int, RunqueueLoad, (int), (const, override));
-  MOCK_METHOD(bool, StealTask, (int, int), (override));
-  MOCK_METHOD(void, SetPreemptEnabled, (bool), (override));
-  MOCK_METHOD(bool, IsPreemptEnabled, (), (const, override));
-  MOCK_METHOD(void, OnTimerInterrupt, (InterruptFrame*), (override));
-  MOCK_METHOD(void, OnWakeupIpi, (InterruptFrame*), (override));
-  MOCK_METHOD(Task*, CurrentTask, (), (const, override));
-};
-
-}  // namespace
-
-void UartPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    g_env.uart_panic_log.append(str);
-  }
-}
-
-void UartPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_env.uart_panic_log.append(buf);
-}
-
-void VgaPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    g_env.vga_panic_log.append(str);
-  }
-}
-
-void VgaPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_env.vga_panic_log.append(buf);
-}
-
-namespace {
 
 TEST(PreemptiveSchedulerTest,
      DefaultPreemptStateTogglingAndInitResetsToEnabled) {

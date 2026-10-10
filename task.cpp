@@ -15,7 +15,7 @@
 namespace protos {
 namespace {
 
-// Single global variable across all task scheduler implementation files.
+// Active composed task scheduler instance initialized by `TaskInit()`.
 std::shared_ptr<TaskScheduler> g_task_scheduler;
 
 static void ApicTimerInterruptHandler(InterruptFrame* const frame) {

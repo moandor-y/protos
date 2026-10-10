@@ -11,129 +11,13 @@
 #include <utility>
 #include <vector>
 
-#include "check.h"
-#include "idt.h"
-#include "smp.h"
-#include "task.h"
-#include "uart.h"
-#include "vga.h"
+#include "core_runqueue_scheduler.h"
+#include "scheduler_test_support.h"
 
 namespace protos {
 namespace {
 
 namespace t = ::testing;
-
-struct FakeSmpEnv {
-  int cpu_count = 1;
-  std::unique_ptr<CpuLocal[]> cpu_locals;
-  std::unique_ptr<bool[]> null_cpu_local;
-
-  std::unique_ptr<std::atomic<int64_t>[]> ipi_sent_count;
-  std::unique_ptr<std::atomic<uint8_t>[]> last_ipi_vector;
-
-  std::string uart_panic_log;
-  std::string vga_panic_log;
-};
-
-FakeSmpEnv g_env;
-
-static void SetupEnv(const int num_cpus) {
-  CHECK(num_cpus >= 1);
-  ResetCpuLocalForTest();
-
-  g_env.cpu_count = num_cpus;
-  g_env.uart_panic_log.clear();
-  g_env.vga_panic_log.clear();
-
-  g_env.cpu_locals.reset(new CpuLocal[num_cpus]());
-  g_env.null_cpu_local.reset(new bool[num_cpus]());
-  g_env.ipi_sent_count.reset(new std::atomic<int64_t>[num_cpus]());
-  g_env.last_ipi_vector.reset(new std::atomic<uint8_t>[num_cpus]());
-
-  for (int i = 0; i < num_cpus; ++i) {
-    CpuLocal& local = g_env.cpu_locals[i];
-    local.self = &local;
-    local.cpu_id = i;
-    local.apic_id = static_cast<uint8_t>(i);
-    local.online = true;
-  }
-
-  BindCpuLocal(&g_env.cpu_locals[0]);
-}
-
-static void NoopTask(void* const /*arg*/) {}
-
-class MockTaskScheduler : public TaskScheduler {
- public:
-  MOCK_METHOD(void, Init, (), (override));
-  MOCK_METHOD(Task*, CreateTask, (TaskFn, void*, int64_t), (override));
-  MOCK_METHOD(Task*, CreateTaskOnCpu, (TaskFn, void*, int64_t, int),
-              (override));
-  MOCK_METHOD(void, Yield, (), (override));
-  MOCK_METHOD(void, Join, (Task*), (override));
-  MOCK_METHOD(int, ReapZombies, (), (override));
-  MOCK_METHOD(bool, PollIdleCpu, (int), (override));
-  MOCK_METHOD(int, RunqueueLoad, (int), (const, override));
-  MOCK_METHOD(bool, StealTask, (int, int), (override));
-  MOCK_METHOD(void, SetPreemptEnabled, (bool), (override));
-  MOCK_METHOD(bool, IsPreemptEnabled, (), (const, override));
-  MOCK_METHOD(void, OnTimerInterrupt, (InterruptFrame*), (override));
-  MOCK_METHOD(void, OnWakeupIpi, (InterruptFrame*), (override));
-  MOCK_METHOD(Task*, CurrentTask, (), (const, override));
-};
-
-}  // namespace
-
-int SmpCpuCount() { return g_env.cpu_count; }
-
-CpuLocal* SmpGetCpuLocal(const int cpu_index) {
-  DCHECK(cpu_index >= 0 && cpu_index < g_env.cpu_count);
-  if (g_env.null_cpu_local[cpu_index]) {
-    return nullptr;
-  }
-  return &g_env.cpu_locals[cpu_index];
-}
-
-void SmpSendIpi(const int target_cpu_index, const uint8_t vector) {
-  DCHECK(target_cpu_index >= 0 && target_cpu_index < g_env.cpu_count);
-  DCHECK(vector >= static_cast<uint8_t>(kCpuExceptionCount));
-  g_env.ipi_sent_count[target_cpu_index].fetch_add(1,
-                                                   std::memory_order_acq_rel);
-  g_env.last_ipi_vector[target_cpu_index].store(vector,
-                                                std::memory_order_release);
-}
-
-void UartPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    g_env.uart_panic_log.append(str);
-  }
-}
-
-void UartPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_env.uart_panic_log.append(buf);
-}
-
-void VgaPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    g_env.vga_panic_log.append(str);
-  }
-}
-
-void VgaPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_env.vga_panic_log.append(buf);
-}
-
-namespace {
 
 TEST(WorkStealingSchedulerTest, InitDelegatesToInnerScheduler) {
   SetupEnv(2);
@@ -685,6 +569,135 @@ TEST(WorkStealingSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   g_env.null_cpu_local[1] = true;
   EXPECT_DEATH(sched->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 1),
                "Check failed");
+}
+
+class ForwardingSpyTaskScheduler final : public TaskScheduler {
+ public:
+  explicit ForwardingSpyTaskScheduler(std::shared_ptr<TaskScheduler> inner)
+      : inner_(std::move(inner)) {}
+
+  void Init() override { inner_->Init(); }
+  Task* CreateTask(const TaskFn entry,  //
+                   void* const arg,     //
+                   const int64_t weight) override {
+    return inner_->CreateTask(entry, arg, weight);
+  }
+  Task* CreateTaskOnCpu(const TaskFn entry,    //
+                        void* const arg,       //
+                        const int64_t weight,  //
+                        const int target_cpu) override {
+    return inner_->CreateTaskOnCpu(entry, arg, weight, target_cpu);
+  }
+  void Yield() override { inner_->Yield(); }
+  void Join(Task* const task) override { inner_->Join(task); }
+  int ReapZombies() override { return inner_->ReapZombies(); }
+  bool PollIdleCpu(const int cpu_index) override {
+    return inner_->PollIdleCpu(cpu_index);
+  }
+  int RunqueueLoad(const int cpu_index) const override {
+    return inner_->RunqueueLoad(cpu_index);
+  }
+  bool StealTask(const int dst_cpu, const int src_cpu) override {
+    if (src_cpu == 0) {
+      steal_from_cpu0_calls_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return inner_->StealTask(dst_cpu, src_cpu);
+  }
+  void SetPreemptEnabled(const bool enabled) override {
+    inner_->SetPreemptEnabled(enabled);
+  }
+  bool IsPreemptEnabled() const override { return inner_->IsPreemptEnabled(); }
+  void OnTimerInterrupt(InterruptFrame* const frame) override {
+    inner_->OnTimerInterrupt(frame);
+  }
+  void OnWakeupIpi(InterruptFrame* const frame) override {
+    inner_->OnWakeupIpi(frame);
+  }
+  Task* CurrentTask() const override { return inner_->CurrentTask(); }
+
+  int StealFromCpu0Calls() const {
+    return steal_from_cpu0_calls_.load(std::memory_order_acquire);
+  }
+
+ private:
+  const std::shared_ptr<TaskScheduler> inner_;
+  std::atomic<int> steal_from_cpu0_calls_{0};
+};
+
+struct BootstrapLoadProbeCtx {
+  TaskScheduler* sched = nullptr;
+  ForwardingSpyTaskScheduler* spy = nullptr;
+  int cpu0_load_with_only_bootstrap_queued = -1;
+  int steal_calls_while_only_bootstrap_queued = -1;
+  int cpu0_load_with_extra_worker_queued = -1;
+  int steal_calls_after_extra_worker_queued = -1;
+  bool ap1_poll_after_extra_worker = false;
+  int extra_worker_runs = 0;
+  Task* extra_task = nullptr;
+};
+
+static void ExtraStealableWorker(void* const raw_arg) {
+  BootstrapLoadProbeCtx* const ctx =
+      static_cast<BootstrapLoadProbeCtx*>(raw_arg);
+  ++ctx->extra_worker_runs;
+}
+
+static void BootstrapLoadProbeWorker(void* const raw_arg) {
+  BootstrapLoadProbeCtx* const ctx =
+      static_cast<BootstrapLoadProbeCtx*>(raw_arg);
+  // While `BootstrapLoadProbeWorker` is running on CPU 0, `bootstrap_task_` is
+  // queued in CPU 0's runqueue tree waiting in `Join`. Because
+  // `bootstrap_task_` is unstealable, `RunqueueLoad(0)` must be 0.
+  ctx->cpu0_load_with_only_bootstrap_queued = ctx->sched->RunqueueLoad(0);
+
+  // Idle APs 1, 2, 3 polling for work must see RunqueueLoad(0) == 0 and must
+  // NOT call StealTask(dst_cpu, 0).
+  for (int ap = 1; ap < 4; ++ap) {
+    EXPECT_FALSE(ctx->sched->PollIdleCpu(ap));
+  }
+  ctx->steal_calls_while_only_bootstrap_queued = ctx->spy->StealFromCpu0Calls();
+
+  // Now enqueue a second worker task on CPU 0 alongside `bootstrap_task_`.
+  // `RunqueueLoad(0)` must become 1, and an idle AP must steal the second
+  // worker task (skipping `bootstrap_task_`).
+  ctx->extra_task = ctx->sched->CreateTaskOnCpu(ExtraStealableWorker,  //
+                                                ctx,                   //
+                                                kDefaultTaskWeight,    //
+                                                0);
+  ctx->cpu0_load_with_extra_worker_queued = ctx->sched->RunqueueLoad(0);
+  BindCpuLocal(SmpGetCpuLocal(1));
+  ctx->ap1_poll_after_extra_worker = ctx->sched->PollIdleCpu(1);
+  BindCpuLocal(SmpGetCpuLocal(0));
+  ctx->steal_calls_after_extra_worker_queued = ctx->spy->StealFromCpu0Calls();
+}
+
+TEST(WorkStealingSchedulerTest,
+     IdleApsDoNotAttemptStealFromCpu0WhenOnlyBootstrapTaskIsQueued) {
+  SetupEnv(4);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  const auto spy = std::make_shared<ForwardingSpyTaskScheduler>(core);
+  const std::shared_ptr<TaskScheduler> sched = CreateWorkStealingScheduler(spy);
+  sched->Init();
+
+  BootstrapLoadProbeCtx ctx;
+  ctx.sched = sched.get();
+  ctx.spy = spy.get();
+
+  Task* const worker = sched->CreateTaskOnCpu(BootstrapLoadProbeWorker,  //
+                                              &ctx,                      //
+                                              kDefaultTaskWeight,        //
+                                              0);
+  ASSERT_THAT(worker, t::NotNull());
+  sched->Join(worker);
+  ASSERT_THAT(ctx.extra_task, t::NotNull());
+  sched->Join(ctx.extra_task);
+
+  EXPECT_THAT(ctx.cpu0_load_with_only_bootstrap_queued, t::Eq(0));
+  EXPECT_THAT(ctx.steal_calls_while_only_bootstrap_queued, t::Eq(0));
+  EXPECT_THAT(ctx.cpu0_load_with_extra_worker_queued, t::Eq(1));
+  EXPECT_TRUE(ctx.ap1_poll_after_extra_worker);
+  EXPECT_THAT(ctx.steal_calls_after_extra_worker_queued, t::Eq(1));
+  EXPECT_THAT(ctx.extra_worker_runs, t::Eq(1));
 }
 
 }  // namespace

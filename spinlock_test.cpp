@@ -282,5 +282,76 @@ TEST(SpinLockDeathTest, InvariantViolationsTriggerDcheck) {
       "Check failed");
 }
 
+TEST(SpinLockTest, OwnershipAndTopHeldLockTrackingWithCpuLocalBoundAndUnbound) {
+  ResetCpuLocalForTest();
+  SetInterruptsEnabledForTest(true);
+  ASSERT_THAT(CurrentCpuOrNull(), t::IsNull());
+
+  IrqSpinLock lock_a;
+  IrqSpinLock lock_b;
+
+  // 1. Unbound fallback path (`CurrentCpuOrNull() == nullptr`).
+  EXPECT_THAT(*internal::TopHeldLockSlot(), t::IsNull());
+  {
+    const IrqSpinLockGuard guard_a(lock_a);
+    EXPECT_TRUE(lock_a.IsLocked());
+    EXPECT_TRUE(lock_a.IsLockedByCurrentCpu());
+    EXPECT_THAT(*internal::TopHeldLockSlot(), t::Eq(&lock_a));
+    {
+      const IrqSpinLockGuard guard_b(lock_b);
+      EXPECT_TRUE(lock_b.IsLocked());
+      EXPECT_TRUE(lock_b.IsLockedByCurrentCpu());
+      EXPECT_THAT(*internal::TopHeldLockSlot(), t::Eq(&lock_b));
+    }
+    EXPECT_THAT(*internal::TopHeldLockSlot(), t::Eq(&lock_a));
+  }
+  EXPECT_THAT(*internal::TopHeldLockSlot(), t::IsNull());
+
+  // 2. Bound `CpuLocal` fast path (`CurrentCpuOrNull() != nullptr`).
+  alignas(64) CpuLocal cpu0 = {};
+  cpu0.self = &cpu0;
+  cpu0.cpu_id = 0;
+  cpu0.apic_id = 0;
+  cpu0.online = true;
+
+  alignas(64) CpuLocal cpu2 = {};
+  cpu2.self = &cpu2;
+  cpu2.cpu_id = 2;
+  cpu2.apic_id = 4;
+  cpu2.online = true;
+
+  BindCpuLocal(&cpu0);
+  ASSERT_THAT(CurrentCpuOrNull(), t::Eq(&cpu0));
+  EXPECT_THAT(internal::CurrentOwnerId(), t::Eq(uintptr_t{1}));
+  EXPECT_THAT(internal::TopHeldLockSlot(), t::Eq(&cpu0.top_held_lock));
+  EXPECT_THAT(cpu0.top_held_lock, t::IsNull());
+
+  lock_a.Lock();
+  EXPECT_TRUE(lock_a.IsLocked());
+  EXPECT_TRUE(lock_a.IsLockedByCurrentCpu());
+  EXPECT_THAT(cpu0.top_held_lock, t::Eq(&lock_a));
+
+  lock_b.Lock();
+  EXPECT_TRUE(lock_b.IsLockedByCurrentCpu());
+  EXPECT_THAT(cpu0.top_held_lock, t::Eq(&lock_b));
+
+  // Switching to a different CpuLocal shows lock_a/lock_b are NOT owned by
+  // cpu2, and cpu2 has its own independent top_held_lock slot.
+  BindCpuLocal(&cpu2);
+  EXPECT_THAT(internal::CurrentOwnerId(), t::Eq(uintptr_t{3}));
+  EXPECT_FALSE(lock_a.IsLockedByCurrentCpu());
+  EXPECT_FALSE(lock_b.IsLockedByCurrentCpu());
+  EXPECT_THAT(cpu2.top_held_lock, t::IsNull());
+
+  BindCpuLocal(&cpu0);
+  lock_b.Unlock();
+  EXPECT_THAT(cpu0.top_held_lock, t::Eq(&lock_a));
+  lock_a.Unlock();
+  EXPECT_THAT(cpu0.top_held_lock, t::IsNull());
+
+  ResetCpuLocalForTest();
+  EXPECT_THAT(CurrentCpuOrNull(), t::IsNull());
+}
+
 }  // namespace
 }  // namespace protos

@@ -133,7 +133,7 @@ static bool VerifyRbSubtree(const RbTree<T, kNodeMember, Traits>& tree,  //
 
   const T* const left = tree.Left(curr);
   const T* const right = tree.Right(curr);
-  const RbColor color = (curr->*kNodeMember).color;
+  const RbColor color = (curr->*kNodeMember).color();
   if (color != RbColor::kRed && color != RbColor::kBlack) {
     return false;
   }
@@ -143,10 +143,10 @@ static bool VerifyRbSubtree(const RbTree<T, kNodeMember, Traits>& tree,  //
 
   // Invariant (2): No red node has a red child.
   if (color == RbColor::kRed) {
-    if (left != nullptr && (left->*kNodeMember).color == RbColor::kRed) {
+    if (left != nullptr && (left->*kNodeMember).color() == RbColor::kRed) {
       return false;
     }
-    if (right != nullptr && (right->*kNodeMember).color == RbColor::kRed) {
+    if (right != nullptr && (right->*kNodeMember).color() == RbColor::kRed) {
       return false;
     }
   }
@@ -208,7 +208,7 @@ static t::AssertionResult VerifyRbTree(
 
   // Invariant (1): Root is black and has no parent.
   if (tree.Parent(root) != nullptr ||
-      (root->*kNodeMember).color != RbColor::kBlack ||
+      (root->*kNodeMember).color() != RbColor::kBlack ||
       tree.Color(root) != RbColor::kBlack) {
     return t::AssertionFailure() << "Root must be black with null parent";
   }
@@ -595,7 +595,8 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
   {
     t::MockFunction<bool(const AugmentedRbTestNode&)> empty_pred;
     EXPECT_CALL(empty_pred, Call).Times(0);
-    EXPECT_THAT(tree.FindFirstAugmented(empty_pred.AsStdFunction()),
+    EXPECT_THAT(tree.FindFirstAugmented(empty_pred.AsStdFunction(),
+                                        empty_pred.AsStdFunction()),
                 t::IsNull());
   }
 
@@ -688,17 +689,16 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
         subtree_pred.AsStdFunction(), node_pred.AsStdFunction());
     EXPECT_THAT(found_two_pred, t::Eq(expected_match));
 
-    // Also verify the single-predicate overload on const_tree.
-    t::MockFunction<bool(const AugmentedRbTestNode&)> single_pred;
-    EXPECT_CALL(single_pred, Call)
-        .Times(t::Between(1, 60))
-        .WillRepeatedly([target](const AugmentedRbTestNode& node) {
-          return node.subtree_max_size >= target;
-        });
-
-    const AugmentedRbTestNode* const found_one_pred =
-        const_tree.FindFirstAugmented(single_pred.AsStdFunction());
-    EXPECT_THAT(found_one_pred, t::Eq(expected_match));
+    // Also verify the const overload on const_tree.
+    const AugmentedRbTestNode* const found_const =
+        const_tree.FindFirstAugmented(
+            [target](const AugmentedRbTestNode& node) {
+              return node.subtree_max_size >= target;
+            },
+            [target](const AugmentedRbTestNode& node) {
+              return node.payload_size >= target;
+            });
+    EXPECT_THAT(found_const, t::Eq(expected_match));
   }
 
   EXPECT_TRUE(VerifyRbTree(tree, kSearchTestNodeCount));
@@ -780,9 +780,11 @@ TEST(RbTreeTest, CustomTraitsInvokeAugmentCallbacksOnInsertAndPropagate) {
   EXPECT_CALL(*observer, OnUpdateAugment).Times(0);
   const auto& const_tree = tree;
   EXPECT_THAT(const_tree.FindFirstAugmented(
+                  [](const ObservedRbTestNode&) { return true; },
                   [](const ObservedRbTestNode& n) { return n.key >= 10; }),
               t::Eq(&n10));
   EXPECT_THAT(const_tree.FindFirstAugmented(
+                  [](const ObservedRbTestNode&) { return true; },
                   [](const ObservedRbTestNode& n) { return n.key > 100; }),
               t::IsNull());
 }
@@ -802,7 +804,7 @@ TEST(RbTreeTest, EraseUninsertedOrAlreadyErasedNodePreservesTreeInvariants) {
   ASSERT_TRUE(VerifyRbTree(tree, 8));
 
   BasicRbTestNode uninserted_black = {888, 88, {}};
-  uninserted_black.node.color = RbColor::kBlack;
+  uninserted_black.node.set_color(RbColor::kBlack);
   tree.Erase(&uninserted_black);
   ASSERT_TRUE(VerifyRbTree(tree, 8));
 
@@ -869,6 +871,9 @@ TEST(RbTreeTest, FindFirstAugmentedOnNonCopyableNodesIsConstAndThreadSafe) {
             const_tree.FindFirstAugmented(
                 [](const NonCopyableAugmentedNode& n) {
                   return n.subtree_max_size >= 5000;
+                },
+                [](const NonCopyableAugmentedNode& n) {
+                  return n.payload_size >= 5000;
                 });
         EXPECT_THAT(match_max, t::Eq(&nodes[kNodeCount - 1]));
 
@@ -876,6 +881,9 @@ TEST(RbTreeTest, FindFirstAugmentedOnNonCopyableNodesIsConstAndThreadSafe) {
             const_tree.FindFirstAugmented(
                 [](const NonCopyableAugmentedNode& n) {
                   return n.subtree_max_size >= 10;
+                },
+                [](const NonCopyableAugmentedNode& n) {
+                  return n.payload_size >= 10;
                 });
         EXPECT_THAT(match_min, t::Eq(&nodes[0]));
 
@@ -883,6 +891,9 @@ TEST(RbTreeTest, FindFirstAugmentedOnNonCopyableNodesIsConstAndThreadSafe) {
             const_tree.FindFirstAugmented(
                 [](const NonCopyableAugmentedNode& n) {
                   return n.subtree_max_size >= 99999;
+                },
+                [](const NonCopyableAugmentedNode& n) {
+                  return n.payload_size >= 99999;
                 });
         EXPECT_THAT(match_none, t::IsNull());
       }
@@ -954,6 +965,9 @@ TEST(RbTreeTest, FindFirstAugmentedWorksWithAddressKeyedTraits) {
         const_tree.FindFirstAugmented(
             [target_size](const AddressKeyedAugmentedNode& n) {
               return n.subtree_max_size >= target_size;
+            },
+            [target_size](const AddressKeyedAugmentedNode& n) {
+              return n.payload_size >= target_size;
             });
     EXPECT_THAT(by_size, t::Eq(&nodes[i]));
 
@@ -961,6 +975,9 @@ TEST(RbTreeTest, FindFirstAugmentedWorksWithAddressKeyedTraits) {
         const_tree.FindFirstAugmented(
             [target_addr](const AddressKeyedAugmentedNode& n) {
               return n.subtree_max_addr >= target_addr;
+            },
+            [target_addr](const AddressKeyedAugmentedNode& n) {
+              return reinterpret_cast<uintptr_t>(&n) >= target_addr;
             });
     EXPECT_THAT(by_addr, t::Eq(&nodes[i]));
   }
@@ -1047,6 +1064,9 @@ TEST(RbTreeTest,
       const_nt_tree.FindFirstAugmented(
           [](const NonTrivialDestructorAugmentedNode& n) {
             return n.subtree_max_size >= 100;
+          },
+          [](const NonTrivialDestructorAugmentedNode& n) {
+            return n.payload_size >= 100;
           });
   EXPECT_THAT(nt_found, t::Eq(&nt20));
   EXPECT_THAT(token.use_count(), t::Eq(3));
@@ -1069,6 +1089,9 @@ TEST(RbTreeTest,
       const_obs_tree.FindFirstAugmented(
           [](const TrivialObserverAugmentedNode& n) {
             return n.subtree_max_size >= 100;
+          },
+          [](const TrivialObserverAugmentedNode& n) {
+            return n.payload_size >= 100;
           });
   EXPECT_THAT(obs_found, t::Eq(&obs20));
   EXPECT_THAT(observer_calls, t::Eq(0));
@@ -1154,6 +1177,11 @@ TEST(RbTreeTest,
       const_derived_tree.FindFirstAugmented(
           [target_end](const DerivedAddressAugmentedNode& n) {
             return n.subtree_max_end >= target_end;
+          },
+          [target_end](const DerivedAddressAugmentedNode& n) {
+            return reinterpret_cast<uintptr_t>(&n) +
+                       static_cast<uintptr_t>(n.payload_size) >=
+                   target_end;
           });
   EXPECT_THAT(derived_found, t::Eq(&derived_nodes[1]));
 
@@ -1180,6 +1208,13 @@ TEST(RbTreeTest,
               saw_foreign_stack_copy = true;
             }
             return n.subtree_max_size >= 80;
+          },
+          [&nc_nodes,
+           &saw_foreign_stack_copy](const NonCopyableAddressKeyedNode& n) {
+            if (&n < &nc_nodes[0] || &n >= &nc_nodes[kCount]) {
+              saw_foreign_stack_copy = true;
+            }
+            return n.payload_size >= 80;
           });
   EXPECT_FALSE(saw_foreign_stack_copy);
   EXPECT_THAT(nc_found, t::Eq(&nc_nodes[kCount - 1]));

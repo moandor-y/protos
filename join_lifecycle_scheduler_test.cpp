@@ -11,11 +11,7 @@
 #include <thread>
 #include <vector>
 
-#include "idt.h"
-#include "spinlock.h"
-#include "task.h"
-#include "uart.h"
-#include "vga.h"
+#include "scheduler_test_support.h"
 
 namespace protos {
 namespace {
@@ -23,11 +19,6 @@ namespace {
 namespace t = ::testing;
 
 constexpr int kMaxJoinRecordsForTest = 1024;
-
-std::string g_uart_panic_log;
-std::string g_vga_panic_log;
-
-static void NoopTask(void* const /*arg*/) {}
 
 static Task* FakeTaskPtr(const int id) {
   return reinterpret_cast<Task*>(static_cast<uintptr_t>(0x10000 + id * 0x10));
@@ -42,65 +33,6 @@ struct CapturedTaskLaunch {
     entry(arg);
   }
 };
-
-class MockTaskScheduler : public TaskScheduler {
- public:
-  MOCK_METHOD(void, Init, (), (override));
-  MOCK_METHOD(Task*, CreateTask, (TaskFn, void*, int64_t), (override));
-  MOCK_METHOD(Task*, CreateTaskOnCpu, (TaskFn, void*, int64_t, int),
-              (override));
-  MOCK_METHOD(void, Yield, (), (override));
-  MOCK_METHOD(void, Join, (Task*), (override));
-  MOCK_METHOD(int, ReapZombies, (), (override));
-  MOCK_METHOD(bool, PollIdleCpu, (int), (override));
-  MOCK_METHOD(int, RunqueueLoad, (int), (const, override));
-  MOCK_METHOD(bool, StealTask, (int, int), (override));
-  MOCK_METHOD(void, SetPreemptEnabled, (bool), (override));
-  MOCK_METHOD(bool, IsPreemptEnabled, (), (const, override));
-  MOCK_METHOD(void, OnTimerInterrupt, (InterruptFrame*), (override));
-  MOCK_METHOD(void, OnWakeupIpi, (InterruptFrame*), (override));
-  MOCK_METHOD(Task*, CurrentTask, (), (const, override));
-};
-
-static void ResetTestEnv() {
-  SetInterruptsEnabledForTest(true);
-  g_uart_panic_log.clear();
-  g_vga_panic_log.clear();
-}
-
-}  // namespace
-
-void UartPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    g_uart_panic_log.append(str);
-  }
-}
-
-void UartPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_uart_panic_log.append(buf);
-}
-
-void VgaPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    g_vga_panic_log.append(str);
-  }
-}
-
-void VgaPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_vga_panic_log.append(buf);
-}
-
-namespace {
 
 // 1. Init() clears all join records and delegates to inner->Init().
 TEST(JoinLifecycleSchedulerTest, InitClearsAllJoinRecordsAndDelegatesToInner) {
@@ -763,6 +695,124 @@ TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   });
   sched->Join(target_task);
   EXPECT_DEATH(sched->Join(target_task), "Check failed");
+}
+
+// 10. Same-CPU preemption / synchronous child completion inside CreateTask and
+//     CreateTaskOnCpu before inner returns the Task* pointer must not spin-wait
+//     or livelock in MarkRecordExited.
+TEST(JoinLifecycleSchedulerTest,
+     SynchronousTaskCompletionInsideCreateTaskDoesNotLivelock) {
+  ResetTestEnv();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateJoinLifecycleScheduler(mock_inner);
+
+  Task* const self_task = FakeTaskPtr(1);
+  Task* const sync_task_1 = FakeTaskPtr(2);
+  Task* const sync_task_2 = FakeTaskPtr(3);
+  int callback_runs = 0;
+
+  // Simulate same-CPU preemption where the newly created task is scheduled and
+  // runs to completion inside inner_->CreateTask BEFORE CreateTask returns.
+  EXPECT_CALL(*mock_inner, CreateTask)
+      .WillOnce([&](const TaskFn entry,  //
+                    void* const arg,     //
+                    const int64_t /*weight*/) {
+        entry(arg);
+        return sync_task_1;
+      });
+  EXPECT_CALL(*mock_inner, CreateTaskOnCpu)
+      .WillOnce([&](const TaskFn entry,  //
+                    void* const arg,     //
+                    const int64_t /*weight*/, const int /*target_cpu*/) {
+        entry(arg);
+        return sync_task_2;
+      });
+
+  EXPECT_THAT(sched->CreateTask(
+                  [](void* const raw) { ++(*static_cast<int*>(raw)); },  //
+                  &callback_runs,                                        //
+                  kDefaultTaskWeight),
+              t::Eq(sync_task_1));
+  EXPECT_THAT(sched->CreateTaskOnCpu(
+                  [](void* const raw) { ++(*static_cast<int*>(raw)); },  //
+                  &callback_runs,                                        //
+                  kDefaultTaskWeight,                                    //
+                  0),
+              t::Eq(sync_task_2));
+  EXPECT_THAT(callback_runs, t::Eq(2));
+
+  // Join sync_task_1 immediately (must not yield) and reap sync_task_2 via
+  // ReapZombies().
+  std::vector<Task*> joined_tasks;
+  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&]() {
+    return self_task;
+  });
+  EXPECT_CALL(*mock_inner, Join).WillRepeatedly([&](Task* const task) {
+    joined_tasks.push_back(task);
+  });
+
+  sched->Join(sync_task_1);
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(1));
+  EXPECT_THAT(joined_tasks, t::ElementsAre(sync_task_1, sync_task_2));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+// 11. Dynamic scaling beyond 1024 concurrent active/unjoined tasks without
+//     hitting a fixed table limit or leaking heap memory.
+TEST(JoinLifecycleSchedulerTest,
+     SupportsMoreThan1024ConcurrentUnjoinedTasksSimultaneously) {
+  ResetTestEnv();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateJoinLifecycleScheduler(mock_inner);
+
+  constexpr int kNumConcurrentTasks = 1500;
+  Task* const self_task = FakeTaskPtr(1);
+  std::vector<Task*> tasks;
+  std::vector<CapturedTaskLaunch> launches;
+  tasks.reserve(kNumConcurrentTasks);
+  launches.reserve(kNumConcurrentTasks);
+
+  for (int i = 0; i < kNumConcurrentTasks; ++i) {
+    Task* const task = FakeTaskPtr(5000 + i);
+    CapturedTaskLaunch launch;
+    EXPECT_CALL(*mock_inner, CreateTask)
+        .WillOnce([task, &launch](const TaskFn entry,  //
+                                  void* const arg,     //
+                                  const int64_t /*weight*/) {
+          launch = {entry, arg};
+          return task;
+        });
+    ASSERT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
+                t::Eq(task));
+    tasks.push_back(task);
+    launches.push_back(launch);
+  }
+
+  for (int i = 0; i < kNumConcurrentTasks; ++i) {
+    launches[i].RunToCompletion();
+  }
+
+  int inner_join_calls = 0;
+  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&]() {
+    return self_task;
+  });
+  EXPECT_CALL(*mock_inner, Join).WillRepeatedly([&](Task* const task) {
+    EXPECT_THAT(task, t::NotNull());
+    ++inner_join_calls;
+  });
+
+  const int half = kNumConcurrentTasks / 2;
+  for (int i = 0; i < half; ++i) {
+    sched->Join(tasks[i]);
+  }
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(kNumConcurrentTasks - half));
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  EXPECT_THAT(inner_join_calls, t::Eq(kNumConcurrentTasks));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
 }  // namespace

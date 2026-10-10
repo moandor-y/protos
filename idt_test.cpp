@@ -246,32 +246,46 @@ TEST(IdtTest, DispatchHandlesLocalApicTimerWakeupIpiSpuriousAndCustomVectors) {
   EXPECT_THAT(ipi_handler_calls, t::Eq(1));
   EXPECT_THAT(g_env.eoi_count.load(), t::Eq(3));
 
-  // Vector 0xFF (Local APIC Spurious Interrupt): invokes optional handler and
-  // returns WITHOUT sending EOI.
+  // Vector 0xFF (Local APIC Spurious Interrupt): when unhandled (no handler
+  // registered), returns cleanly WITHOUT panicking and WITHOUT sending EOI.
+  InterruptFrame spurious_frame = {};
+  spurious_frame.vector = kVectorSpurious;
+  EXPECT_THAT(IdtGetHandler(kVectorSpurious), t::IsNull());
+  IdtDispatch(&spurious_frame);
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(3));
+
+  // Vector 0xFF with an optional handler registered invokes the handler and
+  // still returns WITHOUT sending EOI.
   static int spurious_calls = 0;
   spurious_calls = 0;
   IdtRegisterHandler(kVectorSpurious, [](InterruptFrame* const frame) {
     EXPECT_THAT(frame->vector, t::Eq(static_cast<uint64_t>(kVectorSpurious)));
     ++spurious_calls;
   });
-  InterruptFrame spurious_frame = {};
-  spurious_frame.vector = kVectorSpurious;
   IdtDispatch(&spurious_frame);
   EXPECT_THAT(spurious_calls, t::Eq(1));
   EXPECT_THAT(g_env.eoi_count.load(), t::Eq(3));
+  IdtUnregisterHandler(kVectorSpurious);
 
-  // General external vector (e.g. 0x50): invokes handler and sends EOI.
+  // Unhandled external hardware vector (e.g. 0x50, no handler registered):
+  // sends EOI and returns cleanly without panicking.
+  InterruptFrame custom_frame = {};
+  custom_frame.vector = 0x50;
+  EXPECT_THAT(IdtGetHandler(0x50), t::IsNull());
+  IdtDispatch(&custom_frame);
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(4));
+
+  // General external vector (0x50) with handler registered: invokes handler and
+  // sends EOI.
   static int custom_irq_calls = 0;
   custom_irq_calls = 0;
   IdtRegisterHandler(0x50, [](InterruptFrame* const frame) {
     EXPECT_THAT(frame->vector, t::Eq(0x50u));
     ++custom_irq_calls;
   });
-  InterruptFrame custom_frame = {};
-  custom_frame.vector = 0x50;
   IdtDispatch(&custom_frame);
   EXPECT_THAT(custom_irq_calls, t::Eq(1));
-  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(4));
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(5));
 
   ResetCpuLocalForTest();
 }

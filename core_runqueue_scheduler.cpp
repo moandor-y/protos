@@ -353,7 +353,9 @@ static void EnqueueTaskLocked(CpuRunqueue* const rq,  //
 
   const bool inserted = rq->tree.Insert(task);
   DCHECK(inserted);
-  rq->runnable_count.fetch_add(1, std::memory_order_release);
+  if (!task->is_bootstrap) {
+    rq->runnable_count.fetch_add(1, std::memory_order_release);
+  }
   UpdateRunqueueMinVruntime(rq);
 }
 
@@ -610,7 +612,10 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       return false;
     }
     if (runqueues_[cpu_index].runnable_count.load(std::memory_order_acquire) ==
-        0) {
+            0 &&
+        (cpu_index != 0 ||
+         bootstrap_task_.state.load(std::memory_order_acquire) !=
+             TaskState::kReady)) {
       return false;
     }
     return Schedule(TaskState::kReady);
@@ -641,6 +646,9 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
 
     if (dst_rq.runnable_count.load(std::memory_order_relaxed) > 0) {
       return true;
+    }
+    if (src_rq.runnable_count.load(std::memory_order_relaxed) == 0) {
+      return false;
     }
 
     Task* stolen = src_rq.tree.First();
@@ -922,7 +930,9 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
 
       if (!next->is_idle) {
         rq.tree.Erase(next);
-        rq.runnable_count.fetch_sub(1, std::memory_order_release);
+        if (!next->is_bootstrap) {
+          rq.runnable_count.fetch_sub(1, std::memory_order_release);
+        }
       }
       next->state.store(TaskState::kRunning, std::memory_order_release);
       next->running_cpu.store(cpu_id, std::memory_order_release);

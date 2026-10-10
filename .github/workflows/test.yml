@@ -15,9 +15,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            g++ \
+            grub-common \
+            grub-efi-amd64-bin \
+            grub-pc-bin \
+            grub2-common \
+            libgmock-dev \
+            libgtest-dev \
+            make \
+            mtools \
+            ovmf \
+            python3 \
+            qemu-system-x86 \
+            xorriso
+
       - name: Configure ASLR entropy for ThreadSanitizer
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Run all tests
-        run: make test
-
+        run: make test USE_DOCKER=0

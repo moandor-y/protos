@@ -50,7 +50,7 @@ TEST_EXTRA_SRCS_idt_test := idt.cpp
 TEST_EXTRA_SRCS_pmm_test := pmm.cpp multiboot.cpp
 TEST_EXTRA_SRCS_smp_test := smp.cpp idt.cpp
 TEST_EXTRA_SRCS_core_runqueue_scheduler_test := core_runqueue_scheduler.cpp
-TEST_EXTRA_SRCS_work_stealing_scheduler_test := work_stealing_scheduler.cpp
+TEST_EXTRA_SRCS_work_stealing_scheduler_test := work_stealing_scheduler.cpp core_runqueue_scheduler.cpp
 TEST_EXTRA_SRCS_join_lifecycle_scheduler_test := join_lifecycle_scheduler.cpp
 TEST_EXTRA_SRCS_preemptive_scheduler_test := preemptive_scheduler.cpp
 TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) task.cpp idt.cpp
@@ -101,7 +101,23 @@ HOST_GID ?= $(shell id -g)
 DOCKER_STAMP := $(BUILD_DIR)/.docker.stamp
 
 IN_DOCKER := $(wildcard /.dockerenv /run/.containerenv)
-ifeq ($(IN_DOCKER),)
+HOST_REQUIRED_BINS := $(AS) $(CXX) $(LD) grub-mkrescue xorriso mtools qemu-system-x86_64
+MISSING_HOST_BINS := $(strip $(foreach bin,$(HOST_REQUIRED_BINS),$(if $(shell command -v $(bin) 2>/dev/null),,$(bin))))
+HAVE_HOST_GTEST := $(and $(wildcard /usr/include/gtest/gtest.h),$(wildcard /usr/include/gmock/gmock.h))
+
+ifneq ($(IN_DOCKER),)
+USE_DOCKER := 0
+else ifeq ($(MISSING_HOST_BINS),)
+  ifneq ($(HAVE_HOST_GTEST),)
+    USE_DOCKER ?= 0
+  else
+    USE_DOCKER ?= 1
+  endif
+else
+  USE_DOCKER ?= 1
+endif
+
+ifeq ($(USE_DOCKER),1)
 DOCKER_RUN := $(DOCKER) run --rm --platform=$(DOCKER_PLATFORM) \
               --user $(HOST_UID):$(HOST_GID) \
               -e HOME=/tmp \
@@ -112,11 +128,14 @@ DOCKER_DEPS := $(DOCKER_STAMP)
 else
 DOCKER_RUN :=
 DOCKER_DEPS :=
+ifeq ($(filter -j% --jobserver%,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(shell nproc) -Otarget
+endif
 endif
 
-.PHONY: all clean test test-host test-rbtree test-spinlock test-heap test-idt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-stress_test test-stress run-boot-test
+.PHONY: all clean test unit-test test-host docker-build docker-test test-rbtree test-spinlock test-heap test-idt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-stress_test test-stress run-boot-test
 
-ifeq ($(IN_DOCKER),)
+ifeq ($(USE_DOCKER),1)
 all: $(DOCKER_STAMP)
 	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/kernel.iso'
 else
@@ -169,7 +188,7 @@ define DEFINE_HOST_TEST_SUITE
 $(foreach b,$(TEST_BUILD_MODES),$(foreach s,$(TEST_SAN_MODES),$(eval $(call DEFINE_HOST_TEST_VARIANT,$(1),$(b),$(s)))))
 
 .PHONY: test-$(1)
-ifeq ($(IN_DOCKER),)
+ifeq ($(USE_DOCKER),1)
 test-$(1): $(DOCKER_STAMP)
 	$$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$$$(nproc) -Otarget $$(HOST_TEST_RUNS_$(1))'
 else
@@ -193,24 +212,33 @@ test-task: test-task_test
 test-stress_test: test-stress_test_test
 test-stress: test-stress_test_test
 
-ifeq ($(IN_DOCKER),)
-test-host: $(DOCKER_STAMP)
+ifeq ($(USE_DOCKER),1)
+unit-test: $(DOCKER_STAMP)
 	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(HOST_TEST_ALL_RUNS)'
 else
-test-host: $(HOST_TEST_ALL_RUNS)
+unit-test: $(HOST_TEST_ALL_RUNS)
 endif
+
+test-host: unit-test
 
 run-boot-test: $(BUILD_DIR)/kernel.iso $(DOCKER_DEPS)
 	$(DOCKER_RUN) ./test_boot.sh $(BUILD_DIR)/kernel.iso
 
-ifeq ($(IN_DOCKER),)
+ifeq ($(USE_DOCKER),1)
 test: $(DOCKER_STAMP)
 	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(HOST_TEST_ALL_RUNS) run-boot-test'
 else
-test: $(HOST_TEST_ALL_RUNS) run-boot-test
+test: unit-test run-boot-test
 endif
+
+docker-build:
+	$(MAKE) all USE_DOCKER=1
+
+docker-test:
+	$(MAKE) test USE_DOCKER=1
 
 clean:
 	rm -rf $(BUILD_DIR)
 
 -include $(wildcard $(BUILD_DIR)/*.d)
+

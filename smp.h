@@ -51,6 +51,8 @@ struct CpuInfo {
 
 // Cache-line-aligned per-CPU runtime state bound to `IA32_GS_BASE` on bare
 // metal (`gs:[0]`) and a `thread_local` pointer in host unit tests.
+class IrqSpinLock;
+
 struct alignas(64) CpuLocal {
   CpuLocal* self = nullptr;
   int cpu_id = 0;
@@ -58,6 +60,7 @@ struct alignas(64) CpuLocal {
   bool online = false;
   uintptr_t stack_base = 0;
   uintptr_t stack_top = 0;
+  IrqSpinLock* top_held_lock = nullptr;
   std::atomic<int64_t> timer_ticks{0};
   std::atomic<int64_t> ipi_count{0};
 };
@@ -221,6 +224,29 @@ bool SmpDiscoverTopology(uint32_t multiboot_magic,      //
 uint32_t ComputeApicTimerInitialCount(uint64_t elapsed_apic_ticks,  //
                                       int pit_reload_count,         //
                                       int target_hz);
+
+// Maximum number of port 0x61 poll iterations before PIT calibration times out
+// and falls back to `kFallbackApicTimerInitialCount`.
+constexpr int kPitCalibrationPollLimit = 1000000;
+// Safe fallback periodic Local APIC timer initial count (~250 Hz on a 1 GHz
+// bus / 62.5 MHz div-by-16 APIC timer) used when legacy 8254 PIT port 0x61 is
+// missing or unresponsive.
+constexpr uint32_t kFallbackApicTimerInitialCount = 250000;
+
+using PitSpeakerReadFn = uint8_t (*)();
+using ApicTimerCurrentCountReadFn = uint32_t (*)(uintptr_t lapic_base);
+
+// Polls `read_pit_speaker()` (checking bit 5, `0x20`, terminal count) for at
+// most `max_polls` iterations (`max_polls > 0`), then reads
+// `read_apic_current_count(lapic_base)` and returns the calibrated periodic
+// Local APIC timer initial count for `kApicTimerTargetHz`. If the PIT does not
+// reach terminal count within `max_polls` iterations or elapsed APIC ticks is
+// 0, returns `kFallbackApicTimerInitialCount` instead of hanging or panicking.
+uint32_t CalibrateApicTimerCount(
+    uintptr_t lapic_base,               //
+    int max_polls,                      //
+    PitSpeakerReadFn read_pit_speaker,  //
+    ApicTimerCurrentCountReadFn read_apic_current_count);
 
 // Discovers all CPUs, initializes the BSP Local APIC and `CpuLocal` state,
 // calibrates the Local APIC timer using PIT Channel 2, allocates dedicated

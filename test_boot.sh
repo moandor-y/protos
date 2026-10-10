@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ! -f /.dockerenv && ! -f /run/.containerenv ]]; then
-  exec make test
-fi
-
 BUILD_DIR="build"
 ISO_FILE="${1:-${BUILD_DIR}/kernel.iso}"
+
+if [[ ! -f /.dockerenv && ! -f /run/.containerenv ]]; then
+  if [[ "${USE_DOCKER:-0}" == "1" ]] || ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+    exec make run-boot-test USE_DOCKER=1
+  fi
+  if [[ $# -eq 0 && ! -f "${ISO_FILE}" ]]; then
+    make "${ISO_FILE}"
+  fi
+fi
 EXPECTED_STRING="Hello, x86-64 Kernel World!"
 COMPLETION_MARKER="[TEST] ALL MEMORY TESTS PASSED"
 STRESS_MARKER="[STRESS] random_multicpu_stress: PASS"

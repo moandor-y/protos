@@ -936,12 +936,15 @@ TEST(SmpTest,
   EXPECT_THAT(SmpGetHostEoiCountForTest(), t::Eq(1));
 
   // Verify SmpSendIpi increments target CpuLocal::ipi_count on vector 0x21 and
-  // sends EOI.
+  // sends EOI, whereas kVectorSpurious (0xFF) does not send EOI.
   const int64_t ap_ipi_before =
       SmpGetCpuLocal(1)->ipi_count.load(std::memory_order_acquire);
   SmpSendIpi(1, kVectorWakeupIpi);
   EXPECT_THAT(SmpGetCpuLocal(1)->ipi_count.load(std::memory_order_acquire),
               t::Eq(ap_ipi_before + 1));
+  EXPECT_THAT(SmpGetHostEoiCountForTest(), t::Eq(2));
+
+  SmpSendIpi(1, kVectorSpurious);
   EXPECT_THAT(SmpGetHostEoiCountForTest(), t::Eq(2));
 
   // Out-of-range SmpGetCpuLocal or SmpSendIpi arguments must trigger DCHECK.
@@ -1062,6 +1065,61 @@ TEST(SmpTest,
   for (int i = 1; i < 4; ++i) {
     EXPECT_GE(SmpGetCpuLocal(i)->ipi_count.load(std::memory_order_acquire), 3);
   }
+}
+
+TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndFallbackOnTimeout) {
+  static int g_speaker_polls = 0;
+  static int g_ready_after_poll = 0;
+  static uint32_t g_mock_current_count = 0;
+
+  const auto read_speaker_timeout = +[]() -> uint8_t {
+    ++g_speaker_polls;
+    return 0x00;  // Bit 5 (0x20) is never set.
+  };
+  const auto read_apic_count =
+      +[](const uintptr_t) -> uint32_t { return g_mock_current_count; };
+
+  // 1. Timeout when PIT port 0x61 bit 5 never sets: bounded to max_polls and
+  // returns kFallbackApicTimerInitialCount without hanging.
+  g_speaker_polls = 0;
+  g_mock_current_count = 0xFFFFFFFFu - 50000u;
+  const uint32_t timeout_count =
+      CalibrateApicTimerCount(kDefaultLocalApicPhysAddr,  //
+                              256,                        //
+                              read_speaker_timeout,       //
+                              read_apic_count);
+  EXPECT_THAT(g_speaker_polls, t::Eq(256));
+  EXPECT_THAT(timeout_count, t::Eq(kFallbackApicTimerInitialCount));
+
+  // 2. Normal completion before max_polls: returns calibrated count.
+  const auto read_speaker_ready = +[]() -> uint8_t {
+    ++g_speaker_polls;
+    return (g_speaker_polls >= g_ready_after_poll) ? 0x20 : 0x00;
+  };
+  g_speaker_polls = 0;
+  g_ready_after_poll = 7;
+  g_mock_current_count = 0xFFFFFFFFu - 60000u;
+  const uint32_t calibrated_count =
+      CalibrateApicTimerCount(kDefaultLocalApicPhysAddr,  //
+                              256,                        //
+                              read_speaker_ready,         //
+                              read_apic_count);
+  EXPECT_THAT(g_speaker_polls, t::Eq(7));
+  EXPECT_THAT(calibrated_count,
+              t::Eq(ComputeApicTimerInitialCount(
+                  60000, kPitCalibrationReloadCount, kApicTimerTargetHz)));
+
+  // 3. Zero elapsed APIC ticks even when terminal count reached falls back to
+  // kFallbackApicTimerInitialCount.
+  g_speaker_polls = 0;
+  g_ready_after_poll = 1;
+  g_mock_current_count = 0xFFFFFFFFu;
+  const uint32_t zero_elapsed_count =
+      CalibrateApicTimerCount(kDefaultLocalApicPhysAddr,  //
+                              256,                        //
+                              read_speaker_ready,         //
+                              read_apic_count);
+  EXPECT_THAT(zero_elapsed_count, t::Eq(kFallbackApicTimerInitialCount));
 }
 
 }  // namespace

@@ -31,9 +31,17 @@ void VgaPanicWrite(const char* str);
 // called with local interrupts disabled in unrecoverable panic paths.
 void VgaPanicWriteDec(uint64_t value);
 
-// Attaches a Multiboot2 direct-color linear pixel framebuffer (such as UEFI
-// GOP on pure-UEFI machines without legacy 0xB8000 VGA text mode) and renders
-// the current 80x25 text buffer onto it.
+// Initializes and activates a Multiboot2 direct-color linear pixel framebuffer
+// (such as UEFI GOP on pure-UEFI machines without legacy 0xB8000 VGA text mode)
+// and renders the current 80x25 text buffer onto it. Once active, legacy VGA
+// text memory (0xB8000) and CRT cursor I/O ports (0x3D4/0x3D5) are not touched.
+void VgaInitFramebuffer(uintptr_t fb_phys_addr,  //
+                        int pitch,               //
+                        int width,               //
+                        int height,              //
+                        int bpp);
+
+// Alias for VgaInitFramebuffer used during Multiboot2 framebuffer attachment.
 void VgaAttachFramebuffer(uintptr_t fb_phys_addr,  //
                           int pitch,               //
                           int width,               //
