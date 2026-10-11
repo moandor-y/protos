@@ -125,6 +125,7 @@ static void ResetPmmState() {
   g_pmm_free_frames = 0;
   g_pmm_total_usable_frames = 0;
   g_pmm_initialized = false;
+  g_memory_map = {};
 }
 
 static uintptr_t RunBaseAddress(const FreeRunNode* const node) {
@@ -270,7 +271,7 @@ static void AddAvailableRegion(const uintptr_t base, const int64_t length) {
 
   const int merged_count = merge_end - insert_pos;
   if (merged_count == 0) {
-    DCHECK(g_usable_interval_count < kMaxUsableIntervals);
+    CHECK(g_usable_interval_count < kMaxUsableIntervals);
     for (int i = g_usable_interval_count; i > insert_pos; --i) {
       g_usable_intervals[i] = g_usable_intervals[i - 1];
     }
@@ -335,7 +336,7 @@ static void CarveExcludedRange(const uintptr_t base, const int64_t length) {
       continue;
     }
 
-    DCHECK(g_usable_interval_count < kMaxUsableIntervals);
+    CHECK(g_usable_interval_count < kMaxUsableIntervals);
     for (int j = g_usable_interval_count; j > i + 1; --j) {
       g_usable_intervals[j] = g_usable_intervals[j - 1];
     }
@@ -420,6 +421,7 @@ static void PmmFreeFramesLocked(const uintptr_t base_addr,
                                 const int64_t count) {
   DCHECK(g_pmm_initialized);
   DCHECK(count > 0);
+  DCHECK(count <= INT64_MAX / kPageSize);
   DCHECK(base_addr >= kLowerMemoryLimit);
   DCHECK((base_addr & (kPageSize - 1)) == 0);
   DCHECK(base_addr < g_max_managed_phys_addr);
@@ -429,6 +431,74 @@ static void PmmFreeFramesLocked(const uintptr_t base_addr,
   DCHECK(PmmRangeIsValidUsableRamLocked(base_addr, byte_size));
 
   PmmCoalesceFreeRun(base_addr, count);
+}
+
+struct [[gnu::packed]] Multiboot1BasicInfo {
+  uint32_t flags;
+  uint32_t mem_lower;
+  uint32_t mem_upper;
+};
+
+static void CollectUsableRegions(const uint32_t multiboot_magic,
+                                 const uint64_t multiboot_info_addr,
+                                 const MultibootMemoryMap& memory_map) {
+  bool added_available = false;
+  for (int i = 0; i < memory_map.region_count; ++i) {
+    if (memory_map.regions[i].type == kMemoryTypeAvailable) {
+      AddAvailableRegion(memory_map.regions[i].base,
+                         memory_map.regions[i].length);
+      added_available = true;
+    }
+  }
+
+  if (!added_available && multiboot_magic == kMultiboot1Magic &&
+      multiboot_info_addr != 0 &&
+      multiboot_info_addr < kMaxCanonicalIdentityAddress) {
+    const Multiboot1BasicInfo* const mb1 =
+        reinterpret_cast<const Multiboot1BasicInfo*>(multiboot_info_addr);
+    if ((mb1->flags & kMultiboot1FlagMemBasic) != 0 && mb1->mem_upper > 0) {
+      constexpr uint64_t kUpperMemoryBase = 0x100000ULL;
+      const uint64_t upper_end =
+          kUpperMemoryBase + static_cast<uint64_t>(mb1->mem_upper) * 1024ULL;
+      AddAvailableRegion(static_cast<uintptr_t>(kUpperMemoryBase),
+                         static_cast<int64_t>(upper_end - kUpperMemoryBase));
+    }
+  }
+
+  for (int i = 0; i < memory_map.region_count; ++i) {
+    if (memory_map.regions[i].type != kMemoryTypeAvailable) {
+      CarveExcludedRange(memory_map.regions[i].base,
+                         memory_map.regions[i].length);
+    }
+  }
+
+  CarveExcludedRange(0, kLowerMemoryLimit);
+
+  const uintptr_t kernel_start = KernelStartAddr();
+  const uintptr_t kernel_end = KernelEndAddr();
+  if (kernel_end > kernel_start) {
+    CarveExcludedRange(kernel_start, kernel_end - kernel_start);
+  }
+
+  if (memory_map.mb_reserved_end > memory_map.mb_reserved_start) {
+    CarveExcludedRange(
+        memory_map.mb_reserved_start,
+        memory_map.mb_reserved_end - memory_map.mb_reserved_start);
+  }
+  if (memory_map.mb1_mmap_reserved_end > memory_map.mb1_mmap_reserved_start) {
+    CarveExcludedRange(
+        memory_map.mb1_mmap_reserved_start,
+        memory_map.mb1_mmap_reserved_end - memory_map.mb1_mmap_reserved_start);
+  }
+  if (memory_map.fb_addr != 0 &&
+      memory_map.fb_addr < kMaxCanonicalIdentityAddress &&
+      memory_map.fb_pitch > 0 && memory_map.fb_height > 0 &&
+      static_cast<int64_t>(memory_map.fb_pitch) <=
+          INT64_MAX / static_cast<int64_t>(memory_map.fb_height)) {
+    const int64_t fb_bytes =
+        static_cast<int64_t>(memory_map.fb_pitch) * memory_map.fb_height;
+    CarveExcludedRange(memory_map.fb_addr, fb_bytes);
+  }
 }
 
 }  // namespace
@@ -459,45 +529,9 @@ void PmmInit(const uint32_t multiboot_magic,
     ConsoleWrite("\n");
   }
 
-  for (int i = 0; i < g_memory_map.region_count; ++i) {
-    if (g_memory_map.regions[i].type == kMemoryTypeAvailable) {
-      AddAvailableRegion(g_memory_map.regions[i].base,
-                         g_memory_map.regions[i].length);
-    }
-  }
-
-  for (int i = 0; i < g_memory_map.region_count; ++i) {
-    if (g_memory_map.regions[i].type != kMemoryTypeAvailable) {
-      CarveExcludedRange(g_memory_map.regions[i].base,
-                         g_memory_map.regions[i].length);
-    }
-  }
-
-  CarveExcludedRange(0, kLowerMemoryLimit);
-
   const uintptr_t kernel_start = KernelStartAddr();
   const uintptr_t kernel_end = KernelEndAddr();
-  if (kernel_end > kernel_start) {
-    CarveExcludedRange(kernel_start, kernel_end - kernel_start);
-  }
-
-  if (g_memory_map.mb_reserved_end > g_memory_map.mb_reserved_start) {
-    CarveExcludedRange(
-        g_memory_map.mb_reserved_start,
-        g_memory_map.mb_reserved_end - g_memory_map.mb_reserved_start);
-  }
-  if (g_memory_map.mb1_mmap_reserved_end >
-      g_memory_map.mb1_mmap_reserved_start) {
-    CarveExcludedRange(g_memory_map.mb1_mmap_reserved_start,
-                       g_memory_map.mb1_mmap_reserved_end -
-                           g_memory_map.mb1_mmap_reserved_start);
-  }
-  if (g_memory_map.fb_addr != 0 && g_memory_map.fb_pitch > 0 &&
-      g_memory_map.fb_height > 0) {
-    const int64_t fb_bytes =
-        static_cast<int64_t>(g_memory_map.fb_pitch) * g_memory_map.fb_height;
-    CarveExcludedRange(g_memory_map.fb_addr, fb_bytes);
-  }
+  CollectUsableRegions(multiboot_magic, multiboot_info_addr, g_memory_map);
 
   CHECK(g_usable_interval_count > 0);
 
@@ -508,6 +542,8 @@ void PmmInit(const uint32_t multiboot_magic,
   g_max_managed_phys_addr = highest_usable_addr;
   g_max_frames = g_max_managed_phys_addr / kPageSize;
   g_pmm_initialized = true;
+
+  int64_t total_populated_frames = 0;
 
   // Populate free runs that lie inside the initial 64 MiB bootstrap window
   // first so `PagingExtendIdentityMap` can allocate page-table frames from
@@ -523,6 +559,7 @@ void PmmInit(const uint32_t multiboot_magic,
     if (low_end > u_start) {
       const int64_t frames = (low_end - u_start) / kPageSize;
       PmmCoalesceFreeRun(u_start, frames);
+      total_populated_frames += frames;
     }
   }
 
@@ -543,14 +580,12 @@ void PmmInit(const uint32_t multiboot_magic,
     if (u_end > high_start) {
       const int64_t frames = (u_end - high_start) / kPageSize;
       PmmCoalesceFreeRun(high_start, frames);
+      total_populated_frames += frames;
     }
   }
 
   CHECK(!g_free_run_tree.Empty() && g_pmm_free_frames > 0);
-
-  g_max_managed_phys_addr = RunEndAddress(g_free_run_tree.Last());
-  g_max_frames = g_max_managed_phys_addr / kPageSize;
-  g_pmm_total_usable_frames = g_pmm_free_frames;
+  g_pmm_total_usable_frames = total_populated_frames;
 
   ConsoleWrite("[PMM] Kernel range: ");
   ConsoleWriteHex(kernel_start);
@@ -596,15 +631,31 @@ void PmmFreeFrame(const uintptr_t frame_addr) {
   PmmFreeFramesLocked(frame_addr, 1);
 }
 
-uintptr_t PmmMaxPhysicalAddress() { return g_max_managed_phys_addr; }
+uintptr_t PmmMaxPhysicalAddress() {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  return g_max_managed_phys_addr;
+}
 
-int64_t PmmMaxFrameCount() { return g_max_frames; }
+int64_t PmmMaxFrameCount() {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  return g_max_frames;
+}
 
 int64_t PmmFreeFrameCount() {
   const IrqSpinLockGuard lock_guard(g_pmm_lock);
   return g_pmm_free_frames;
 }
 
-int64_t PmmTotalUsableFrameCount() { return g_pmm_total_usable_frames; }
+int64_t PmmTotalUsableFrameCount() {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  return g_pmm_total_usable_frames;
+}
+
+#if __STDC_HOSTED__
+void PmmResetForTest() {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  ResetPmmState();
+}
+#endif
 
 }  // namespace protos

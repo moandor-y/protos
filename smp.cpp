@@ -59,7 +59,6 @@ constexpr int64_t kRsdpScanAlignment = 16;
 constexpr uint8_t kMadtTypeLocalApic = 0;
 constexpr uint8_t kMadtTypeLocalApicOverride = 5;
 constexpr uint8_t kMadtTypeLocalX2Apic = 9;
-constexpr uint8_t kInvalidXapicId = 0xFFu;
 constexpr uint32_t kMadtLapicFlagEnabled = 1u << 0;
 constexpr uint32_t kMadtLapicFlagOnlineCapable = 1u << 1;
 constexpr uint32_t kMadtLapicUsableMask =
@@ -67,15 +66,11 @@ constexpr uint32_t kMadtLapicUsableMask =
 constexpr int kMaxPitReloadCount = 0xFFFF;
 constexpr uint8_t kPitSpeakerOut2Bit = 1u << 5;
 
-#if !__STDC_HOSTED__
 constexpr uint32_t kMsrIa32ApicBase = 0x0000001B;
 constexpr uint32_t kMsrX2ApicBase = 0x00000800;
-constexpr uint32_t kMsrIa32Efer = 0xC0000080;
 constexpr uint32_t kCpuidEcxX2ApicBit = 1u << 21;
 constexpr uint64_t kApicBaseX2ApicEnable = 1ULL << 10;
 constexpr uint64_t kApicBaseGlobalEnable = 1ULL << 11;
-constexpr uint64_t kEferLongModeActive = 1ULL << 10;
-constexpr uint64_t kKernelCodeSelector = 0x08;
 
 constexpr int kLapicRegId = 0x020;
 constexpr int kLapicRegTpr = 0x080;
@@ -101,6 +96,12 @@ constexpr uint32_t kIcrDeliveryStartup = 0x00000600u;
 constexpr uint32_t kIcrDeliveryPending = 1u << 12;
 constexpr uint32_t kIcrLevelAssert = 1u << 14;
 constexpr uint32_t kIcrTriggerLevel = 1u << 15;
+constexpr int kIcrIdlePollLimit = 1000000;
+
+#if !__STDC_HOSTED__
+constexpr uint32_t kMsrIa32Efer = 0xC0000080;
+constexpr uint64_t kEferLongModeActive = 1ULL << 10;
+constexpr uint64_t kKernelCodeSelector = 0x08;
 
 constexpr uint16_t kPitChannel2DataPort = 0x42;
 constexpr uint16_t kPitCommandPort = 0x43;
@@ -110,7 +111,6 @@ constexpr uint8_t kPitSpeakerGate2Bit = 1u << 0;
 constexpr uint8_t kPitSpeakerEnableMask = 0x03u;
 
 constexpr int64_t kMaxTrampolineBytes = 512;
-constexpr int kIcrIdlePollLimit = 1000000;
 constexpr int kInitDelayIterations = 50000;
 constexpr int kFirstSipiPollLimit = 200000;
 #endif
@@ -202,12 +202,10 @@ std::atomic<int> g_online_cpu_count{0};
 std::atomic<int> g_ap_boot_done{0};
 // True once SmpInit() has completed topology discovery and AP bring-up.
 bool g_smp_initialized = false;
-#if !__STDC_HOSTED__
 // True if the BSP Local APIC is operating in x2APIC MSR mode (IA32_APIC_BASE
 // bit 10 EXTD = 1), in which case APs are also switched to x2APIC mode on
 // bring-up and all Local APIC accesses use the 0x800+ MSR range.
 bool g_x2apic_mode = false;
-#endif
 
 // State for synchronous multi-CPU work dispatch in SmpRunOnAllCpus():
 // Guards against concurrent or re-entrant SmpRunOnAllCpus() calls.
@@ -232,11 +230,14 @@ std::unique_ptr<std::atomic<int64_t>[]> g_ap_done_epoch;
 constexpr uint64_t kDefaultHostCalibrationTicks = 625000;
 
 // Host unit-test overrides configured via SmpSetHostTestHooks().
-uint8_t g_host_bsp_apic_id = 0;
+uint32_t g_host_bsp_apic_id = 0;
 uintptr_t g_host_ebda_base = 0;
 uintptr_t g_host_bios_rom_base = 0;
 uintptr_t g_host_acpi32_high_bits = 0;
 SmpHostApBootSimFn g_host_ap_sim_fn = nullptr;
+SmpHostCpuidFn g_host_cpuid_fn = nullptr;
+SmpHostReadMsrFn g_host_read_msr_fn = nullptr;
+SmpHostWriteMsrFn g_host_write_msr_fn = nullptr;
 uint64_t g_host_calibration_ticks = kDefaultHostCalibrationTicks;
 std::atomic<int64_t> g_host_eoi_count{0};
 
@@ -333,9 +334,9 @@ static bool VerifyChecksum(const void* const data, const int64_t length) {
   return sum == 0;
 }
 
-static bool ValidateRsdpV1Bounded(const uintptr_t rsdp_addr,          //
-                                  const uintptr_t rsdp_max_end_addr,  //
-                                  const uintptr_t max_physical_addr,  //
+static bool ValidateRsdpV1Bounded(const uintptr_t rsdp_addr,
+                                  const uintptr_t rsdp_max_end_addr,
+                                  const uintptr_t max_physical_addr,
                                   uintptr_t* const out_rsdt_addr) {
   DCHECK(rsdp_addr != 0);
   DCHECK(max_physical_addr > 0);
@@ -364,10 +365,10 @@ static bool ValidateRsdpV1Bounded(const uintptr_t rsdp_addr,          //
   return true;
 }
 
-static bool ParseRsdpBounded(const uintptr_t rsdp_addr,          //
-                             const uintptr_t rsdp_max_end_addr,  //
-                             const uintptr_t max_physical_addr,  //
-                             uintptr_t* const out_rsdt_addr,     //
+static bool ParseRsdpBounded(const uintptr_t rsdp_addr,
+                             const uintptr_t rsdp_max_end_addr,
+                             const uintptr_t max_physical_addr,
+                             uintptr_t* const out_rsdt_addr,
                              uintptr_t* const out_xsdt_addr) {
   DCHECK(rsdp_addr != 0);
   DCHECK(max_physical_addr > 0);
@@ -424,11 +425,11 @@ static bool ParseRsdpBounded(const uintptr_t rsdp_addr,          //
   return *out_rsdt_addr != 0 || *out_xsdt_addr != 0;
 }
 
-static bool FindRsdpTagsInMultiboot2(const uintptr_t multiboot_info_addr,  //
-                                     const uintptr_t max_physical_addr,    //
-                                     uintptr_t* const out_new_addr,        //
-                                     uintptr_t* const out_new_end_addr,    //
-                                     uintptr_t* const out_old_addr,        //
+static bool FindRsdpTagsInMultiboot2(const uintptr_t multiboot_info_addr,
+                                     const uintptr_t max_physical_addr,
+                                     uintptr_t* const out_new_addr,
+                                     uintptr_t* const out_new_end_addr,
+                                     uintptr_t* const out_old_addr,
                                      uintptr_t* const out_old_end_addr) {
   DCHECK(multiboot_info_addr != 0);
   DCHECK(max_physical_addr > 0);
@@ -548,11 +549,11 @@ static bool IsValidLocalApicAddress(const uintptr_t addr,
 
 static void AddDiscoveredCpu(SmpTopology* const topology,  //
                              const int capacity,           //
-                             const uint8_t apic_id,        //
-                             const uint8_t acpi_processor_id) {
+                             const uint32_t apic_id,       //
+                             const uint32_t acpi_processor_id) {
   DCHECK(topology != nullptr);
   DCHECK(topology->cpus != nullptr);
-  DCHECK(apic_id != kInvalidXapicId);
+  DCHECK(apic_id != kInvalidX2ApicId);
   for (int i = 0; i < topology->cpu_count; ++i) {
     if (topology->cpus[i].apic_id == apic_id) {
       return;
@@ -566,15 +567,15 @@ static void AddDiscoveredCpu(SmpTopology* const topology,  //
   ++topology->cpu_count;
 }
 
-static bool TryDiscoverFromRsdp(const uintptr_t rsdp_addr,          //
-                                const uintptr_t rsdp_max_end_addr,  //
-                                const uintptr_t max_physical_addr,  //
-                                const uint8_t bsp_apic_id,          //
-                                const bool force_v1_only,           //
+static bool TryDiscoverFromRsdp(const uintptr_t rsdp_addr,
+                                const uintptr_t rsdp_max_end_addr,
+                                const uintptr_t max_physical_addr,
+                                const uint32_t bsp_apic_id,
+                                const bool force_v1_only,
                                 SmpTopology* const out_topology) {
   DCHECK(rsdp_addr != 0);
   DCHECK(max_physical_addr > 0);
-  DCHECK(bsp_apic_id != kInvalidXapicId);
+  DCHECK(bsp_apic_id != kInvalidX2ApicId);
   DCHECK(out_topology != nullptr);
   uintptr_t rsdt_addr = 0;
   uintptr_t xsdt_addr = 0;
@@ -618,15 +619,15 @@ static bool TryDiscoverFromRsdp(const uintptr_t rsdp_addr,          //
   return false;
 }
 
-static bool TryDiscoverFromMemoryRange(const uintptr_t range_start,        //
-                                       const int64_t range_length,         //
-                                       const uintptr_t max_physical_addr,  //
-                                       const uint8_t bsp_apic_id,          //
+static bool TryDiscoverFromMemoryRange(const uintptr_t range_start,
+                                       const int64_t range_length,
+                                       const uintptr_t max_physical_addr,
+                                       const uint32_t bsp_apic_id,
                                        SmpTopology* const out_topology) {
   DCHECK(range_start != 0);
   DCHECK(range_length > 0);
   DCHECK(max_physical_addr > 0);
-  DCHECK(bsp_apic_id != kInvalidXapicId);
+  DCHECK(bsp_apic_id != kInvalidX2ApicId);
   DCHECK(out_topology != nullptr);
   if (range_start >= max_physical_addr ||
       (max_physical_addr - range_start) <
@@ -655,7 +656,7 @@ static bool TryDiscoverFromMemoryRange(const uintptr_t range_start,        //
 }
 
 static void InitCpuLocalSlot(const int cpu_index,         //
-                             const uint8_t apic_id,       //
+                             const uint32_t apic_id,      //
                              const bool online,           //
                              const uintptr_t stack_base,  //
                              const uintptr_t stack_top) {
@@ -678,10 +679,13 @@ static void ResetSmpState() {
   g_host_ap_runner.Reset();
   ResetCpuLocalForTest();
   g_host_eoi_count.store(0, std::memory_order_relaxed);
+  g_host_cpuid_fn = nullptr;
+  g_host_read_msr_fn = nullptr;
+  g_host_write_msr_fn = nullptr;
 #else
   internal::g_cpu_local_bound.store(false, std::memory_order_release);
-  g_x2apic_mode = false;
 #endif
+  g_x2apic_mode = false;
   g_topology = {};
   g_cpu_locals.reset();
   g_calibrated_timer_initial_count = 0;
@@ -700,6 +704,194 @@ static void ResetSmpState() {
   g_ap_done_epoch.reset();
 }
 
+static void ReadCpuid(const uint32_t leaf,     //
+                      const uint32_t subleaf,  //
+                      uint32_t* const eax,     //
+                      uint32_t* const ebx,     //
+                      uint32_t* const ecx,     //
+                      uint32_t* const edx) {
+  DCHECK(eax != nullptr);
+  DCHECK(ebx != nullptr);
+  DCHECK(ecx != nullptr);
+  DCHECK(edx != nullptr);
+#if !__STDC_HOSTED__
+  uint32_t a = leaf;
+  uint32_t b = 0;
+  uint32_t c = subleaf;
+  uint32_t d = 0;
+  asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d) : : "cc");
+  *eax = a;
+  *ebx = b;
+  *ecx = c;
+  *edx = d;
+#else
+  *eax = 0;
+  *ebx = 0;
+  *ecx = 0;
+  *edx = 0;
+  if (g_host_cpuid_fn != nullptr) {
+    g_host_cpuid_fn(leaf, subleaf, eax, ebx, ecx, edx);
+  }
+#endif
+}
+
+static uint64_t ReadMsr(const uint32_t msr) {
+#if !__STDC_HOSTED__
+  uint32_t low = 0;
+  uint32_t high = 0;
+  asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
+  return (static_cast<uint64_t>(high) << 32) | low;
+#else
+  if (g_host_read_msr_fn != nullptr) {
+    return g_host_read_msr_fn(msr);
+  }
+  return 0;
+#endif
+}
+
+static void WriteMsr(const uint32_t msr, const uint64_t value) {
+#if !__STDC_HOSTED__
+  const uint32_t low = static_cast<uint32_t>(value & 0xFFFFFFFFu);
+  const uint32_t high = static_cast<uint32_t>(value >> 32);
+  asm volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high) : "memory");
+#else
+  if (g_host_write_msr_fn != nullptr) {
+    g_host_write_msr_fn(msr, value);
+  }
+#endif
+}
+
+static uint32_t ReadCpuidInitialApicId() {
+  uint32_t eax = 0;
+  uint32_t ebx = 0;
+  uint32_t ecx = 0;
+  uint32_t edx = 0;
+  ReadCpuid(1, 0, &eax, &ebx, &ecx, &edx);
+  const uint32_t xapic_id = (ebx >> 24) & 0xFFu;
+  const bool x2apic_supported =
+      (ecx & kCpuidEcxX2ApicBit) != 0 ||
+      (ReadMsr(kMsrIa32ApicBase) & kApicBaseX2ApicEnable) != 0;
+  if (x2apic_supported) {
+    uint32_t max_leaf = 0;
+    uint32_t vendor_ebx = 0;
+    uint32_t vendor_ecx = 0;
+    uint32_t vendor_edx = 0;
+    ReadCpuid(0, 0, &max_leaf, &vendor_ebx, &vendor_ecx, &vendor_edx);
+    if (max_leaf >= 0x0Bu) {
+      uint32_t leaf_b_eax = 0;
+      uint32_t leaf_b_ebx = 0;
+      uint32_t leaf_b_ecx = 0;
+      uint32_t leaf_b_edx = 0;
+      ReadCpuid(0x0Bu, 0, &leaf_b_eax, &leaf_b_ebx, &leaf_b_ecx, &leaf_b_edx);
+      if ((leaf_b_ebx & 0xFFFFu) != 0 || ((leaf_b_ecx >> 8) & 0xFFu) != 0) {
+        return leaf_b_edx;
+      }
+    }
+  }
+  return xapic_id;
+}
+
+static uint32_t LapicOffsetToX2ApicMsr(const int reg_offset) {
+  DCHECK(reg_offset >= 0 && (reg_offset & 0xF) == 0);
+  return kMsrX2ApicBase + static_cast<uint32_t>(reg_offset >> 4);
+}
+
+static uint32_t LapicRead(const uintptr_t lapic_base, const int reg_offset) {
+  DCHECK(g_x2apic_mode || lapic_base != 0);
+  DCHECK(reg_offset >= 0);
+  if (g_x2apic_mode) {
+    return static_cast<uint32_t>(ReadMsr(LapicOffsetToX2ApicMsr(reg_offset)));
+  }
+  const volatile uint32_t* const reg =
+      reinterpret_cast<const volatile uint32_t*>(lapic_base + reg_offset);
+  return *reg;
+}
+
+static void LapicWrite(const uintptr_t lapic_base,  //
+                       const int reg_offset,        //
+                       const uint32_t value) {
+  DCHECK(g_x2apic_mode || lapic_base != 0);
+  DCHECK(reg_offset >= 0);
+  if (g_x2apic_mode) {
+    asm volatile("mfence; lfence" : : : "memory");
+    WriteMsr(LapicOffsetToX2ApicMsr(reg_offset), value);
+    return;
+  }
+  volatile uint32_t* const reg =
+      reinterpret_cast<volatile uint32_t*>(lapic_base + reg_offset);
+  *reg = value;
+  (void)LapicRead(lapic_base, kLapicRegId);
+}
+
+static uint32_t ReadLapicId(const uintptr_t lapic_base) {
+  DCHECK(g_x2apic_mode || lapic_base != 0);
+  const uint32_t raw_id = LapicRead(lapic_base, kLapicRegId);
+  if (g_x2apic_mode) {
+    return raw_id;
+  }
+  return (raw_id >> 24) & 0xFFu;
+}
+
+static bool WaitForIcrIdle(const uintptr_t lapic_base) {
+  DCHECK(g_x2apic_mode || lapic_base != 0);
+  if (g_x2apic_mode) {
+    return true;
+  }
+  for (int i = 0; i < kIcrIdlePollLimit; ++i) {
+    if ((LapicRead(lapic_base, kLapicRegIcrLow) & kIcrDeliveryPending) == 0) {
+      return true;
+    }
+    asm volatile("pause" : : : "memory");
+  }
+  return (LapicRead(lapic_base, kLapicRegIcrLow) & kIcrDeliveryPending) == 0;
+}
+
+static void LapicSendIpiCommand(const uintptr_t lapic_base,
+                                const uint32_t apic_id,
+                                const uint32_t icr_low) {
+  DCHECK(g_x2apic_mode || lapic_base != 0);
+  DCHECK(g_x2apic_mode ? (apic_id != kInvalidX2ApicId)
+                       : (apic_id < kInvalidXapicId));
+  const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
+  CHECK(WaitForIcrIdle(lapic_base));
+  LapicWrite(lapic_base, kLapicRegEsr, 0);
+  (void)LapicRead(lapic_base, kLapicRegEsr);
+  if (g_x2apic_mode) {
+    const uint64_t icr = (static_cast<uint64_t>(apic_id) << 32) | icr_low;
+    asm volatile("mfence; lfence" : : : "memory");
+    WriteMsr(LapicOffsetToX2ApicMsr(kLapicRegIcrLow), icr);
+    internal::LocalRestoreInterrupts(saved_irq);
+    return;
+  }
+  const uint32_t icr_dest = apic_id << 24;
+  LapicWrite(lapic_base, kLapicRegIcrHigh, icr_dest);
+  LapicWrite(lapic_base, kLapicRegIcrLow, icr_low);
+  CHECK(WaitForIcrIdle(lapic_base));
+  internal::LocalRestoreInterrupts(saved_irq);
+}
+
+static void EnableLocalApic(const uintptr_t lapic_base) {
+  DCHECK(g_x2apic_mode || lapic_base != 0);
+  uint64_t apic_base_msr = ReadMsr(kMsrIa32ApicBase);
+  if (!g_x2apic_mode && (apic_base_msr & kApicBaseX2ApicEnable) != 0) {
+    apic_base_msr &= ~(kApicBaseGlobalEnable | kApicBaseX2ApicEnable);
+    WriteMsr(kMsrIa32ApicBase, apic_base_msr);
+  }
+  if ((apic_base_msr & kApicBaseGlobalEnable) == 0) {
+    apic_base_msr |= kApicBaseGlobalEnable;
+    WriteMsr(kMsrIa32ApicBase, apic_base_msr);
+  }
+  if (g_x2apic_mode && (apic_base_msr & kApicBaseX2ApicEnable) == 0) {
+    apic_base_msr |= kApicBaseX2ApicEnable;
+    WriteMsr(kMsrIa32ApicBase, apic_base_msr);
+  }
+  LapicWrite(lapic_base, kLapicRegTpr, 0);
+  const uint32_t svr = LapicRead(lapic_base, kLapicRegSvr);
+  LapicWrite(lapic_base,    //
+             kLapicRegSvr,  //
+             svr | kLapicSvrSoftwareEnable | kLapicSpuriousVector);
+}
+
 #if !__STDC_HOSTED__
 static inline void Outb(const uint16_t port, const uint8_t value) {
   asm volatile("out %1, %0" : : "a"(value), "Nd"(port) : "memory");
@@ -709,19 +901,6 @@ static inline uint8_t Inb(const uint16_t port) {
   uint8_t value = 0;
   asm volatile("in %0, %1" : "=a"(value) : "Nd"(port) : "memory");
   return value;
-}
-
-static uint64_t ReadMsr(const uint32_t msr) {
-  uint32_t low = 0;
-  uint32_t high = 0;
-  asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
-  return (static_cast<uint64_t>(high) << 32) | low;
-}
-
-static void WriteMsr(const uint32_t msr, const uint64_t value) {
-  const uint32_t low = static_cast<uint32_t>(value & 0xFFFFFFFFu);
-  const uint32_t high = static_cast<uint32_t>(value >> 32);
-  asm volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high) : "memory");
 }
 
 static uintptr_t ReadRsp() {
@@ -753,115 +932,14 @@ static bool IsHardwareLongModeActive() {
   return (efer & kEferLongModeActive) != 0 && ReadCs() == kKernelCodeSelector;
 }
 
-static uint8_t ReadCpuidInitialApicId() {
-  uint32_t eax = 1;
-  uint32_t ebx = 0;
-  uint32_t ecx = 0;
-  uint32_t edx = 0;
-  asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : : "cc");
-  return static_cast<uint8_t>((ebx >> 24) & 0xFFu);
-}
-
 static bool IsX2ApicSupported() {
-  uint32_t eax = 1;
+  uint32_t eax = 0;
   uint32_t ebx = 0;
   uint32_t ecx = 0;
   uint32_t edx = 0;
-  asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : : "cc");
+  ReadCpuid(1, 0, &eax, &ebx, &ecx, &edx);
   return (ecx & kCpuidEcxX2ApicBit) != 0 ||
          (ReadMsr(kMsrIa32ApicBase) & kApicBaseX2ApicEnable) != 0;
-}
-
-static uint32_t LapicOffsetToX2ApicMsr(const int reg_offset) {
-  DCHECK(reg_offset >= 0 && (reg_offset & 0xF) == 0);
-  return kMsrX2ApicBase + static_cast<uint32_t>(reg_offset >> 4);
-}
-
-static uint32_t LapicRead(const uintptr_t lapic_base, const int reg_offset) {
-  DCHECK(lapic_base != 0);
-  DCHECK(reg_offset >= 0);
-  if (g_x2apic_mode) {
-    return static_cast<uint32_t>(ReadMsr(LapicOffsetToX2ApicMsr(reg_offset)));
-  }
-  const volatile uint32_t* const reg =
-      reinterpret_cast<const volatile uint32_t*>(lapic_base + reg_offset);
-  return *reg;
-}
-
-static void LapicWrite(const uintptr_t lapic_base,  //
-                       const int reg_offset,        //
-                       const uint32_t value) {
-  DCHECK(lapic_base != 0);
-  DCHECK(reg_offset >= 0);
-  if (g_x2apic_mode) {
-    asm volatile("mfence" : : : "memory");
-    WriteMsr(LapicOffsetToX2ApicMsr(reg_offset), value);
-    return;
-  }
-  volatile uint32_t* const reg =
-      reinterpret_cast<volatile uint32_t*>(lapic_base + reg_offset);
-  *reg = value;
-  (void)LapicRead(lapic_base, kLapicRegId);
-}
-
-static void EnableLocalApic(const uintptr_t lapic_base) {
-  DCHECK(lapic_base != 0);
-  uint64_t apic_base_msr = ReadMsr(kMsrIa32ApicBase);
-  if ((apic_base_msr & kApicBaseGlobalEnable) == 0) {
-    apic_base_msr |= kApicBaseGlobalEnable;
-    WriteMsr(kMsrIa32ApicBase, apic_base_msr);
-  }
-  if (g_x2apic_mode && (apic_base_msr & kApicBaseX2ApicEnable) == 0) {
-    apic_base_msr |= kApicBaseX2ApicEnable;
-    WriteMsr(kMsrIa32ApicBase, apic_base_msr);
-  }
-  LapicWrite(lapic_base, kLapicRegTpr, 0);
-  const uint32_t svr = LapicRead(lapic_base, kLapicRegSvr);
-  LapicWrite(lapic_base,    //
-             kLapicRegSvr,  //
-             svr | kLapicSvrSoftwareEnable | kLapicSpuriousVector);
-}
-
-static uint8_t ReadLapicId(const uintptr_t lapic_base) {
-  DCHECK(lapic_base != 0);
-  const uint32_t raw_id = LapicRead(lapic_base, kLapicRegId);
-  if (g_x2apic_mode) {
-    return static_cast<uint8_t>(raw_id & 0xFFu);
-  }
-  return static_cast<uint8_t>((raw_id >> 24) & 0xFFu);
-}
-
-static bool WaitForIcrIdle(const uintptr_t lapic_base) {
-  DCHECK(lapic_base != 0);
-  if (g_x2apic_mode) {
-    return true;
-  }
-  for (int i = 0; i < kIcrIdlePollLimit; ++i) {
-    if ((LapicRead(lapic_base, kLapicRegIcrLow) & kIcrDeliveryPending) == 0) {
-      return true;
-    }
-    asm volatile("pause" : : : "memory");
-  }
-  return (LapicRead(lapic_base, kLapicRegIcrLow) & kIcrDeliveryPending) == 0;
-}
-
-static void LapicSendIpiCommand(const uintptr_t lapic_base,  //
-                                const uint8_t apic_id,       //
-                                const uint32_t icr_low) {
-  DCHECK(lapic_base != 0);
-  DCHECK(apic_id != kInvalidXapicId);
-  LapicWrite(lapic_base, kLapicRegEsr, 0);
-  (void)LapicRead(lapic_base, kLapicRegEsr);
-  if (g_x2apic_mode) {
-    const uint64_t icr = (static_cast<uint64_t>(apic_id) << 32) | icr_low;
-    asm volatile("mfence" : : : "memory");
-    WriteMsr(LapicOffsetToX2ApicMsr(kLapicRegIcrLow), icr);
-    return;
-  }
-  const uint32_t icr_dest = static_cast<uint32_t>(apic_id) << 24;
-  LapicWrite(lapic_base, kLapicRegIcrHigh, icr_dest);
-  LapicWrite(lapic_base, kLapicRegIcrLow, icr_low);
-  CHECK(WaitForIcrIdle(lapic_base));
 }
 
 static uint8_t ReadPitSpeakerPort() { return Inb(kPitSpeakerPort); }
@@ -871,7 +949,7 @@ static uint32_t ReadLapicTimerCurrentCount(const uintptr_t lapic_base) {
 }
 
 static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
-  DCHECK(lapic_base != 0);
+  DCHECK(g_x2apic_mode || lapic_base != 0);
   LapicWrite(lapic_base, kLapicRegTimerDivConfig, kLapicTimerDivBy16);
   LapicWrite(lapic_base,         //
              kLapicRegLvtTimer,  //
@@ -907,7 +985,7 @@ static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
 
 static void StartLocalApicTimer(const uintptr_t lapic_base,
                                 const uint32_t initial_count) {
-  DCHECK(lapic_base != 0);
+  DCHECK(g_x2apic_mode || lapic_base != 0);
   DCHECK(initial_count > 0);
   LapicWrite(lapic_base, kLapicRegTimerDivConfig, kLapicTimerDivBy16);
   LapicWrite(lapic_base,         //
@@ -917,10 +995,11 @@ static void StartLocalApicTimer(const uintptr_t lapic_base,
 }
 
 static void SendFixedIpi(const uintptr_t lapic_base,  //
-                         const uint8_t apic_id,       //
+                         const uint32_t apic_id,      //
                          const uint8_t vector) {
-  DCHECK(lapic_base != 0);
-  DCHECK(apic_id != kInvalidXapicId);
+  DCHECK(g_x2apic_mode || lapic_base != 0);
+  DCHECK(g_x2apic_mode ? (apic_id != kInvalidX2ApicId)
+                       : (apic_id < kInvalidXapicId));
   DCHECK(vector >= static_cast<uint8_t>(kCpuExceptionCount));
   LapicSendIpiCommand(
       lapic_base,  //
@@ -963,13 +1042,14 @@ static void RestoreApTrampoline(const uint8_t* const saved_bytes) {
   std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
-static void WakeApplicationProcessor(const uintptr_t lapic_base,  //
-                                     const int cpu_index,         //
-                                     const uint8_t apic_id,       //
+static void WakeApplicationProcessor(const uintptr_t lapic_base,
+                                     const int cpu_index,
+                                     const uint32_t apic_id,
                                      const uintptr_t stack_top_addr) {
-  DCHECK(lapic_base != 0);
+  DCHECK(g_x2apic_mode || lapic_base != 0);
   DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
-  DCHECK(apic_id != kInvalidXapicId);
+  DCHECK(g_x2apic_mode ? (apic_id != kInvalidX2ApicId)
+                       : (apic_id < kInvalidXapicId));
   DCHECK(stack_top_addr != 0 && (stack_top_addr & 0xF) == 0);
   g_ap_boot_stack = stack_top_addr;
   g_ap_boot_cpu_index = cpu_index;
@@ -1055,10 +1135,10 @@ static bool RunPendingApWork(const int cpu_index,
 
 static void SendWakeupIpi(const uintptr_t lapic_base,  //
                           const int cpu_index,         //
-                          const uint8_t apic_id) {
-  DCHECK(lapic_base != 0);
+                          const uint32_t apic_id) {
+  DCHECK(g_x2apic_mode || lapic_base != 0);
   DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
-  DCHECK(apic_id != kInvalidXapicId);
+  DCHECK(apic_id != kInvalidX2ApicId);
 #if !__STDC_HOSTED__
   (void)cpu_index;
   SendFixedIpi(lapic_base, apic_id, kVectorWakeupIpi);
@@ -1097,7 +1177,7 @@ extern "C" void ApKernelEntry(const int cpu_index) {
 #if !__STDC_HOSTED__
   g_ap_boot_started.store(1, std::memory_order_release);
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
-  DCHECK(lapic_base != 0);
+  DCHECK(g_x2apic_mode || lapic_base != 0);
   DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
 
   IdtLoad();
@@ -1256,11 +1336,11 @@ uintptr_t SmpFindMadtInSdt(const uintptr_t rsdt_addr,  //
 
 bool SmpParseMadt(const uintptr_t madt_addr,          //
                   const uintptr_t max_physical_addr,  //
-                  const uint8_t bsp_apic_id,          //
+                  const uint32_t bsp_apic_id,         //
                   SmpTopology* const out_topology) {
   DCHECK(madt_addr != 0);
   DCHECK(max_physical_addr > 0);
-  DCHECK(bsp_apic_id != kInvalidXapicId);
+  DCHECK(bsp_apic_id != kInvalidX2ApicId);
   DCHECK(out_topology != nullptr);
   *out_topology = {};
 
@@ -1317,7 +1397,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
       const AcpiMadtLocalX2Apic* const x2apic =
           reinterpret_cast<const AcpiMadtLocalX2Apic*>(entry);
       if ((x2apic->flags & kMadtLapicUsableMask) != 0 &&
-          x2apic->x2apic_id < kInvalidXapicId) {
+          x2apic->x2apic_id != kInvalidX2ApicId) {
         ++candidate_count;
       }
     }
@@ -1370,11 +1450,11 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
       const AcpiMadtLocalX2Apic* const x2apic =
           reinterpret_cast<const AcpiMadtLocalX2Apic*>(entry);
       if ((x2apic->flags & kMadtLapicUsableMask) != 0 &&
-          x2apic->x2apic_id < kInvalidXapicId) {
-        AddDiscoveredCpu(out_topology,                             //
-                         capacity,                                 //
-                         static_cast<uint8_t>(x2apic->x2apic_id),  //
-                         static_cast<uint8_t>(x2apic->acpi_processor_uid));
+          x2apic->x2apic_id != kInvalidX2ApicId) {
+        AddDiscoveredCpu(out_topology,       //
+                         capacity,           //
+                         x2apic->x2apic_id,  //
+                         x2apic->acpi_processor_uid);
       }
     }
 
@@ -1417,15 +1497,15 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
   return true;
 }
 
-bool SmpDiscoverTopology(const uint32_t multiboot_magic,      //
-                         const uint64_t multiboot_info_addr,  //
-                         const uintptr_t ebda_base,           //
-                         const uintptr_t bios_rom_base,       //
-                         const uintptr_t max_physical_addr,   //
-                         const uint8_t bsp_apic_id,           //
+bool SmpDiscoverTopology(const uint32_t multiboot_magic,
+                         const uint64_t multiboot_info_addr,
+                         const uintptr_t ebda_base,
+                         const uintptr_t bios_rom_base,
+                         const uintptr_t max_physical_addr,
+                         const uint32_t bsp_apic_id,
                          SmpTopology* const out_topology) {
   DCHECK(max_physical_addr > 0);
-  DCHECK(bsp_apic_id != kInvalidXapicId);
+  DCHECK(bsp_apic_id != kInvalidX2ApicId);
   DCHECK(out_topology != nullptr);
   *out_topology = {};
 
@@ -1489,8 +1569,8 @@ bool SmpDiscoverTopology(const uint32_t multiboot_magic,      //
   return false;
 }
 
-uint32_t ComputeApicTimerInitialCount(const uint64_t elapsed_apic_ticks,  //
-                                      const int pit_reload_count,         //
+uint32_t ComputeApicTimerInitialCount(const uint64_t elapsed_apic_ticks,
+                                      const int pit_reload_count,
                                       const int target_hz) {
   DCHECK(pit_reload_count > 0 && pit_reload_count <= kMaxPitReloadCount);
   DCHECK(target_hz > 0 && target_hz <= kPitBaseFrequencyHz);
@@ -1535,10 +1615,8 @@ uint32_t CalibrateApicTimerCount(
   }
 
   const uint64_t elapsed_ticks = 0xFFFFFFFFULL - current_count;
-  const uint32_t initial_count =
-      ComputeApicTimerInitialCount(elapsed_ticks,               //
-                                   kPitCalibrationReloadCount,  //
-                                   kApicTimerTargetHz);
+  const uint32_t initial_count = ComputeApicTimerInitialCount(
+      elapsed_ticks, kPitCalibrationReloadCount, kApicTimerTargetHz);
   return (initial_count > 0) ? initial_count : kFallbackApicTimerInitialCount;
 }
 
@@ -1550,7 +1628,7 @@ void SmpInit(const uint32_t multiboot_magic,
   }
 
 #if !__STDC_HOSTED__
-  const uint8_t bsp_initial_apic_id = ReadCpuidInitialApicId();
+  const uint32_t bsp_initial_apic_id = ReadCpuidInitialApicId();
   uintptr_t bda_ebda_addr = 0x040E;
   asm volatile("" : "+r"(bda_ebda_addr));
   const uint16_t ebda_segment =
@@ -1562,7 +1640,7 @@ void SmpInit(const uint32_t multiboot_magic,
           : 0;
   const uintptr_t bios_rom_base = kBiosRomSearchBase;
 #else
-  const uint8_t bsp_initial_apic_id = g_host_bsp_apic_id;
+  const uint32_t bsp_initial_apic_id = g_host_bsp_apic_id;
   const uintptr_t ebda_base = g_host_ebda_base;
   const uintptr_t bios_rom_base = g_host_bios_rom_base;
 #endif
@@ -1584,11 +1662,12 @@ void SmpInit(const uint32_t multiboot_magic,
   g_ap_done_epoch.reset(new std::atomic<int64_t>[cpu_count]());
   CHECK(g_ap_done_epoch != nullptr);
 
-  CHECK(PagingMapBootstrapRange(g_topology.local_apic_phys_addr, kPageSize));
-
 #if !__STDC_HOSTED__
-  MarkMmioPageUncacheable(g_topology.local_apic_phys_addr);
   g_x2apic_mode = IsX2ApicSupported();
+  if (!g_x2apic_mode) {
+    CHECK(PagingMapBootstrapRange(g_topology.local_apic_phys_addr, kPageSize));
+    MarkMmioPageUncacheable(g_topology.local_apic_phys_addr);
+  }
   EnableLocalApic(g_topology.local_apic_phys_addr);
   g_topology.cpus[0].observed_apic_id =
       ReadLapicId(g_topology.local_apic_phys_addr);
@@ -1598,6 +1677,9 @@ void SmpInit(const uint32_t multiboot_magic,
   g_topology.cpus[0].observed_cr3 = ReadCr3();
   g_topology.cpus[0].long_mode_active = IsHardwareLongModeActive();
 #else
+  if (!g_x2apic_mode) {
+    CHECK(PagingMapBootstrapRange(g_topology.local_apic_phys_addr, kPageSize));
+  }
   g_topology.cpus[0].observed_apic_id = bsp_initial_apic_id;
   g_topology.cpus[0].stack_base = 0x100000;
   g_topology.cpus[0].stack_top = 0x100000 + kApStackSize;
@@ -1619,10 +1701,8 @@ void SmpInit(const uint32_t multiboot_magic,
   g_calibrated_timer_initial_count =
       CalibrateLocalApicTimer(g_topology.local_apic_phys_addr);
 #else
-  g_calibrated_timer_initial_count =
-      ComputeApicTimerInitialCount(g_host_calibration_ticks,    //
-                                   kPitCalibrationReloadCount,  //
-                                   kApicTimerTargetHz);
+  g_calibrated_timer_initial_count = ComputeApicTimerInitialCount(
+      g_host_calibration_ticks, kPitCalibrationReloadCount, kApicTimerTargetHz);
   CHECK(g_calibrated_timer_initial_count > 0);
 #endif
 
@@ -1761,6 +1841,8 @@ uintptr_t SmpLocalApicPhysAddr() {
   return g_topology.local_apic_phys_addr;
 }
 
+bool SmpIsX2ApicEnabled() { return g_x2apic_mode; }
+
 uint32_t SmpCalibratedTimerInitialCount() {
   DCHECK(g_smp_initialized);
   return g_calibrated_timer_initial_count;
@@ -1769,7 +1851,7 @@ uint32_t SmpCalibratedTimerInitialCount() {
 void SmpSetLocalApicTimerInitialCount(const uint32_t initial_count) {
 #if !__STDC_HOSTED__
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
-  if (lapic_base == 0 || initial_count == 0) {
+  if ((!g_x2apic_mode && lapic_base == 0) || initial_count == 0) {
     return;
   }
   LapicWrite(lapic_base, kLapicRegTimerInitCount, initial_count);
@@ -1781,7 +1863,7 @@ void SmpSetLocalApicTimerInitialCount(const uint32_t initial_count) {
 void SmpSendLocalApicEoi() {
 #if !__STDC_HOSTED__
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
-  DCHECK(lapic_base != 0);
+  DCHECK(g_x2apic_mode || lapic_base != 0);
   LapicWrite(lapic_base, kLapicRegEoi, 0);
 #else
   g_host_eoi_count.fetch_add(1, std::memory_order_relaxed);
@@ -1833,7 +1915,7 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
   }
 
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
-  DCHECK(lapic_base != 0);
+  DCHECK(g_x2apic_mode || lapic_base != 0);
   g_work_fn.store(work_fn, std::memory_order_release);
   g_work_context.store(context, std::memory_order_release);
   const int64_t epoch =
@@ -1873,12 +1955,12 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
 }
 
 #if __STDC_HOSTED__
-void SmpSetHostTestHooks(const uint8_t bsp_apic_id,      //
+void SmpSetHostTestHooks(const uint32_t bsp_apic_id,     //
                          const uintptr_t ebda_base,      //
                          const uintptr_t bios_rom_base,  //
                          const uintptr_t acpi32_arena,   //
                          const SmpHostApBootSimFn sim_fn) {
-  DCHECK(bsp_apic_id != kInvalidXapicId);
+  DCHECK(bsp_apic_id != kInvalidX2ApicId);
   ResetSmpState();
   g_host_bsp_apic_id = bsp_apic_id;
   g_host_ebda_base = ebda_base;
@@ -1886,6 +1968,38 @@ void SmpSetHostTestHooks(const uint8_t bsp_apic_id,      //
   g_host_acpi32_high_bits = acpi32_arena & ~0xFFFFFFFFULL;
   g_host_ap_sim_fn = sim_fn;
   g_host_calibration_ticks = kDefaultHostCalibrationTicks;
+}
+
+void SmpSetHostHardwareHooksForTest(const bool x2apic_mode,
+                                    const SmpHostCpuidFn cpuid_fn,
+                                    const SmpHostReadMsrFn read_msr_fn,
+                                    const SmpHostWriteMsrFn write_msr_fn) {
+  g_x2apic_mode = x2apic_mode;
+  g_host_cpuid_fn = cpuid_fn;
+  g_host_read_msr_fn = read_msr_fn;
+  g_host_write_msr_fn = write_msr_fn;
+}
+
+uint32_t SmpReadCpuidInitialApicIdForTest() { return ReadCpuidInitialApicId(); }
+
+uint32_t SmpReadLapicIdForTest(const uintptr_t lapic_base) {
+  return ReadLapicId(lapic_base);
+}
+
+void SmpEnableLocalApicForTest(const uintptr_t lapic_base) {
+  EnableLocalApic(lapic_base);
+}
+
+void SmpLapicWriteForTest(const uintptr_t lapic_base,  //
+                          const int reg_offset,        //
+                          const uint32_t value) {
+  LapicWrite(lapic_base, reg_offset, value);
+}
+
+void SmpLapicSendIpiCommandForTest(const uintptr_t lapic_base,
+                                   const uint32_t apic_id,
+                                   const uint32_t icr_low) {
+  LapicSendIpiCommand(lapic_base, apic_id, icr_low);
 }
 
 void SmpSetHostTimerCalibrationTicksForTest(const uint64_t elapsed_apic_ticks) {

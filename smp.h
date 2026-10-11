@@ -34,12 +34,18 @@ constexpr int64_t kPitBaseFrequencyHz = 1193182;
 constexpr int kPitCalibrationReloadCount = 11932;
 // Periodic Local APIC timer target interrupt frequency in Hz.
 constexpr int kApicTimerTargetHz = 250;
+// Maximum number of logical CPUs supported by the kernel and test suite.
+constexpr int kMaxSupportedCpus = 128;
+// Reserved 8-bit xAPIC broadcast/invalid APIC ID.
+constexpr uint8_t kInvalidXapicId = 0xFFu;
+// Reserved 32-bit x2APIC broadcast/invalid APIC ID.
+constexpr uint32_t kInvalidX2ApicId = 0xFFFFFFFFu;
 
 // Per-CPU descriptor populated during ACPI MADT discovery and AP bring-up.
 struct CpuInfo {
-  uint8_t apic_id;
-  uint8_t acpi_processor_id;
-  uint8_t observed_apic_id;
+  uint32_t apic_id;
+  uint32_t acpi_processor_id;
+  uint32_t observed_apic_id;
   bool is_bsp;
   bool online;
   bool long_mode_active;
@@ -56,7 +62,7 @@ class IrqSpinLock;
 struct alignas(64) CpuLocal {
   CpuLocal* self = nullptr;
   int cpu_id = 0;
-  uint8_t apic_id = 0;
+  uint32_t apic_id = 0;
   bool online = false;
   uintptr_t stack_base = 0;
   uintptr_t stack_top = 0;
@@ -152,7 +158,7 @@ inline void ResetCpuLocalForTest() {
 // Discovered multiprocessor topology from ACPI MADT firmware tables.
 struct SmpTopology {
   uintptr_t local_apic_phys_addr = 0;
-  uint8_t bsp_apic_id = 0;
+  uint32_t bsp_apic_id = 0;
   int cpu_count = 0;
   std::unique_ptr<CpuInfo[]> cpus;
 };
@@ -196,12 +202,12 @@ uintptr_t SmpFindMadtInSdt(uintptr_t rsdt_addr,  //
 // `max_physical_addr`), extracting the Local APIC MMIO base address (including
 // any Type 5 64-bit override) and all enabled or online-capable processors
 // (Type 0 Local APIC and Type 9 Local x2APIC entries) into non-null
-// `*out_topology` with `bsp_apic_id` (`!= 0xFF`) placed at index 0. Validates
-// preconditions with `DCHECK`. Returns true if the MADT is valid and at least
-// one CPU is present.
+// `*out_topology` with `bsp_apic_id` (`!= kInvalidX2ApicId`) placed at index 0.
+// Validates preconditions with `DCHECK`. Returns true if the MADT is valid and
+// at least one CPU is present.
 bool SmpParseMadt(uintptr_t madt_addr,          //
                   uintptr_t max_physical_addr,  //
-                  uint8_t bsp_apic_id,          //
+                  uint32_t bsp_apic_id,         //
                   SmpTopology* out_topology);
 
 // Discovers the system CPU topology from Multiboot2 ACPI tags (if
@@ -214,7 +220,7 @@ bool SmpDiscoverTopology(uint32_t multiboot_magic,      //
                          uintptr_t ebda_base,           //
                          uintptr_t bios_rom_base,       //
                          uintptr_t max_physical_addr,   //
-                         uint8_t bsp_apic_id,           //
+                         uint32_t bsp_apic_id,          //
                          SmpTopology* out_topology);
 
 // Computes the periodic Local APIC timer initial count for `target_hz`
@@ -279,6 +285,9 @@ CpuLocal* SmpGetCpuLocal(int cpu_index);
 // during `SmpInit`. Validates with `DCHECK` that `SmpInit` has completed.
 uintptr_t SmpLocalApicPhysAddr();
 
+// Returns true if the Local APIC is operating in MSR-based x2APIC mode.
+bool SmpIsX2ApicEnabled();
+
 // Returns the PIT-calibrated periodic Local APIC timer initial count computed
 // during `SmpInit`. Validates with `DCHECK` that `SmpInit` has completed.
 uint32_t SmpCalibratedTimerInitialCount();
@@ -311,11 +320,31 @@ void SmpRunOnAllCpus(SmpWorkFn work_fn, void* context);
 // Host unit-test hooks for overriding hardware AP bring-up behavior, 32-bit
 // ACPI table pointer base, and simulated PIT/APIC timer calibration ticks.
 using SmpHostApBootSimFn = bool (*)(int cpu_index, CpuInfo* cpu_info);
-void SmpSetHostTestHooks(uint8_t bsp_apic_id,      //
+using SmpHostCpuidFn = void (*)(uint32_t leaf,     //
+                                uint32_t subleaf,  //
+                                uint32_t* eax,     //
+                                uint32_t* ebx,     //
+                                uint32_t* ecx,     //
+                                uint32_t* edx);
+using SmpHostReadMsrFn = uint64_t (*)(uint32_t msr);
+using SmpHostWriteMsrFn = void (*)(uint32_t msr, uint64_t value);
+
+void SmpSetHostTestHooks(uint32_t bsp_apic_id,     //
                          uintptr_t ebda_base,      //
                          uintptr_t bios_rom_base,  //
                          uintptr_t acpi32_arena,   //
                          SmpHostApBootSimFn sim_fn);
+void SmpSetHostHardwareHooksForTest(bool x2apic_mode,              //
+                                    SmpHostCpuidFn cpuid_fn,       //
+                                    SmpHostReadMsrFn read_msr_fn,  //
+                                    SmpHostWriteMsrFn write_msr_fn);
+uint32_t SmpReadCpuidInitialApicIdForTest();
+uint32_t SmpReadLapicIdForTest(uintptr_t lapic_base);
+void SmpEnableLocalApicForTest(uintptr_t lapic_base);
+void SmpLapicWriteForTest(uintptr_t lapic_base, int reg_offset, uint32_t value);
+void SmpLapicSendIpiCommandForTest(uintptr_t lapic_base,  //
+                                   uint32_t apic_id,      //
+                                   uint32_t icr_low);
 void SmpSetHostTimerCalibrationTicksForTest(uint64_t elapsed_apic_ticks);
 int64_t SmpGetHostEoiCountForTest();
 void SmpResetHostEoiCountForTest();

@@ -114,17 +114,18 @@ _start:
     or  eax, ((1 << 5) | (1 << 9) | (1 << 10))
     mov cr4, eax
 
-    /* Enable Long Mode in IA32_EFER MSR (0xC0000080, bit 8 = LME) */
+    /* Enable Long Mode (bit 8 = LME) and No-Execute (bit 11 = NXE) in IA32_EFER MSR (0xC0000080) */
     mov ecx, 0xC0000080
     rdmsr
-    or  eax, (1 << 8)
+    or  eax, ((1 << 8) | (1 << 11))
     wrmsr
 
-    /* Enable Paging (bit 31 = PG), Monitor Coprocessor (bit 1 = MP),
-     * and Protected Mode (bit 0 = PE) while clearing Emulation (bit 2 = EM) in CR0 */
+    /* Enable Paging (bit 31 = PG), Write Protect (bit 16 = WP), Monitor
+     * Coprocessor (bit 1 = MP), and Protected Mode (bit 0 = PE) while clearing
+     * Emulation (bit 2 = EM) in CR0 */
     mov eax, cr0
     and eax, ~(1 << 2)
-    or  eax, ((1 << 31) | (1 << 1) | (1 << 0))
+    or  eax, ((1 << 31) | (1 << 16) | (1 << 1) | (1 << 0))
     mov cr0, eax
 
     /* Load 64-bit Global Descriptor Table (GDT) */
@@ -147,8 +148,10 @@ long_mode_start:
     mov gs, ax
     mov ss, ax
 
-    /* Set up 64-bit stack pointer (16-byte aligned) */
+    /* Set up 64-bit stack pointer (16-byte aligned) and reset RFLAGS */
     mov rsp, offset stack_top
+    push 0
+    popfq
 
     /* Populate 32-entry 64-bit IDT (vectors 0..31) so bare-metal NMIs do not
      * cause a double/triple fault reset. */
@@ -263,17 +266,18 @@ ap_pm32_entry:
     mov eax, offset pml4_table
     mov cr3, eax
 
-    /* Enable Long Mode in IA32_EFER MSR (0xC0000080, bit 8 = LME) */
+    /* Enable Long Mode (bit 8 = LME) and No-Execute (bit 11 = NXE) in IA32_EFER MSR (0xC0000080) */
     mov ecx, 0xC0000080
     rdmsr
-    or  eax, (1 << 8)
+    or  eax, ((1 << 8) | (1 << 11))
     wrmsr
 
-    /* Enable Paging (bit 31 = PG), Monitor Coprocessor (bit 1 = MP),
-     * and Protected Mode (bit 0 = PE) while clearing Emulation (bit 2 = EM) in CR0 */
+    /* Enable Paging (bit 31 = PG), Write Protect (bit 16 = WP), Monitor
+     * Coprocessor (bit 1 = MP), and Protected Mode (bit 0 = PE) while clearing
+     * Emulation (bit 2 = EM) in CR0 */
     mov eax, cr0
     and eax, ~(1 << 2)
-    or  eax, ((1 << 31) | (1 << 1) | (1 << 0))
+    or  eax, ((1 << 31) | (1 << 16) | (1 << 1) | (1 << 0))
     mov cr0, eax
 
     /* Far jump to 64-bit Long Mode entry in kernel .text (selector 0x08) */
@@ -307,10 +311,12 @@ ap_long_mode_entry:
     mov gs, ax
     mov ss, ax
 
-    /* Load this AP's dedicated 64-bit stack pointer and CPU slot index */
+    /* Load this AP's dedicated 64-bit stack pointer, reset RFLAGS, and load CPU slot index */
     .extern g_ap_boot_stack
     .extern g_ap_boot_cpu_index
     mov rsp, qword ptr [g_ap_boot_stack]
+    push 0
+    popfq
     mov edi, dword ptr [g_ap_boot_cpu_index]
     xor rbp, rbp
 

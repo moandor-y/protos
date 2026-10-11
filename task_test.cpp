@@ -240,10 +240,8 @@ static void VeteranFloorWorker(void* const raw_arg) {
     sched->Yield();
   }
 
-  ctx->newborn = sched->CreateTaskOnCpu(NewbornFloorWorker,  //
-                                        ctx,                 //
-                                        kDefaultTaskWeight,  //
-                                        0);
+  ctx->newborn =
+      sched->CreateTaskOnCpu(NewbornFloorWorker, ctx, kDefaultTaskWeight, 0);
   for (int i = 0; i < 4; ++i) {
     ctx->create_trace.push_back(1);
     sched->Yield();
@@ -283,10 +281,8 @@ TEST(TaskTest,
   //     then spawns `newborn` on CPU 0. Because `newborn`'s vruntime is
   //     clamped to CPU 0's min_vruntime (instead of 0), `newborn` does not
   //     starve `veteran` for 4 consecutive slices — they interleave.
-  Task* const veteran = sched->CreateTaskOnCpu(VeteranFloorWorker,  //
-                                               &ctx,                //
-                                               kDefaultTaskWeight,  //
-                                               0);
+  Task* const veteran =
+      sched->CreateTaskOnCpu(VeteranFloorWorker, &ctx, kDefaultTaskWeight, 0);
   sched->Join(veteran);
   ASSERT_THAT(ctx.newborn, t::NotNull());
   sched->Join(ctx.newborn);
@@ -314,20 +310,16 @@ TEST(TaskTest,
   //     normalizes `remote_task`'s vruntime to CPU 0's min_vruntime,
   //     `remote_task` (20) interleaves with `local_peer` (10) instead of
   //     monopolizing CPU 0 for all 4 slices.
-  Task* const remote_task = sched->CreateTaskOnCpu(MigratedFloorWorker,  //
-                                                   &ctx,                 //
-                                                   kDefaultTaskWeight,   //
-                                                   1);
+  Task* const remote_task =
+      sched->CreateTaskOnCpu(MigratedFloorWorker, &ctx, kDefaultTaskWeight, 1);
   EXPECT_THAT(sched->RunqueueLoad(1), t::Eq(1));
   EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(0));
   EXPECT_TRUE(sched->StealTask(0, 1));
   EXPECT_THAT(sched->RunqueueLoad(1), t::Eq(0));
   EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(1));
 
-  Task* const local_peer = sched->CreateTaskOnCpu(LocalPeerFloorWorker,  //
-                                                  &ctx,                  //
-                                                  kDefaultTaskWeight,    //
-                                                  0);
+  Task* const local_peer =
+      sched->CreateTaskOnCpu(LocalPeerFloorWorker, &ctx, kDefaultTaskWeight, 0);
   sched->Join(remote_task);
   sched->Join(local_peer);
 

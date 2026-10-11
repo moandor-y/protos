@@ -12,6 +12,7 @@ void VgaClear();
 // Writes a single character to the console at the current cursor position,
 // advancing the cursor and scrolling as needed.
 void VgaPutc(char ch);
+void VgaPutChar(char ch);
 
 // Writes a null-terminated string to the console at the current cursor
 // position, advancing the cursor and scrolling as needed.
@@ -22,6 +23,11 @@ void VgaWriteHex(uint64_t value);
 
 // Writes a 64-bit unsigned integer in base-10 decimal to the console.
 void VgaWriteDec(uint64_t value);
+
+// Returns the current 0-based cursor row (`0 <= row < 25`) or column
+// (`0 <= col < 80`) under `g_vga_lock`.
+int VgaGetCursorRow();
+int VgaGetCursorCol();
 
 // Lockless emergency panic writer for the VGA console; must only be called with
 // local interrupts disabled in unrecoverable panic paths (e.g., CheckFailure).

@@ -550,8 +550,8 @@ TEST(SmpTest, ParseMadtHandlesBspReorderingFilteringDuplicatesAndOverrides) {
   AppendLapicRecord(&recs, 13, 2, 1);
   // CPU with APIC ID 7 via Local x2APIC (Type 9)
   AppendX2ApicRecord(&recs, 7, 14, 1);
-  // x2APIC entry with ID >= 0xFF (must be ignored in xAPIC mode)
-  AppendX2ApicRecord(&recs, 255, 15, 1);
+  // Broadcast/invalid 32-bit x2APIC entry 0xFFFFFFFF (must be ignored)
+  AppendX2ApicRecord(&recs, kInvalidX2ApicId, 15, 1);
   // 64-bit Local APIC Address Override (Type 5)
   AppendLapicOverrideRecord(&recs, 0xFEE01000ULL);
   // Misaligned 64-bit Local APIC Address Override (must be ignored)
@@ -565,32 +565,32 @@ TEST(SmpTest, ParseMadtHandlesBspReorderingFilteringDuplicatesAndOverrides) {
   SmpTopology topo = {};
   ASSERT_TRUE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 4, &topo));
   EXPECT_THAT(topo.local_apic_phys_addr, t::Eq(0xFEE01000ULL));
-  EXPECT_THAT(topo.bsp_apic_id, t::Eq(4));
+  EXPECT_THAT(topo.bsp_apic_id, t::Eq(4u));
   ASSERT_THAT(topo.cpu_count, t::Eq(3));
 
   // BSP (APIC ID 4) must be placed at index 0, preserving relative order of APs
   // (APIC ID 2 at index 1, APIC ID 7 at index 2).
-  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(4));
+  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(4u));
   EXPECT_TRUE(topo.cpus[0].is_bsp);
   EXPECT_TRUE(topo.cpus[0].online);
 
-  EXPECT_THAT(topo.cpus[1].apic_id, t::Eq(2));
-  EXPECT_THAT(topo.cpus[1].acpi_processor_id, t::Eq(10));
+  EXPECT_THAT(topo.cpus[1].apic_id, t::Eq(2u));
+  EXPECT_THAT(topo.cpus[1].acpi_processor_id, t::Eq(10u));
   EXPECT_FALSE(topo.cpus[1].is_bsp);
 
-  EXPECT_THAT(topo.cpus[2].apic_id, t::Eq(7));
-  EXPECT_THAT(topo.cpus[2].acpi_processor_id, t::Eq(14));
+  EXPECT_THAT(topo.cpus[2].apic_id, t::Eq(7u));
+  EXPECT_THAT(topo.cpus[2].acpi_processor_id, t::Eq(14u));
   EXPECT_FALSE(topo.cpus[2].is_bsp);
 
   // If bsp_apic_id (e.g. 99) was omitted from the MADT, it is inserted at
   // index 0 and existing CPUs are shifted right.
   ASSERT_TRUE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 99, &topo));
   ASSERT_THAT(topo.cpu_count, t::Eq(4));
-  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(99));
+  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(99u));
   EXPECT_TRUE(topo.cpus[0].is_bsp);
-  EXPECT_THAT(topo.cpus[1].apic_id, t::Eq(2));
-  EXPECT_THAT(topo.cpus[2].apic_id, t::Eq(4));
-  EXPECT_THAT(topo.cpus[3].apic_id, t::Eq(7));
+  EXPECT_THAT(topo.cpus[1].apic_id, t::Eq(2u));
+  EXPECT_THAT(topo.cpus[2].apic_id, t::Eq(4u));
+  EXPECT_THAT(topo.cpus[3].apic_id, t::Eq(7u));
 }
 
 TEST(SmpTest, ParseMadtHandlesMalformedEntriesAndClampsMaxCpus) {
@@ -793,8 +793,9 @@ TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(SmpParseMadt(0, kMaxCanonicalIdentityAddress, 0, &topo),
                "Check failed");
   EXPECT_DEATH(SmpParseMadt(addr, 0, 0, &topo), "Check failed");
-  EXPECT_DEATH(SmpParseMadt(addr, kMaxCanonicalIdentityAddress, 0xFF, &topo),
-               "Check failed");
+  EXPECT_DEATH(
+      SmpParseMadt(addr, kMaxCanonicalIdentityAddress, kInvalidX2ApicId, &topo),
+      "Check failed");
   EXPECT_DEATH(SmpParseMadt(addr, kMaxCanonicalIdentityAddress, 0, nullptr),
                "Check failed");
 
@@ -805,7 +806,7 @@ TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
                                    0,                             //
                                    0,                             //
                                    kMaxCanonicalIdentityAddress,  //
-                                   0xFF,                          //
+                                   kInvalidX2ApicId,              //
                                    &topo),
                "Check failed");
   EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic,              //
@@ -826,7 +827,8 @@ TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(SmpLocalApicPhysAddr(), "Check failed");
   EXPECT_DEATH(SmpCalibratedTimerInitialCount(), "Check failed");
   EXPECT_DEATH(SmpSendIpi(0, kVectorWakeupIpi), "Check failed");
-  EXPECT_DEATH(SmpRunOnAllCpus([](int, void*) {}, nullptr), "Check failed");
+  EXPECT_DEATH(SmpRunOnAllCpus([](const int, void* const) {}, nullptr),
+               "Check failed");
   EXPECT_DEATH(BindCpuLocal(nullptr), "Check failed");
   CpuLocal invalid_self = {};
   EXPECT_DEATH(BindCpuLocal(&invalid_self), "Check failed");
@@ -999,11 +1001,12 @@ TEST(SmpTest,
 
   // Null work_fn or nested SmpRunOnAllCpus must trigger DCHECK.
   EXPECT_DEATH(SmpRunOnAllCpus(nullptr, nullptr), "Check failed");
-  EXPECT_DEATH(
-      SmpRunOnAllCpus(
-          [](int, void*) { SmpRunOnAllCpus([](int, void*) {}, nullptr); },
-          nullptr),
-      "Check failed");
+  EXPECT_DEATH(SmpRunOnAllCpus(
+                   [](const int, void* const) {
+                     SmpRunOnAllCpus([](const int, void* const) {}, nullptr);
+                   },
+                   nullptr),
+               "Check failed");
 
   // 2. Multi-CPU topology (4 CPUs): SmpRunOnAllCpus executes concurrently
   //    across all 4 CPUs with a simultaneous barrier and IrqSpinLock
@@ -1071,6 +1074,9 @@ TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndFallbackOnTimeout) {
   static int g_speaker_polls = 0;
   static int g_ready_after_poll = 0;
   static uint32_t g_mock_current_count = 0;
+  g_speaker_polls = 0;
+  g_ready_after_poll = 0;
+  g_mock_current_count = 0;
 
   const auto read_speaker_timeout = +[]() -> uint8_t {
     ++g_speaker_polls;
@@ -1083,11 +1089,8 @@ TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndFallbackOnTimeout) {
   // returns kFallbackApicTimerInitialCount without hanging.
   g_speaker_polls = 0;
   g_mock_current_count = 0xFFFFFFFFu - 50000u;
-  const uint32_t timeout_count =
-      CalibrateApicTimerCount(kDefaultLocalApicPhysAddr,  //
-                              256,                        //
-                              read_speaker_timeout,       //
-                              read_apic_count);
+  const uint32_t timeout_count = CalibrateApicTimerCount(
+      kDefaultLocalApicPhysAddr, 256, read_speaker_timeout, read_apic_count);
   EXPECT_THAT(g_speaker_polls, t::Eq(256));
   EXPECT_THAT(timeout_count, t::Eq(kFallbackApicTimerInitialCount));
 
@@ -1099,11 +1102,8 @@ TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndFallbackOnTimeout) {
   g_speaker_polls = 0;
   g_ready_after_poll = 7;
   g_mock_current_count = 0xFFFFFFFFu - 60000u;
-  const uint32_t calibrated_count =
-      CalibrateApicTimerCount(kDefaultLocalApicPhysAddr,  //
-                              256,                        //
-                              read_speaker_ready,         //
-                              read_apic_count);
+  const uint32_t calibrated_count = CalibrateApicTimerCount(
+      kDefaultLocalApicPhysAddr, 256, read_speaker_ready, read_apic_count);
   EXPECT_THAT(g_speaker_polls, t::Eq(7));
   EXPECT_THAT(calibrated_count,
               t::Eq(ComputeApicTimerInitialCount(
@@ -1114,12 +1114,257 @@ TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndFallbackOnTimeout) {
   g_speaker_polls = 0;
   g_ready_after_poll = 1;
   g_mock_current_count = 0xFFFFFFFFu;
-  const uint32_t zero_elapsed_count =
-      CalibrateApicTimerCount(kDefaultLocalApicPhysAddr,  //
-                              256,                        //
-                              read_speaker_ready,         //
-                              read_apic_count);
+  const uint32_t zero_elapsed_count = CalibrateApicTimerCount(
+      kDefaultLocalApicPhysAddr, 256, read_speaker_ready, read_apic_count);
   EXPECT_THAT(zero_elapsed_count, t::Eq(kFallbackApicTimerInitialCount));
+}
+
+TEST(SmpTest,
+     ParseMadtAndX2ApicSupport32BitApicIdsCpuidLeaf0BAndMsrOperations) {
+  ResetState(BaseAddr());
+  const uintptr_t rsdt_addr = OffsetAddr(0x6100);
+  const uintptr_t madt_addr = OffsetAddr(0x6400);
+  const uintptr_t bios_rom_base = OffsetAddr(0x7000);
+
+  // 1. MADT Type 9 (Local x2APIC) entries with 32-bit APIC IDs >= 0xFF (0xFF,
+  // 0x100, 0x12345678, 0xFFFFFFFE) and 32-bit ACPI processor UIDs are
+  // preserved without 8-bit truncation, while 0xFFFFFFFF (kInvalidX2ApicId) is
+  // rejected and Type 0 0xFF (kInvalidXapicId) is rejected.
+  std::vector<uint8_t> recs;
+  AppendLapicRecord(&recs, 0, kInvalidXapicId, 1);
+  AppendX2ApicRecord(&recs, 0xFFu, 0x10000001u, 1);
+  AppendX2ApicRecord(&recs, 0x100u, 0x20000002u, 1);
+  AppendX2ApicRecord(&recs, 0x12345678u, 0x30000003u, 1);
+  AppendX2ApicRecord(&recs, 0xFFFFFFFEu, 0x40000004u, 2);
+  AppendX2ApicRecord(&recs, kInvalidX2ApicId, 0x50000005u, 1);
+  // Duplicate 32-bit x2APIC ID must be deduplicated without colliding on low 8
+  // bits (0x200 vs 0x100 have identical low 8 bits 0x00, so both must remain!).
+  AppendX2ApicRecord(&recs, 0x100u, 0x99999999u, 1);
+  AppendX2ApicRecord(&recs, 0x200u, 0x60000006u, 1);
+  WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
+
+  SmpTopology topo = {};
+  ASSERT_TRUE(SmpParseMadt(madt_addr,                     //
+                           kMaxCanonicalIdentityAddress,  //
+                           0x12345678u,                   //
+                           &topo));
+  EXPECT_THAT(topo.bsp_apic_id, t::Eq(0x12345678u));
+  ASSERT_THAT(topo.cpu_count, t::Eq(5));
+
+  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(0x12345678u));
+  EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(0x30000003u));
+  EXPECT_THAT(topo.cpus[0].observed_apic_id, t::Eq(0x12345678u));
+  EXPECT_TRUE(topo.cpus[0].is_bsp);
+
+  EXPECT_THAT(topo.cpus[1].apic_id, t::Eq(0xFFu));
+  EXPECT_THAT(topo.cpus[1].acpi_processor_id, t::Eq(0x10000001u));
+  EXPECT_THAT(topo.cpus[2].apic_id, t::Eq(0x100u));
+  EXPECT_THAT(topo.cpus[2].acpi_processor_id, t::Eq(0x20000002u));
+  EXPECT_THAT(topo.cpus[3].apic_id, t::Eq(0xFFFFFFFEu));
+  EXPECT_THAT(topo.cpus[3].acpi_processor_id, t::Eq(0x40000004u));
+  EXPECT_THAT(topo.cpus[4].apic_id, t::Eq(0x200u));
+  EXPECT_THAT(topo.cpus[4].acpi_processor_id, t::Eq(0x60000006u));
+
+  // 2. ReadCpuidInitialApicId queries CPUID leaf 0x0B EDX when x2APIC is
+  // supported and leaf 0x0B is populated, and falls back to
+  // CPUID.01H:EBX[31:24] otherwise.
+  static uint32_t g_cpuid_max_leaf = 0;
+  static uint32_t g_leaf1_ebx = 0;
+  static uint32_t g_leaf1_ecx = 0;
+  static uint32_t g_leafb_ebx = 0;
+  static uint32_t g_leafb_ecx = 0;
+  static uint32_t g_leafb_edx = 0;
+  static uint64_t g_apic_base_msr = 0;
+  static uint32_t g_msr_lapic_id = 0;
+  static std::vector<std::pair<uint32_t, uint64_t>> g_msr_writes;
+  g_cpuid_max_leaf = 0x0Bu;
+  g_leaf1_ebx = 0x78u << 24;
+  g_leaf1_ecx = 1u << 21;  // x2APIC supported
+  g_leafb_ebx = 2u;        // 2 logical processors at level 0
+  g_leafb_ecx = 1u << 8;   // level type = SMT (1)
+  g_leafb_edx = 0x12345678u;
+  g_apic_base_msr = 0xFEE00900ULL;
+  g_msr_lapic_id = 0x12345678u;
+  g_msr_writes.clear();
+
+  const auto cpuid_hook = +[](const uint32_t leaf,     //
+                              const uint32_t subleaf,  //
+                              uint32_t* const eax,     //
+                              uint32_t* const ebx,     //
+                              uint32_t* const ecx,     //
+                              uint32_t* const edx) {
+    if (leaf == 0) {
+      *eax = g_cpuid_max_leaf;
+      *ebx = 0;
+      *ecx = 0;
+      *edx = 0;
+    } else if (leaf == 1) {
+      *eax = 0x000306A9u;
+      *ebx = g_leaf1_ebx;
+      *ecx = g_leaf1_ecx;
+      *edx = 1u << 9;
+    } else if (leaf == 0x0Bu && subleaf == 0) {
+      *eax = 1u;
+      *ebx = g_leafb_ebx;
+      *ecx = g_leafb_ecx;
+      *edx = g_leafb_edx;
+    }
+  };
+  const auto read_msr_hook = +[](const uint32_t msr) -> uint64_t {
+    if (msr == 0x1Bu) {
+      return g_apic_base_msr;
+    }
+    if (msr == 0x802u) {
+      return g_msr_lapic_id;
+    }
+    return 0;
+  };
+  const auto write_msr_hook = +[](const uint32_t msr, const uint64_t value) {
+    g_msr_writes.emplace_back(msr, value);
+  };
+
+  SmpSetHostHardwareHooksForTest(true,           //
+                                 cpuid_hook,     //
+                                 read_msr_hook,  //
+                                 write_msr_hook);
+  EXPECT_THAT(SmpReadCpuidInitialApicIdForTest(), t::Eq(0x12345678u));
+
+  // If leaf 0x0B is unpopulated (ebx[15:0] == 0 && ecx[15:8] == 0), falls back
+  // to CPUID.01H:EBX[31:24] (0x78).
+  g_leafb_ebx = 0;
+  g_leafb_ecx = 0;
+  EXPECT_THAT(SmpReadCpuidInitialApicIdForTest(), t::Eq(0x78u));
+
+  // If max_leaf < 0x0B, falls back to CPUID.01H:EBX[31:24].
+  g_leafb_ebx = 2u;
+  g_leafb_ecx = 1u << 8;
+  g_cpuid_max_leaf = 0x0Au;
+  EXPECT_THAT(SmpReadCpuidInitialApicIdForTest(), t::Eq(0x78u));
+
+  // If x2APIC is not supported in CPUID.01H:ECX[21] nor enabled in
+  // IA32_APIC_BASE, falls back to CPUID.01H:EBX[31:24].
+  g_cpuid_max_leaf = 0x0Bu;
+  g_leaf1_ecx = 0;
+  g_apic_base_msr = 0xFEE00900ULL;
+  EXPECT_THAT(SmpReadCpuidInitialApicIdForTest(), t::Eq(0x78u));
+
+  // If x2APIC is already enabled in IA32_APIC_BASE (bit 10 EXTD = 1), leaf 0x0B
+  // is used and returns 0x100.
+  g_apic_base_msr = 0xFEE00D00ULL;
+  g_leafb_edx = 0x100u;
+  EXPECT_THAT(SmpReadCpuidInitialApicIdForTest(), t::Eq(0x100u));
+
+  // 3. In x2APIC mode, ReadLapicId, LapicWrite, and LapicSendIpiCommand do not
+  // require non-zero lapic_base and preserve full 32-bit APIC IDs.
+  g_msr_lapic_id = 0x12345678u;
+  EXPECT_THAT(SmpReadLapicIdForTest(/*lapic_base=*/0), t::Eq(0x12345678u));
+
+  g_msr_writes.clear();
+  SmpLapicWriteForTest(/*lapic_base=*/0, /*reg_offset=*/0x0B0, /*value=*/0);
+  ASSERT_THAT(g_msr_writes.size(), t::Eq(1u));
+  EXPECT_THAT(g_msr_writes[0].first, t::Eq(0x80Bu));
+  EXPECT_THAT(g_msr_writes[0].second, t::Eq(0u));
+
+  g_msr_writes.clear();
+  SmpLapicSendIpiCommandForTest(/*lapic_base=*/0,
+                                /*apic_id=*/0x12345678u,
+                                /*icr_low=*/0x00004021u);
+  ASSERT_THAT(g_msr_writes.size(), t::Eq(2u));
+  EXPECT_THAT(g_msr_writes[0].first, t::Eq(0x828u));
+  EXPECT_THAT(g_msr_writes[0].second, t::Eq(0u));
+  EXPECT_THAT(g_msr_writes[1].first, t::Eq(0x830u));
+  EXPECT_THAT(g_msr_writes[1].second,
+              t::Eq((0x12345678ULL << 32) | 0x00004021ULL));
+
+  // In xAPIC MMIO mode, ReadLapicId shifts right by 24 bits and requires
+  // non-zero lapic_base, and LapicSendIpiCommand waits for ICR delivery-pending
+  // before and after programming ICR_HIGH/ICR_LOW while preserving the caller's
+  // interrupt enable state.
+  uint32_t fake_mmio_lapic[256] = {};
+  fake_mmio_lapic[0x020 / sizeof(uint32_t)] = 0x42000000u;
+  SmpSetHostHardwareHooksForTest(false,          //
+                                 cpuid_hook,     //
+                                 read_msr_hook,  //
+                                 write_msr_hook);
+  const uintptr_t fake_lapic_base =
+      reinterpret_cast<uintptr_t>(fake_mmio_lapic);
+  EXPECT_THAT(SmpReadLapicIdForTest(fake_lapic_base), t::Eq(0x42u));
+  EXPECT_DEATH(SmpReadLapicIdForTest(0), "Check failed");
+
+  const bool irq_before_ipi = AreInterruptsEnabled();
+  SmpLapicSendIpiCommandForTest(fake_lapic_base, 0x42u, 0x00004021u);
+  EXPECT_THAT(AreInterruptsEnabled(), t::Eq(irq_before_ipi));
+  EXPECT_THAT(fake_mmio_lapic[0x310 / sizeof(uint32_t)], t::Eq(0x42u << 24));
+  EXPECT_THAT(fake_mmio_lapic[0x300 / sizeof(uint32_t)], t::Eq(0x00004021u));
+
+  // If ICR_LOW bit 12 (Delivery Status = Send Pending) is stuck prior to
+  // sending an IPI in xAPIC mode, LapicSendIpiCommand must fail the pre-write
+  // WaitForIcrIdle check before overwriting ICR_HIGH.
+  fake_mmio_lapic[0x300 / sizeof(uint32_t)] = (1u << 12);
+  EXPECT_DEATH(
+      SmpLapicSendIpiCommandForTest(fake_lapic_base, 0x11u, 0x00004021u),
+      "Check failed");
+  fake_mmio_lapic[0x300 / sizeof(uint32_t)] = 0;
+
+  // Verify EnableLocalApic steps down from x2APIC (EXTD=1, EN=1) to xAPIC
+  // (EXTD=0, EN=1) via the Architecturally Disabled state (EXTD=0, EN=0) and
+  // programs TPR=0 and SVR=(kLapicSvrSoftwareEnable | kLapicSpuriousVector).
+  g_apic_base_msr = 0xFEE00D00ULL;
+  fake_mmio_lapic[0x080 / sizeof(uint32_t)] = 0xFFu;
+  fake_mmio_lapic[0x0F0 / sizeof(uint32_t)] = 0x00001000u;
+  g_msr_writes.clear();
+  SmpEnableLocalApicForTest(fake_lapic_base);
+  ASSERT_THAT(g_msr_writes.size(), t::Eq(2u));
+  EXPECT_THAT(g_msr_writes[0].first, t::Eq(0x1Bu));
+  EXPECT_THAT(g_msr_writes[0].second, t::Eq(0xFEE00100ULL));
+  EXPECT_THAT(g_msr_writes[1].first, t::Eq(0x1Bu));
+  EXPECT_THAT(g_msr_writes[1].second, t::Eq(0xFEE00900ULL));
+  EXPECT_THAT(fake_mmio_lapic[0x080 / sizeof(uint32_t)], t::Eq(0u));
+  EXPECT_THAT(fake_mmio_lapic[0x0F0 / sizeof(uint32_t)], t::Eq(0x000011FFu));
+  EXPECT_DEATH(SmpEnableLocalApicForTest(0), "Check failed");
+
+  // Also verify EnableLocalApic in x2APIC mode enables EN (bit 11) then EXTD
+  // (bit 10) and writes TPR (MSR 0x808) and SVR (MSR 0x80F).
+  SmpSetHostHardwareHooksForTest(true,           //
+                                 cpuid_hook,     //
+                                 read_msr_hook,  //
+                                 write_msr_hook);
+  g_apic_base_msr = 0xFEE00100ULL;
+  g_msr_writes.clear();
+  SmpEnableLocalApicForTest(/*lapic_base=*/0);
+  ASSERT_THAT(g_msr_writes.size(), t::Eq(4u));
+  EXPECT_THAT(g_msr_writes[0].first, t::Eq(0x1Bu));
+  EXPECT_THAT(g_msr_writes[0].second, t::Eq(0xFEE00900ULL));
+  EXPECT_THAT(g_msr_writes[1].first, t::Eq(0x1Bu));
+  EXPECT_THAT(g_msr_writes[1].second, t::Eq(0xFEE00D00ULL));
+  EXPECT_THAT(g_msr_writes[2].first, t::Eq(0x808u));
+  EXPECT_THAT(g_msr_writes[2].second, t::Eq(0u));
+  EXPECT_THAT(g_msr_writes[3].first, t::Eq(0x80Fu));
+  EXPECT_THAT(g_msr_writes[3].second, t::Eq(0x1FFu));
+  g_apic_base_msr = 0xFEE00D00ULL;
+
+  // 4. End-to-end SmpInit and SmpRunOnAllCpus with 32-bit x2APIC IDs.
+  WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
+  WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
+  IdtInit();
+  SmpSetHostTestHooks(0x100u, 0, bios_rom_base, BaseAddr(), nullptr);
+  SmpInit(kMultiboot1Magic, 0);
+  ASSERT_THAT(SmpCpuCount(), t::Eq(5));
+  EXPECT_THAT(SmpGetCpuInfo(0)->apic_id, t::Eq(0x100u));
+  EXPECT_THAT(SmpGetCpuLocal(0)->apic_id, t::Eq(0x100u));
+  EXPECT_THAT(SmpGetCpuInfo(2)->apic_id, t::Eq(0x12345678u));
+  EXPECT_THAT(SmpGetCpuLocal(2)->apic_id, t::Eq(0x12345678u));
+
+  std::atomic<int> high_apic_seen{0};
+  SmpRunOnAllCpus(
+      [](const int cpu_index, void* const ctx) {
+        if (SmpGetCpuLocal(cpu_index)->apic_id >= 0x100u) {
+          static_cast<std::atomic<int>*>(ctx)->fetch_add(
+              1, std::memory_order_acq_rel);
+        }
+      },
+      &high_apic_seen);
+  EXPECT_THAT(high_apic_seen.load(std::memory_order_acquire), t::Eq(4));
 }
 
 }  // namespace

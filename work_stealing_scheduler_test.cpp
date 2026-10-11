@@ -160,6 +160,26 @@ TEST(WorkStealingSchedulerTest,
   for (int i = 0; i < 4; ++i) {
     EXPECT_THAT(g_env.ipi_sent_count[i].load(), t::Eq(0));
   }
+
+  // Also verify that if CPU 0 itself is offline despite having load 0, CPU 0 is
+  // skipped and online CPU 3 is selected.
+  g_env.cpu_locals[0].online = false;
+  loads[0] = 0;
+  loads[3] = 5;
+  queried_cpus.clear();
+  captured_cpu = -1;
+  EXPECT_CALL(*mock_inner, CreateTaskOnCpu)
+      .WillOnce([&](const TaskFn /*entry*/,    //
+                    void* const /*arg*/,       //
+                    const int64_t /*weight*/,  //
+                    const int target_cpu) {
+        captured_cpu = target_cpu;
+        return fake_task;
+      });
+  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
+              t::Eq(fake_task));
+  EXPECT_THAT(queried_cpus, t::ElementsAre(3));
+  EXPECT_THAT(captured_cpu, t::Eq(3));
 }
 
 TEST(WorkStealingSchedulerTest,
@@ -258,12 +278,14 @@ TEST(WorkStealingSchedulerTest,
   });
   EXPECT_CALL(*mock_inner, StealTask)
       .WillOnce([&](const int dst_cpu, const int src_cpu) {
+        EXPECT_FALSE(AreInterruptsEnabled());
         EXPECT_THAT(dst_cpu, t::Eq(0));
         EXPECT_THAT(src_cpu, t::Eq(2));
         call_order.push_back("StealTask(0,2)");
         return true;
       });
   EXPECT_CALL(*mock_inner, Yield).WillOnce([&]() {
+    EXPECT_TRUE(AreInterruptsEnabled());
     call_order.push_back("Yield");
   });
 

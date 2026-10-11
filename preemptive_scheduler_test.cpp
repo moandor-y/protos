@@ -380,9 +380,7 @@ TEST(PreemptiveSchedulerTest,
 
   // 1. CreateTask
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t weight) {
+      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
         EXPECT_THAT(entry, t::Eq(&NoopTask));
         EXPECT_THAT(arg, t::Eq(&dummy_arg_a));
         EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight * 2));
@@ -403,11 +401,9 @@ TEST(PreemptiveSchedulerTest,
         EXPECT_THAT(target_cpu, t::Eq(3));
         return fake_task_b;
       });
-  EXPECT_THAT(sched->CreateTaskOnCpu(NoopTask,                //
-                                     &dummy_arg_b,            //
-                                     kDefaultTaskWeight / 2,  //
-                                     3),
-              t::Eq(fake_task_b));
+  EXPECT_THAT(
+      sched->CreateTaskOnCpu(NoopTask, &dummy_arg_b, kDefaultTaskWeight / 2, 3),
+      t::Eq(fake_task_b));
 
   // 3. Yield
   int yield_calls = 0;

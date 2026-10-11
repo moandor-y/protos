@@ -10,9 +10,6 @@ namespace protos {
 
 namespace {
 
-constexpr uint32_t kMultiboot1Magic = 0x2BADB002;
-constexpr uint32_t kMultiboot2Magic = 0x36D76289;
-constexpr uint32_t kMultiboot1FlagMmap = 1 << 6;
 constexpr uint32_t kMultiboot2TagEnd = 0;
 constexpr uint32_t kMultiboot2TagMmap = 6;
 constexpr uint32_t kMultiboot2TagFramebuffer = 8;
@@ -141,10 +138,11 @@ static bool TryMergeRegions(MemoryRegion* const dst, const MemoryRegion& src) {
 
 }  // namespace
 
-bool MultibootRecordMmapEntry(MultibootMemoryMap* const out_map,  //
-                              const uint64_t raw_base,            //
-                              const uint64_t raw_length,          //
-                              const uint32_t type) {
+static bool RecordMmapEntryImpl(MultibootMemoryMap* const out_map,  //
+                                const uint64_t raw_base,            //
+                                const uint64_t raw_length,          //
+                                const uint32_t type,                //
+                                const bool log_entry) {
   if (out_map == nullptr) {
     return false;
   }
@@ -206,7 +204,7 @@ bool MultibootRecordMmapEntry(MultibootMemoryMap* const out_map,  //
           }
         }
       }
-      if (out_map->mb_reserved_start != 0) {
+      if (log_entry) {
         ConsoleWrite("[PMM] mmap entry: base=");
         ConsoleWriteHex(base);
         ConsoleWrite(" len=");
@@ -235,7 +233,7 @@ bool MultibootRecordMmapEntry(MultibootMemoryMap* const out_map,  //
   out_map->regions[out_map->region_count] = incoming;
   ++out_map->region_count;
 
-  if (out_map->mb_reserved_start != 0) {
+  if (log_entry) {
     ConsoleWrite("[PMM] mmap entry: base=");
     ConsoleWriteHex(base);
     ConsoleWrite(" len=");
@@ -247,10 +245,11 @@ bool MultibootRecordMmapEntry(MultibootMemoryMap* const out_map,  //
   return true;
 }
 
-bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,      //
-                                       const uint64_t multiboot_info_addr,  //
-                                       const uintptr_t max_physical_addr,   //
-                                       MultibootMemoryMap* const out_map) {
+static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
+                               const uint64_t multiboot_info_addr,
+                               const uintptr_t max_physical_addr,
+                               MultibootMemoryMap* const out_map,
+                               const bool log_boot) {
   if (out_map == nullptr) {
     return false;
   }
@@ -270,11 +269,13 @@ bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,      //
   out_map->fb_bpp = 0;
   out_map->fb_type = 0;
 
-  ConsoleWrite("[PMM] Multiboot magic=");
-  ConsoleWriteHex(multiboot_magic);
-  ConsoleWrite(" info_addr=");
-  ConsoleWriteHex(multiboot_info_addr);
-  ConsoleWrite("\n");
+  if (log_boot) {
+    ConsoleWrite("[PMM] Multiboot magic=");
+    ConsoleWriteHex(multiboot_magic);
+    ConsoleWrite(" info_addr=");
+    ConsoleWriteHex(multiboot_info_addr);
+    ConsoleWrite("\n");
+  }
 
   if (multiboot_info_addr == 0 || multiboot_info_addr >= max_physical_addr) {
     return false;
@@ -322,10 +323,11 @@ bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,      //
             const Multiboot2MmapEntry* const entry =
                 reinterpret_cast<const Multiboot2MmapEntry*>(
                     reinterpret_cast<uintptr_t>(mmap_tag) + entry_offset);
-            if (!MultibootRecordMmapEntry(out_map,      //
-                                          entry->addr,  //
-                                          entry->len,   //
-                                          entry->type)) {
+            if (!RecordMmapEntryImpl(out_map,      //
+                                     entry->addr,  //
+                                     entry->len,   //
+                                     entry->type,  //
+                                     log_boot)) {
               return false;
             }
             entry_offset += entry_size;
@@ -336,7 +338,16 @@ bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,      //
         const Multiboot2TagFramebuffer* const fb_tag =
             reinterpret_cast<const Multiboot2TagFramebuffer*>(tag);
         if (fb_tag->framebuffer_type == kMultiboot2FramebufferTypeRgb &&
-            fb_tag->framebuffer_addr < kMaxCanonicalIdentityAddress) {
+            fb_tag->framebuffer_addr != 0 &&
+            fb_tag->framebuffer_addr < kMaxCanonicalIdentityAddress &&
+            fb_tag->framebuffer_width > 0 && fb_tag->framebuffer_height > 0 &&
+            fb_tag->framebuffer_pitch <= static_cast<uint32_t>(INT32_MAX) &&
+            fb_tag->framebuffer_width <= static_cast<uint32_t>(INT32_MAX) &&
+            fb_tag->framebuffer_height <= static_cast<uint32_t>(INT32_MAX) &&
+            (fb_tag->framebuffer_bpp == 24 || fb_tag->framebuffer_bpp == 32) &&
+            static_cast<int64_t>(fb_tag->framebuffer_pitch) >=
+                static_cast<int64_t>(fb_tag->framebuffer_width) *
+                    (fb_tag->framebuffer_bpp / 8)) {
           out_map->fb_addr = fb_tag->framebuffer_addr;
           out_map->fb_pitch = fb_tag->framebuffer_pitch;
           out_map->fb_width = fb_tag->framebuffer_width;
@@ -355,41 +366,71 @@ bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,      //
     }
     const Multiboot1Info* const info =
         reinterpret_cast<const Multiboot1Info*>(info_phys);
-    const int64_t mmap_length = info->mmap_length;
-    if ((info->flags & kMultiboot1FlagMmap) == 0 || info->mmap_addr == 0 ||
-        mmap_length <= 0 || mmap_length > kMaxMultibootStructureBytes) {
-      return false;
-    }
-    const uintptr_t mmap_phys = info->mmap_addr;
-    if (mmap_phys >= max_physical_addr ||
-        (max_physical_addr - mmap_phys) < static_cast<uintptr_t>(mmap_length) ||
-        !PagingMapBootstrapRange(mmap_phys, mmap_length)) {
-      return false;
-    }
     out_map->mb_reserved_start = info_phys;
     out_map->mb_reserved_end = info_phys + kInfoSize;
-    out_map->mb1_mmap_reserved_start = mmap_phys;
-    out_map->mb1_mmap_reserved_end = mmap_phys + mmap_length;
-
-    int64_t entry_offset = 0;
-    constexpr int64_t kMinEntryStructSize = sizeof(Multiboot1MmapEntry);
-    constexpr int64_t kSizeFieldBytes = sizeof(uint32_t);
-    while (entry_offset <= mmap_length - kMinEntryStructSize) {
-      const Multiboot1MmapEntry* const entry =
-          reinterpret_cast<const Multiboot1MmapEntry*>(mmap_phys +
-                                                       entry_offset);
-      const int64_t entry_step =
-          static_cast<int64_t>(entry->size) + kSizeFieldBytes;
-      if (entry->size < 20 || entry_step > mmap_length - entry_offset) {
-        break;
-      }
-      if (!MultibootRecordMmapEntry(out_map,      //
-                                    entry->addr,  //
-                                    entry->len,   //
-                                    entry->type)) {
+    if ((info->flags & kMultiboot1FlagMmap) != 0) {
+      const int64_t mmap_length = info->mmap_length;
+      if (info->mmap_addr == 0 || mmap_length <= 0 ||
+          mmap_length > kMaxMultibootStructureBytes) {
         return false;
       }
-      entry_offset += entry_step;
+      const uintptr_t mmap_phys = info->mmap_addr;
+      if (mmap_phys >= max_physical_addr ||
+          (max_physical_addr - mmap_phys) <
+              static_cast<uintptr_t>(mmap_length) ||
+          !PagingMapBootstrapRange(mmap_phys, mmap_length)) {
+        return false;
+      }
+      out_map->mb1_mmap_reserved_start = mmap_phys;
+      out_map->mb1_mmap_reserved_end = mmap_phys + mmap_length;
+
+      int64_t entry_offset = 0;
+      constexpr int64_t kMinEntryStructSize = sizeof(Multiboot1MmapEntry);
+      constexpr int64_t kSizeFieldBytes = sizeof(uint32_t);
+      while (entry_offset <= mmap_length - kMinEntryStructSize) {
+        const Multiboot1MmapEntry* const entry =
+            reinterpret_cast<const Multiboot1MmapEntry*>(mmap_phys +
+                                                         entry_offset);
+        const int64_t entry_step =
+            static_cast<int64_t>(entry->size) + kSizeFieldBytes;
+        if (entry->size < 20 || entry_step > mmap_length - entry_offset) {
+          break;
+        }
+        if (!RecordMmapEntryImpl(out_map,      //
+                                 entry->addr,  //
+                                 entry->len,   //
+                                 entry->type,  //
+                                 log_boot)) {
+          return false;
+        }
+        entry_offset += entry_step;
+      }
+    } else if ((info->flags & kMultiboot1FlagMemBasic) != 0) {
+      if (info->mem_lower > 0) {
+        const uint64_t lower_bytes =
+            static_cast<uint64_t>(info->mem_lower) * 1024ULL;
+        if (!RecordMmapEntryImpl(out_map,               //
+                                 0ULL,                  //
+                                 lower_bytes,           //
+                                 kMemoryTypeAvailable,  //
+                                 log_boot)) {
+          return false;
+        }
+      }
+      if (info->mem_upper > 0) {
+        constexpr uint64_t kUpperMemoryBase = 0x100000ULL;
+        const uint64_t upper_end =
+            kUpperMemoryBase + static_cast<uint64_t>(info->mem_upper) * 1024ULL;
+        if (!RecordMmapEntryImpl(out_map,                       //
+                                 kUpperMemoryBase,              //
+                                 upper_end - kUpperMemoryBase,  //
+                                 kMemoryTypeAvailable,          //
+                                 log_boot)) {
+          return false;
+        }
+      }
+    } else {
+      return false;
     }
   } else {
     return false;
@@ -398,14 +439,33 @@ bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,      //
   return out_map->region_count > 0 && out_map->usable_ram_bytes > 0;
 }
 
+bool MultibootRecordMmapEntry(MultibootMemoryMap* const out_map,  //
+                              const uint64_t raw_base,            //
+                              const uint64_t raw_length,          //
+                              const uint32_t type) {
+  return RecordMmapEntryImpl(out_map, raw_base, raw_length, type, false);
+}
+
+bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,
+                                       const uint64_t multiboot_info_addr,
+                                       const uintptr_t max_physical_addr,
+                                       MultibootMemoryMap* const out_map) {
+  return ParseMemoryMapImpl(multiboot_magic,      //
+                            multiboot_info_addr,  //
+                            max_physical_addr,    //
+                            out_map,              //
+                            false);
+}
+
 [[gnu::weak]] bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
                                            const uint64_t multiboot_info_addr,
                                            const uintptr_t max_physical_addr,
                                            MultibootMemoryMap* const out_map) {
-  return MultibootParseMemoryMapFromBuffer(multiboot_magic,      //
-                                           multiboot_info_addr,  //
-                                           max_physical_addr,    //
-                                           out_map);
+  return ParseMemoryMapImpl(multiboot_magic,      //
+                            multiboot_info_addr,  //
+                            max_physical_addr,    //
+                            out_map,              //
+                            true);
 }
 
 }  // namespace protos

@@ -78,7 +78,8 @@ struct DefaultRbTraits {
   }
 };
 
-template <typename T, RbNode T::* kNodeMember,
+template <typename T,               //
+          RbNode T::* kNodeMember,  //
           typename Traits = DefaultRbTraits>
 class RbTree {
  private:

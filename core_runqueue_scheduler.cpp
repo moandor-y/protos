@@ -198,7 +198,7 @@ struct alignas(64) CpuRunqueue {
 
   Task* pending_handoff_task = nullptr;
   TaskState pending_handoff_state = TaskState::kReady;
-  bool in_schedule = false;
+  std::atomic<bool> in_schedule{false};
 };
 
 [[gnu::noinline]] static int GetCurrentCpuId() {
@@ -370,7 +370,13 @@ static void IdleTaskLoop(void* const arg) {
     const std::shared_ptr<TaskScheduler>& active_sched = GetTaskScheduler();
     TaskScheduler* const sched =
         (active_sched != nullptr) ? active_sched.get() : fallback_sched;
+#if !__STDC_HOSTED__
+    asm volatile("cli" : : : "memory", "cc");
+#endif
     if (sched != nullptr && sched->PollIdleCpu(cpu_id)) {
+#if !__STDC_HOSTED__
+      asm volatile("sti" : : : "memory", "cc");
+#endif
       continue;
     }
 #if !__STDC_HOSTED__
@@ -505,11 +511,13 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     DCHECK(IsCpuOnline(target_cpu, cpu_count_));
 
     void* const raw_tcb = Kmalloc(sizeof(Task));
-    CHECK(raw_tcb != nullptr);
+    if (raw_tcb == nullptr) {
+      return nullptr;
+    }
     const uintptr_t stack_phys = PmmAllocFrames(kTaskStackFrames);
     if (stack_phys == 0) {
       Kfree(raw_tcb);
-      CHECK(false);
+      return nullptr;
     }
     DCHECK((stack_phys & 0xFu) == 0);
 
@@ -553,7 +561,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       const int cpu_id = GetCurrentCpuId();
       DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
       CpuRunqueue& rq = runqueues_[cpu_id];
-      if (rq.in_schedule) {
+      if (rq.in_schedule.load(std::memory_order_acquire)) {
         return;
       }
       const IrqSpinLockGuard guard(rq.lock);
@@ -605,9 +613,16 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
   }
 
   bool PollIdleCpu(const int cpu_index) override {
-    if (!initialized_.load(std::memory_order_acquire) || cpu_index < 0 ||
-        cpu_index >= cpu_count_) {
+    if (!initialized_.load(std::memory_order_acquire) ||
+        !IsCpuOnline(cpu_index, cpu_count_)) {
       return false;
+    }
+    {
+      const ScopedIrqDisable irq_guard;
+      const CpuLocal* const cpu = GetCurrentCpuOrNull();
+      if (cpu == nullptr || !cpu->online || cpu->cpu_id != cpu_index) {
+        return false;
+      }
     }
     if (runqueues_[cpu_index].runnable_count.load(std::memory_order_acquire) ==
             0 &&
@@ -689,7 +704,8 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       return;
     }
     CpuRunqueue& rq = runqueues_[cpu_id];
-    if (rq.in_schedule || rq.lock.IsLockedByCurrentCpu()) {
+    if (rq.in_schedule.load(std::memory_order_acquire) ||
+        rq.lock.IsLockedByCurrentCpu()) {
       return;
     }
 
@@ -704,7 +720,8 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
         UpdateRunqueueMinVruntime(&rq);
       }
       const Task* const first = rq.tree.First();
-      if (!rq.in_schedule && curr != nullptr && first != nullptr) {
+      if (!rq.in_schedule.load(std::memory_order_relaxed) && curr != nullptr &&
+          first != nullptr) {
         should_preempt = curr->is_idle || (first->vruntime < curr->vruntime);
       }
     }
@@ -727,7 +744,8 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       return;
     }
     CpuRunqueue& rq = runqueues_[cpu_id];
-    if (rq.in_schedule || rq.lock.IsLockedByCurrentCpu()) {
+    if (rq.in_schedule.load(std::memory_order_acquire) ||
+        rq.lock.IsLockedByCurrentCpu()) {
       return;
     }
 
@@ -736,7 +754,8 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       const IrqSpinLockGuard guard(rq.lock);
       const Task* const curr = rq.current_task;
       const Task* const first = rq.tree.First();
-      if (!rq.in_schedule && curr != nullptr && first != nullptr) {
+      if (!rq.in_schedule.load(std::memory_order_relaxed) && curr != nullptr &&
+          first != nullptr) {
         should_preempt = curr->is_idle || (first->vruntime < curr->vruntime);
       }
     }
@@ -789,7 +808,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     const int cpu_id = GetCurrentCpuId();
     DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
     CpuRunqueue& rq = runqueues_[cpu_id];
-    DCHECK(rq.in_schedule);
+    DCHECK(rq.in_schedule.load(std::memory_order_acquire));
 
 #if __STDC_HOSTED__ && defined(__SANITIZE_ADDRESS__)
     Task* const curr = rq.current_task;
@@ -807,23 +826,25 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     }
 #endif
 
-    Task* const prev = rq.pending_handoff_task;
-    const TaskState target_state = rq.pending_handoff_state;
-    rq.pending_handoff_task = nullptr;
-    rq.in_schedule = false;
-
-    if (prev == nullptr) {
-      return;
+    Task* prev = nullptr;
+    TaskState target_state = TaskState::kReady;
+    {
+      const IrqSpinLockGuard guard(rq.lock);
+      prev = rq.pending_handoff_task;
+      target_state = rq.pending_handoff_state;
+      rq.pending_handoff_task = nullptr;
+      if (prev != nullptr && target_state == TaskState::kReady) {
+        if (prev->is_idle) {
+          prev->running_cpu.store(-1, std::memory_order_release);
+          prev->state.store(TaskState::kReady, std::memory_order_release);
+        } else {
+          EnqueueTaskLocked(&rq, prev, false);
+        }
+      }
+      rq.in_schedule.store(false, std::memory_order_release);
     }
 
-    if (target_state == TaskState::kReady) {
-      const IrqSpinLockGuard guard(rq.lock);
-      if (prev->is_idle) {
-        prev->running_cpu.store(-1, std::memory_order_release);
-        prev->state.store(TaskState::kReady, std::memory_order_release);
-      } else {
-        EnqueueTaskLocked(&rq, prev, false);
-      }
+    if (prev == nullptr || target_state == TaskState::kReady) {
       return;
     }
 
@@ -874,10 +895,10 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     // 2. Across the unlocked handoff window (`TaskContextSwitch` through
     //    `FinishContextSwitch()`): once `lock_guard` releases `rq.lock`,
     //    `rq.current_task` is already `next` while still on `prev`'s stack, and
-    //    `FinishContextSwitch()` clears `rq.in_schedule = false` before
-    //    re-acquiring `rq.lock` to re-enqueue `prev` (or freeing `prev`'s
-    //    stack). An interrupt preempting and migrating `next` there would leave
-    //    `FinishContextSwitch()` holding a stale `rq` reference mid-handoff.
+    //    `FinishContextSwitch()` clears `rq.in_schedule = false` under
+    //    `rq.lock` after re-enqueuing `prev`. An interrupt preempting and
+    //    migrating `next` there would leave `FinishContextSwitch()` holding a
+    //    stale `rq` reference mid-handoff.
     // 3. Preserving per-task `RFLAGS.IF` across cooperative (`IF=1`) <->
     //    ISR-preempted (`IF=0`) switches: if `lock_guard` restored `IF=1`
     //    before `TaskContextSwitch`, a task resuming inside `OnTimerInterrupt`
@@ -895,10 +916,10 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
       CpuRunqueue& rq = runqueues_[cpu_id];
       const IrqSpinLockGuard lock_guard(rq.lock);
-      if (rq.in_schedule) {
+      if (rq.in_schedule.load(std::memory_order_relaxed)) {
         return false;
       }
-      rq.in_schedule = true;
+      rq.in_schedule.store(true, std::memory_order_release);
 
       prev = rq.current_task;
       DCHECK(prev != nullptr);
@@ -922,7 +943,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
         // We are on the same task. No need to switch.
         DCHECK(outgoing_state == TaskState::kReady);
         UpdateRunqueueMinVruntime(&rq);
-        rq.in_schedule = false;
+        rq.in_schedule.store(false, std::memory_order_release);
         return false;
       }
       // We need to do a context switch.

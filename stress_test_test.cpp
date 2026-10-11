@@ -600,6 +600,95 @@ TEST(StressDeathTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_pmm_high), "Check failed");
 
   TaskResetForTest();
+
+  SetupEnv(kMaxSupportedCpus + 1);
+  TaskInit();
+  StressTestConfig over_max_cpus = {};
+  over_max_cpus.num_workers = 1;
+  over_max_cpus.rounds_per_worker = 1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(over_max_cpus), "Check failed");
+  TaskResetForTest();
+}
+
+TEST(StressTest, ExecuteRandomMultiCpuStressSupportsGreaterThan64CpusUpTo128) {
+  for (const int num_cpus : {68, kMaxSupportedCpus}) {
+    SetupEnv(num_cpus);
+    TaskInit();
+    g_env.active_scheduler = GetTaskScheduler();
+    ASSERT_THAT(g_env.active_scheduler, t::NotNull());
+
+    const int64_t pmm_before = PmmFreeFrameCount();
+    const int64_t heap_before = HeapTotalFreeBytes();
+
+    std::atomic<bool> stop_aps{false};
+    std::atomic<int> ready_aps{0};
+    std::vector<std::thread> ap_threads;
+    ap_threads.reserve(num_cpus - 1);
+
+    for (int cpu = 1; cpu < num_cpus; ++cpu) {
+      ap_threads.emplace_back([cpu, &stop_aps, &ready_aps]() {
+        BindCpuLocal(&g_env.cpu_locals[cpu]);
+        SetInterruptsEnabledForTest(true);
+        ready_aps.fetch_add(1, std::memory_order_acq_rel);
+
+        int64_t handled_ipis = 0;
+        const std::shared_ptr<TaskScheduler>& ap_sched = GetTaskScheduler();
+        while (!stop_aps.load(std::memory_order_acquire)) {
+          const int64_t sent_ipis =
+              g_env.ipi_sent_count[cpu].load(std::memory_order_acquire);
+          if (sent_ipis > handled_ipis && IdtIsInitialized() &&
+              AreInterruptsEnabled()) {
+            handled_ipis = sent_ipis;
+            InterruptFrame ipi_frame = {};
+            ipi_frame.vector = kVectorWakeupIpi;
+            ipi_frame.rflags = internal::kRflagsInterruptEnableBit;
+            IdtDispatch(&ipi_frame);
+          }
+          if (ap_sched == nullptr || !ap_sched->PollIdleCpu(cpu)) {
+            std::this_thread::yield();
+          }
+        }
+        ResetCpuLocalForTest();
+      });
+    }
+
+    while (ready_aps.load(std::memory_order_acquire) < (num_cpus - 1)) {
+      std::this_thread::yield();
+    }
+
+    StressTestConfig cfg = {};
+    cfg.seed = 0x123456789ABCDEF0ULL ^ static_cast<uint64_t>(num_cpus);
+    cfg.num_workers = 8;
+    cfg.rounds_per_worker = 2;
+    cfg.max_live_allocs_per_worker = 2;
+    cfg.max_heap_alloc_bytes = 256;
+    cfg.max_pmm_alloc_frames = 1;
+    cfg.boost_lapic_timer = false;
+    cfg.log_to_console = false;
+
+    const StressTestStats stats = ExecuteRandomMultiCpuStress(cfg);
+
+    stop_aps.store(true, std::memory_order_release);
+    for (std::thread& th : ap_threads) {
+      th.join();
+    }
+
+    const uint64_t expected_high =
+        (num_cpus >= 128)
+            ? ~0ULL
+            : ((1ULL << static_cast<uint32_t>(num_cpus - 64)) - 1ULL);
+    EXPECT_THAT(stats.cpu_count, t::Eq(num_cpus));
+    EXPECT_THAT(stats.cpu_participation_mask, t::Eq(~0ULL));
+    EXPECT_THAT(stats.cpu_participation_mask_high & expected_high,
+                t::Eq(expected_high));
+    EXPECT_THAT(stats.task_migrations_observed, t::Gt(0));
+    EXPECT_THAT(stats.payload_corruptions, t::Eq(0));
+    EXPECT_THAT(stats.stack_canary_corruptions, t::Eq(0));
+    EXPECT_THAT(stats.pmm_free_after, t::Eq(pmm_before));
+    EXPECT_THAT(stats.heap_free_after, t::Eq(heap_before));
+
+    TaskResetForTest();
+  }
 }
 
 }  // namespace

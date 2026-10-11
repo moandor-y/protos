@@ -742,10 +742,8 @@ TEST(
       const uint8_t pattern =
           static_cast<uint8_t>(((a_idx + 1) * 29 + (s_idx + 1) * 7) & 0xFF);
       std::memset(ptr, pattern, usable_size);
-      records.push_back(AllocationRecord{ptr,              //
-                                         usable_size,      //
-                                         effective_align,  //
-                                         pattern});
+      records.push_back(
+          AllocationRecord{ptr, usable_size, effective_align, pattern});
     }
   }
 

@@ -706,7 +706,8 @@ TEST(RbTreeTest, PropagateAugmentAndAugmentedSearchWithMockPredicates) {
 
 class MockAugmentObserver {
  public:
-  MOCK_METHOD(void, OnUpdateAugment,
+  MOCK_METHOD(void,             //
+              OnUpdateAugment,  //
               (int node_key, const int* left_key, const int* right_key));
 };
 
@@ -1049,8 +1050,8 @@ TEST(RbTreeTest,
      FindFirstAugmentedHandlesNonTriviallyDestructibleAndTrivialObserverNodes) {
   // 1) Non-trivially-destructible augmented node (holding std::shared_ptr<int>)
   // must descend into right child when root's own payload_size is too small.
-  using NonTrivialTree = RbTree<NonTrivialDestructorAugmentedNode,         //
-                                &NonTrivialDestructorAugmentedNode::node,  //
+  using NonTrivialTree = RbTree<NonTrivialDestructorAugmentedNode,
+                                &NonTrivialDestructorAugmentedNode::node,
                                 NonTrivialDestructorAugmentedTraits>;
   NonTrivialTree nt_tree;
   const auto token = std::make_shared<int>(42);

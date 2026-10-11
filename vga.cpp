@@ -168,10 +168,25 @@ static void RenderCellToFramebuffer(const int row,  //
   }
 }
 
+static void Outb(const uint16_t port, const uint8_t value) {
+#if !__STDC_HOSTED__
+  asm volatile("out dx, al" : : "d"(port), "a"(value));
+#else
+  (void)port;
+  (void)value;
+#endif
+}
+
 static void UpdateCursor() {
   if (g_fb_active) {
     return;
   }
+  const uint16_t pos =
+      static_cast<uint16_t>(g_cursor_row * kVgaWidth + g_cursor_col);
+  Outb(0x3D4, 0x0F);
+  Outb(0x3D5, static_cast<uint8_t>(pos & 0xFFu));
+  Outb(0x3D4, 0x0E);
+  Outb(0x3D5, static_cast<uint8_t>((pos >> 8) & 0xFFu));
 }
 
 static void WriteCell(const int row, const int col, const char ch) {
@@ -207,7 +222,6 @@ static void VgaPutcLocked(const char ch) {
   }
   if (ch == '\r') {
     g_cursor_col = 0;
-    UpdateCursor();
     return;
   }
   if (ch == '\n') {
@@ -217,7 +231,23 @@ static void VgaPutcLocked(const char ch) {
       ScrollUpOneRow();
       g_cursor_row = kVgaHeight - 1;
     }
-    UpdateCursor();
+    return;
+  }
+  if (ch == '\t') {
+    const int spaces = 8 - (g_cursor_col & 7);
+    for (int i = 0; i < spaces; ++i) {
+      WriteCell(g_cursor_row, g_cursor_col, ' ');
+      ++g_cursor_col;
+      if (g_cursor_col >= kVgaWidth) {
+        g_cursor_col = 0;
+        ++g_cursor_row;
+        if (g_cursor_row >= kVgaHeight) {
+          ScrollUpOneRow();
+          g_cursor_row = kVgaHeight - 1;
+        }
+        break;
+      }
+    }
     return;
   }
   WriteCell(g_cursor_row, g_cursor_col, ch);
@@ -230,7 +260,6 @@ static void VgaPutcLocked(const char ch) {
       g_cursor_row = kVgaHeight - 1;
     }
   }
-  UpdateCursor();
 }
 
 static void VgaWriteLocked(const char* const str) {
@@ -240,11 +269,13 @@ static void VgaWriteLocked(const char* const str) {
   for (int i = 0; str[i] != '\0'; ++i) {
     VgaPutcLocked(str[i]);
   }
+  UpdateCursor();
 }
 
 static void VgaWriteDecLocked(const uint64_t value) {
   if (value == 0) {
     VgaPutcLocked('0');
+    UpdateCursor();
     return;
   }
   char buffer[20];
@@ -259,6 +290,7 @@ static void VgaWriteDecLocked(const uint64_t value) {
     --count;
     VgaPutcLocked(buffer[count]);
   }
+  UpdateCursor();
 }
 
 }  // namespace
@@ -278,6 +310,13 @@ void VgaClear() {
 void VgaPutc(const char ch) {
   const IrqSpinLockGuard lock_guard(g_vga_lock);
   VgaPutcLocked(ch);
+  UpdateCursor();
+}
+
+void VgaPutChar(const char ch) {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
+  VgaPutcLocked(ch);
+  UpdateCursor();
 }
 
 void VgaWrite(const char* const str) {
@@ -288,11 +327,15 @@ void VgaWrite(const char* const str) {
 void VgaWriteHex(const uint64_t value) {
   const IrqSpinLockGuard lock_guard(g_vga_lock);
   constexpr const char* kHexDigits = "0123456789ABCDEF";
-  VgaWriteLocked("0x");
   if (value == 0) {
     VgaPutcLocked('0');
+    VgaPutcLocked('x');
+    VgaPutcLocked('0');
+    UpdateCursor();
     return;
   }
+  VgaPutcLocked('0');
+  VgaPutcLocked('x');
   char buffer[16];
   int count = 0;
   uint64_t remaining = value;
@@ -305,11 +348,22 @@ void VgaWriteHex(const uint64_t value) {
     --count;
     VgaPutcLocked(buffer[count]);
   }
+  UpdateCursor();
 }
 
 void VgaWriteDec(const uint64_t value) {
   const IrqSpinLockGuard lock_guard(g_vga_lock);
   VgaWriteDecLocked(value);
+}
+
+int VgaGetCursorRow() {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
+  return g_cursor_row;
+}
+
+int VgaGetCursorCol() {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
+  return g_cursor_col;
 }
 
 void VgaPanicWrite(const char* const str) { VgaWriteLocked(str); }
@@ -323,11 +377,15 @@ void VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
                         const int bpp) {
   const IrqSpinLockGuard lock_guard(g_vga_lock);
   if (fb_phys_addr == 0 || pitch <= 0 || width < kVgaWidth * kGlyphWidth ||
-      height < kVgaHeight * kGlyphHeight || (bpp != 32 && bpp != 24)) {
+      height < kVgaHeight * kGlyphHeight || (bpp != 32 && bpp != 24) ||
+      static_cast<int64_t>(pitch) < static_cast<int64_t>(width) * (bpp / 8)) {
     return;
   }
   const int64_t fb_bytes = static_cast<int64_t>(pitch) * height;
-  if (!PagingMapBootstrapRange(fb_phys_addr, fb_bytes)) {
+  if (fb_phys_addr >= kMaxCanonicalIdentityAddress ||
+      static_cast<uintptr_t>(fb_bytes) >
+          kMaxCanonicalIdentityAddress - fb_phys_addr ||
+      !PagingMapBootstrapRange(fb_phys_addr, fb_bytes)) {
     return;
   }
   g_fb_addr = fb_phys_addr;

@@ -122,17 +122,31 @@ static void PanicWriteHex(const uint64_t value) {
   PanicWriteStr("\n");
 
 #if __STDC_HOSTED__
-  std::fprintf(stderr,
-               "[FATAL] Unhandled CPU exception %llu (%s) err=0x%llx "
-               "rip=0x%llx rsp=0x%llx rflags=0x%llx cr2=0x%llx cpu=%d\n",
-               static_cast<unsigned long long>(frame->vector),  //
-               mnemonic,                                        //
-               static_cast<unsigned long long>(frame->error_code),
-               static_cast<unsigned long long>(frame->rip),     //
-               static_cast<unsigned long long>(frame->rsp),     //
-               static_cast<unsigned long long>(frame->rflags),  //
-               static_cast<unsigned long long>(cr2),            //
-               cpu_id);
+  if (cpu_id >= 0) {
+    std::fprintf(stderr,  //
+                 "[FATAL] Unhandled CPU exception %llu (%s) err=0x%llx "
+                 "rip=0x%llx rsp=0x%llx rflags=0x%llx cr2=0x%llx cpu=%d\n",  //
+                 static_cast<unsigned long long>(frame->vector),             //
+                 mnemonic,                                                   //
+                 static_cast<unsigned long long>(frame->error_code),         //
+                 static_cast<unsigned long long>(frame->rip),                //
+                 static_cast<unsigned long long>(frame->rsp),                //
+                 static_cast<unsigned long long>(frame->rflags),             //
+                 static_cast<unsigned long long>(cr2),                       //
+                 cpu_id);
+  } else {
+    std::fprintf(
+        stderr,  //
+        "[FATAL] Unhandled CPU exception %llu (%s) err=0x%llx "
+        "rip=0x%llx rsp=0x%llx rflags=0x%llx cr2=0x%llx cpu=unbound\n",  //
+        static_cast<unsigned long long>(frame->vector),                  //
+        mnemonic,                                                        //
+        static_cast<unsigned long long>(frame->error_code),              //
+        static_cast<unsigned long long>(frame->rip),                     //
+        static_cast<unsigned long long>(frame->rsp),                     //
+        static_cast<unsigned long long>(frame->rflags),                  //
+        static_cast<unsigned long long>(cr2));
+  }
   std::fflush(stderr);
   std::_Exit(134);
 #else
@@ -149,6 +163,9 @@ IdtGateDescriptor IdtEncodeGate(const uint64_t handler_addr,  //
                                 const uint8_t ist,            //
                                 const uint8_t type_attr) {
   DCHECK(handler_addr != 0);
+  const uint64_t sign_ext =
+      static_cast<uint64_t>(static_cast<int64_t>(handler_addr) >> 47);
+  DCHECK(sign_ext == 0ULL || sign_ext == ~0ULL);
   DCHECK(selector != 0);
   DCHECK(ist <= kMaxIstIndex);
   DCHECK(IsValidGateTypeAttr(type_attr));

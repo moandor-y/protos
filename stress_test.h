@@ -101,6 +101,7 @@ struct StressTestStats {
   uint64_t seed = 0;
   int cpu_count = 0;
   uint64_t cpu_participation_mask = 0;
+  uint64_t cpu_participation_mask_high = 0;
   int64_t cooperative_yields = 0;
   int64_t preemptive_spin_bursts = 0;
   int64_t timer_preemptions_observed = 0;

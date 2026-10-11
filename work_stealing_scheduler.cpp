@@ -11,11 +11,10 @@
 #include "check.h"
 #include "idt.h"
 #include "smp.h"
+#include "spinlock.h"
 
 namespace protos {
 namespace {
-
-[[gnu::noinline]] static int GetCurrentCpuId() { return CurrentCpuId(); }
 
 [[gnu::noinline]] static CpuLocal* GetCurrentCpuOrNull() {
   return CurrentCpuOrNull();
@@ -63,10 +62,13 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
   }
 
   void Yield() override {
-    const int cpu_id = GetCurrentCpuId();
-    if (inner_->RunqueueLoad(cpu_id) == 0) {
-      (void)TryStealForCpu(cpu_id);
+    const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
+    const CpuLocal* const cpu = GetCurrentCpuOrNull();
+    if (cpu != nullptr && cpu->online &&
+        inner_->RunqueueLoad(cpu->cpu_id) == 0) {
+      (void)TryStealForCpu(cpu->cpu_id);
     }
+    internal::LocalRestoreInterrupts(saved_irq);
     inner_->Yield();
   }
 
@@ -126,8 +128,8 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
     const int cpu_count = SmpCpuCount();
     DCHECK(cpu_count >= 1);
     int best_cpu = 0;
-    int best_load = inner_->RunqueueLoad(0);
-    for (int cpu = 1; cpu < cpu_count; ++cpu) {
+    int best_load = INT_MAX;
+    for (int cpu = 0; cpu < cpu_count; ++cpu) {
       if (!IsCpuOnline(cpu, cpu_count)) {
         continue;
       }

@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -39,6 +40,7 @@ TEST(SpinLockTest, ConstexprInitAndBasicLockUnlock) {
   EXPECT_TRUE(AreInterruptsEnabled());
   EXPECT_THAT(g_static_spinlock.NextTicket(), t::Eq(1));
   EXPECT_THAT(g_static_spinlock.ServingTicket(), t::Eq(1));
+  new (&g_static_spinlock) IrqSpinLock{};
 }
 
 TEST(SpinLockTest, ScopedGuardSupportsReferenceAndPointer) {

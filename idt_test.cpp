@@ -77,10 +77,8 @@ TEST(IdtTest, EncodeGateAndDecodeOffsetEncodeAllFieldsCorrectly) {
   ResetEnv();
   constexpr uint64_t kHandlerAddr = 0xFFFFFFFF80123456ULL;
 
-  const IdtGateDescriptor irq_gate = IdtEncodeGate(kHandlerAddr,            //
-                                                   kIdtKernelCodeSelector,  //
-                                                   0,                       //
-                                                   kIdtInterruptGateAttr);
+  const IdtGateDescriptor irq_gate = IdtEncodeGate(
+      kHandlerAddr, kIdtKernelCodeSelector, 0, kIdtInterruptGateAttr);
   EXPECT_THAT(irq_gate.offset_low, t::Eq(0x3456u));
   EXPECT_THAT(irq_gate.selector, t::Eq(kIdtKernelCodeSelector));
   EXPECT_THAT(irq_gate.ist, t::Eq(0u));
@@ -90,10 +88,8 @@ TEST(IdtTest, EncodeGateAndDecodeOffsetEncodeAllFieldsCorrectly) {
   EXPECT_THAT(irq_gate.reserved, t::Eq(0u));
   EXPECT_THAT(IdtDecodeGateOffset(irq_gate), t::Eq(kHandlerAddr));
 
-  const IdtGateDescriptor trap_gate = IdtEncodeGate(0x0000123456789ABCULL,   //
-                                                    kIdtKernelCodeSelector,  //
-                                                    7,                       //
-                                                    kIdtUserTrapGateAttr);
+  const IdtGateDescriptor trap_gate = IdtEncodeGate(
+      0x0000123456789ABCULL, kIdtKernelCodeSelector, 7, kIdtUserTrapGateAttr);
   EXPECT_THAT(trap_gate.offset_low, t::Eq(0x9ABCu));
   EXPECT_THAT(trap_gate.selector, t::Eq(kIdtKernelCodeSelector));
   EXPECT_THAT(trap_gate.ist, t::Eq(7u));
@@ -288,6 +284,18 @@ TEST(IdtTest, DispatchHandlesLocalApicTimerWakeupIpiSpuriousAndCustomVectors) {
   EXPECT_THAT(g_env.eoi_count.load(), t::Eq(5));
 
   ResetCpuLocalForTest();
+  EXPECT_THAT(CurrentCpuOrNull(), t::IsNull());
+
+  // When CurrentCpuOrNull() is nullptr, timer (0x20) and wakeup IPI (0x21)
+  // dispatches must still invoke registered handlers and send EOI without
+  // dereferencing a null CpuLocal pointer.
+  IdtDispatch(&timer_frame);
+  IdtDispatch(&ipi_frame);
+  EXPECT_THAT(cpu.timer_ticks.load(), t::Eq(2));
+  EXPECT_THAT(cpu.ipi_count.load(), t::Eq(1));
+  EXPECT_THAT(timer_handler_calls, t::Eq(3));
+  EXPECT_THAT(ipi_handler_calls, t::Eq(2));
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(7));
 }
 
 TEST(IdtTest, ConcurrentMultiThreadedPerCpuDispatchUnderTsan) {
@@ -372,6 +380,21 @@ TEST(IdtDeathTest, UnhandledCpuExceptionsLogDiagnosticsAndPanic) {
       },
       "Unhandled CPU exception 14 \\(#PF\\) err=0x2 rip=0x104567 "
       "rsp=0x207ff0 rflags=0x202 cr2=0xdeadbeef12340000 cpu=3");
+
+  EXPECT_DEATH(
+      {
+        ResetCpuLocalForTest();
+        IdtSetHostCr2ForTest(0);
+        InterruptFrame de_frame = {};
+        de_frame.vector = kVectorDivideError;
+        de_frame.error_code = 0;
+        de_frame.rip = 0;
+        de_frame.rsp = 0;
+        de_frame.rflags = 0;
+        IdtDispatch(&de_frame);
+      },
+      "Unhandled CPU exception 0 \\(#DE\\) err=0x0 rip=0x0 "
+      "rsp=0x0 rflags=0x0 cr2=0x0 cpu=unbound");
 }
 
 TEST(IdtDeathTest, PreconditionViolationsTriggerDcheck) {
@@ -382,7 +405,8 @@ TEST(IdtDeathTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(IdtLoad(), "Check failed");
   EXPECT_DEATH(IdtGetGate(0), "Check failed");
   EXPECT_DEATH(IdtGetPointer(), "Check failed");
-  EXPECT_DEATH(IdtRegisterHandler(3, [](InterruptFrame*) {}), "Check failed");
+  EXPECT_DEATH(IdtRegisterHandler(3, [](InterruptFrame* const) {}),
+               "Check failed");
   EXPECT_DEATH(IdtUnregisterHandler(3), "Check failed");
   EXPECT_DEATH(IdtGetHandler(3), "Check failed");
   EXPECT_DEATH(IdtDispatch(&frame), "Check failed");
@@ -391,6 +415,16 @@ TEST(IdtDeathTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(
       IdtEncodeGate(0, kIdtKernelCodeSelector, 0, kIdtInterruptGateAttr),
       "Check failed");
+  EXPECT_DEATH(IdtEncodeGate(0x0001000000001000ULL,   //
+                             kIdtKernelCodeSelector,  //
+                             0,                       //
+                             kIdtInterruptGateAttr),
+               "Check failed");
+  EXPECT_DEATH(IdtEncodeGate(0xFFFEFFFFFFFF0000ULL,   //
+                             kIdtKernelCodeSelector,  //
+                             0,                       //
+                             kIdtInterruptGateAttr),
+               "Check failed");
   EXPECT_DEATH(IdtEncodeGate(0x1000, 0, 0, kIdtInterruptGateAttr),
                "Check failed");
   EXPECT_DEATH(
@@ -412,8 +446,10 @@ TEST(IdtDeathTest, PreconditionViolationsTriggerDcheck) {
   IdtInit();
   EXPECT_DEATH(IdtGetGate(-1), "Check failed");
   EXPECT_DEATH(IdtGetGate(256), "Check failed");
-  EXPECT_DEATH(IdtRegisterHandler(-1, [](InterruptFrame*) {}), "Check failed");
-  EXPECT_DEATH(IdtRegisterHandler(256, [](InterruptFrame*) {}), "Check failed");
+  EXPECT_DEATH(IdtRegisterHandler(-1, [](InterruptFrame* const) {}),
+               "Check failed");
+  EXPECT_DEATH(IdtRegisterHandler(256, [](InterruptFrame* const) {}),
+               "Check failed");
   EXPECT_DEATH(IdtRegisterHandler(3, nullptr), "Check failed");
   EXPECT_DEATH(IdtUnregisterHandler(-1), "Check failed");
   EXPECT_DEATH(IdtUnregisterHandler(256), "Check failed");

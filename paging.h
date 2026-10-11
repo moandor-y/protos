@@ -7,6 +7,8 @@ namespace protos {
 
 // Size of a 2 MiB huge page mapped by a Page Directory (PD) entry with PS=1.
 constexpr uintptr_t kHugePageSize = 0x200000;
+// Page Directory (PD) entry Page Size (PS) bit indicating a 2 MiB huge page.
+constexpr uint64_t kPageEntryHugePage = 1ULL << 7;
 // Initial physical address range identity-mapped by `boot.S` before `PmmInit`
 // runs (64 MiB = 32 * 2 MiB huge pages).
 constexpr uintptr_t kBootstrapIdentityMapSize = 0x04000000;
@@ -18,6 +20,12 @@ constexpr uintptr_t kMaxCanonicalIdentityAddress = 0x0000800000000000ULL;
 // call before `PmmInit` completes). Does not advance
 // `PagingIdentityMappedLimit()`.
 bool PagingMapBootstrapRange(uintptr_t phys_addr, int64_t size);
+
+// Ensures that all pages overlapping `[phys_addr, phys_addr + size)` are
+// present and writable in the active identity map, handling 2 MiB PD entries
+// that are already mapped as 2 MiB huge pages (`kPageEntryHugePage`) as well
+// as 2 MiB PD entries that have been split into 4 KiB page tables.
+bool PagingEnsureIdentityMappedRange(uintptr_t phys_addr, int64_t size);
 
 // Extends the active 4-level identity mapping (`virtual_addr == physical_addr`)
 // from `0` up to `max_physical_addr` (rounded up to `kHugePageSize`),

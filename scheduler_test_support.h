@@ -32,6 +32,8 @@ constexpr uintptr_t kFakeStackBase = 0x200000;
 struct FakeSchedulerEnv {
   int cpu_count = 1;
   bool idt_initialized = true;
+  bool fail_pmm_alloc = false;
+  bool fail_kmalloc = false;
   std::unique_ptr<CpuLocal[]> cpu_locals;
   std::unique_ptr<CpuInfo[]> cpu_infos;
   std::unique_ptr<bool[]> null_cpu_local;
@@ -85,6 +87,8 @@ inline void SetupEnv(const int num_cpus = 1) {
 
   g_env.active_scheduler.reset();
   g_env.idt_initialized = true;
+  g_env.fail_pmm_alloc = false;
+  g_env.fail_kmalloc = false;
   g_env.cpu_count = num_cpus;
   g_env.allocated_frames.store(0, std::memory_order_relaxed);
   g_env.allocated_heap_bytes.store(0, std::memory_order_relaxed);
@@ -112,15 +116,15 @@ inline void SetupEnv(const int num_cpus = 1) {
     CpuLocal& local = g_env.cpu_locals[i];
     local.self = &local;
     local.cpu_id = i;
-    local.apic_id = static_cast<uint8_t>(i);
+    local.apic_id = static_cast<uint32_t>(i);
     local.online = true;
     local.stack_base = stack_base;
     local.stack_top = stack_top;
 
     CpuInfo& info = g_env.cpu_infos[i];
-    info.apic_id = static_cast<uint8_t>(i);
-    info.acpi_processor_id = static_cast<uint8_t>(i);
-    info.observed_apic_id = static_cast<uint8_t>(i);
+    info.apic_id = static_cast<uint32_t>(i);
+    info.acpi_processor_id = static_cast<uint32_t>(i);
+    info.observed_apic_id = static_cast<uint32_t>(i);
     info.is_bsp = (i == 0);
     info.online = true;
     info.long_mode_active = true;
@@ -139,7 +143,9 @@ class MockTaskScheduler : public TaskScheduler {
  public:
   MOCK_METHOD(void, Init, (), (override));
   MOCK_METHOD(Task*, CreateTask, (TaskFn, void*, int64_t), (override));
-  MOCK_METHOD(Task*, CreateTaskOnCpu, (TaskFn, void*, int64_t, int),
+  MOCK_METHOD(Task*,                          //
+              CreateTaskOnCpu,                //
+              (TaskFn, void*, int64_t, int),  //
               (override));
   MOCK_METHOD(void, Yield, (), (override));
   MOCK_METHOD(void, Join, (Task*), (override));
@@ -156,6 +162,9 @@ class MockTaskScheduler : public TaskScheduler {
 
 [[gnu::used]] inline uintptr_t PmmAllocFrames(const int64_t count) {
   DCHECK(count > 0);
+  if (g_env.fail_pmm_alloc) {
+    return 0;
+  }
   const int64_t bytes = count * kPageSize;
   void* const mem = std::aligned_alloc(static_cast<size_t>(kPageSize),
                                        static_cast<size_t>(bytes));
@@ -190,8 +199,8 @@ class MockTaskScheduler : public TaskScheduler {
 
 [[gnu::used]] inline void* KmallocAligned(const int64_t size,
                                           const int64_t alignment) {
-  if (size < 0 || alignment < 1 || (alignment & (alignment - 1)) != 0 ||
-      alignment > kPageSize) {
+  if (g_env.fail_kmalloc || size < 0 || alignment < 1 ||
+      (alignment & (alignment - 1)) != 0 || alignment > kPageSize) {
     return nullptr;
   }
   const int64_t payload = (size > 0) ? size : kHeapAlignment;

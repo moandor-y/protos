@@ -113,6 +113,7 @@ struct StressSharedState {
   uint64_t master_seed = 1;
 
   std::atomic<uint64_t> cpu_participation_mask{0};
+  std::atomic<uint64_t> cpu_participation_mask_high{0};
   std::atomic<int64_t> cooperative_yields{0};
   std::atomic<int64_t> preemptive_spin_bursts{0};
   std::atomic<int64_t> timer_preemptions_observed{0};
@@ -158,8 +159,10 @@ struct PreemptProbeContext {
 
 struct CpuParticipationBarrierContext {
   StressSharedState* shared = nullptr;
-  std::atomic<uint64_t>* barrier_mask = nullptr;
-  uint64_t expected_cpu_mask = 0;
+  std::atomic<uint64_t>* barrier_mask_low = nullptr;
+  std::atomic<uint64_t>* barrier_mask_high = nullptr;
+  uint64_t expected_cpu_mask_low = 0;
+  uint64_t expected_cpu_mask_high = 0;
   int initial_cpu = 0;
 };
 
@@ -201,8 +204,8 @@ static void FillByteBufferPattern(uint8_t* const buf,       //
   }
 }
 
-static bool VerifyAndPoisonByteBuffer(uint8_t* const buf,       //
-                                      const int64_t byte_size,  //
+static bool VerifyAndPoisonByteBuffer(uint8_t* const buf,
+                                      const int64_t byte_size,
                                       const uint64_t pattern_seed) {
   DCHECK(buf != nullptr);
   DCHECK(byte_size >= 0);
@@ -224,8 +227,8 @@ static bool VerifyAndPoisonByteBuffer(uint8_t* const buf,       //
   return ok;
 }
 
-static void FillFrameRunPattern(const uintptr_t phys_addr,  //
-                                const int64_t frame_count,  //
+static void FillFrameRunPattern(const uintptr_t phys_addr,
+                                const int64_t frame_count,
                                 const uint64_t pattern_seed) {
   DCHECK(phys_addr != 0);
   DCHECK(frame_count > 0);
@@ -238,8 +241,8 @@ static void FillFrameRunPattern(const uintptr_t phys_addr,  //
   }
 }
 
-static bool VerifyAndPoisonFrameRun(const uintptr_t phys_addr,  //
-                                    const int64_t frame_count,  //
+static bool VerifyAndPoisonFrameRun(const uintptr_t phys_addr,
+                                    const int64_t frame_count,
                                     const uint64_t pattern_seed) {
   DCHECK(phys_addr != 0);
   DCHECK(frame_count > 0);
@@ -485,6 +488,9 @@ static void RecordCpuAndMigration(StressSharedState* const shared,
   if (cpu >= 0 && cpu < 64) {
     shared->cpu_participation_mask.fetch_or(1ULL << static_cast<uint32_t>(cpu),
                                             std::memory_order_acq_rel);
+  } else if (cpu >= 64 && cpu < kMaxSupportedCpus) {
+    shared->cpu_participation_mask_high.fetch_or(
+        1ULL << static_cast<uint32_t>(cpu - 64), std::memory_order_acq_rel);
   }
   if (cpu != *last_cpu) {
     shared->task_migrations_observed.fetch_add(1, std::memory_order_acq_rel);
@@ -508,18 +514,24 @@ static void CpuParticipationBarrierEntry(void* const raw_arg) {
   CpuParticipationBarrierContext* const ctx =
       static_cast<CpuParticipationBarrierContext*>(raw_arg);
   if (ctx == nullptr || ctx->shared == nullptr ||
-      ctx->barrier_mask == nullptr) {
+      ctx->barrier_mask_low == nullptr || ctx->barrier_mask_high == nullptr) {
     return;
   }
   StressSharedState* const shared = ctx->shared;
   int last_cpu = ctx->initial_cpu;
   RecordCpuAndMigration(shared, &last_cpu);
   if (last_cpu >= 0 && last_cpu < 64) {
-    ctx->barrier_mask->fetch_or(1ULL << static_cast<uint32_t>(last_cpu),
-                                std::memory_order_acq_rel);
+    ctx->barrier_mask_low->fetch_or(1ULL << static_cast<uint32_t>(last_cpu),
+                                    std::memory_order_acq_rel);
+  } else if (last_cpu >= 64 && last_cpu < kMaxSupportedCpus) {
+    ctx->barrier_mask_high->fetch_or(
+        1ULL << static_cast<uint32_t>(last_cpu - 64),
+        std::memory_order_acq_rel);
   }
-  while ((ctx->barrier_mask->load(std::memory_order_acquire) &
-          ctx->expected_cpu_mask) != ctx->expected_cpu_mask) {
+  while ((ctx->barrier_mask_low->load(std::memory_order_acquire) &
+          ctx->expected_cpu_mask_low) != ctx->expected_cpu_mask_low ||
+         (ctx->barrier_mask_high->load(std::memory_order_acquire) &
+          ctx->expected_cpu_mask_high) != ctx->expected_cpu_mask_high) {
     asm volatile("pause" : : : "memory");
 #if __STDC_HOSTED__
     std::this_thread::yield();
@@ -848,9 +860,8 @@ static void StressWorkerEntry(void* const raw_arg) {
                                            target_cpu);
       } else {
         child_ctx.initial_cpu = CurrentCpuId();
-        child = scheduler->CreateTask(JoinedChildEntry,  //
-                                      &child_ctx,        //
-                                      child_weight);
+        child =
+            scheduler->CreateTask(JoinedChildEntry, &child_ctx, child_weight);
       }
       if (child == nullptr) {
         shared->invariant_failed.store(true, std::memory_order_release);
@@ -891,10 +902,8 @@ static void StressWorkerEntry(void* const raw_arg) {
           if (prng.NextBool()) {
             const int target_cpu = prng.NextIntRange(0, shared->cpu_count - 1);
             det_ctx->initial_cpu = target_cpu;
-            det_task = scheduler->CreateTaskOnCpu(DetachedChildEntry,  //
-                                                  det_ctx.get(),       //
-                                                  det_weight,          //
-                                                  target_cpu);
+            det_task = scheduler->CreateTaskOnCpu(
+                DetachedChildEntry, det_ctx.get(), det_weight, target_cpu);
           } else {
             det_ctx->initial_cpu = CurrentCpuId();
             det_task = scheduler->CreateTask(DetachedChildEntry,  //
@@ -1146,7 +1155,7 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
   const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
   CHECK(scheduler != nullptr);
   const int cpu_count = SmpCpuCount();
-  CHECK(cpu_count >= 1 && cpu_count <= 64);
+  CHECK(cpu_count >= 1 && cpu_count <= kMaxSupportedCpus);
   CHECK(SmpOnlineCpuCount() == cpu_count);
 
   Task* const bootstrap_task = scheduler->CurrentTask();
@@ -1240,22 +1249,17 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
 
     if (cpu_count > 1 && i < (num_workers / 2)) {
       workers[i].initial_cpu = 0;
-      workers[i].task = scheduler->CreateTaskOnCpu(StressWorkerEntry,  //
-                                                   &workers[i],        //
-                                                   worker_weight,      //
-                                                   0);
+      workers[i].task = scheduler->CreateTaskOnCpu(
+          StressWorkerEntry, &workers[i], worker_weight, 0);
     } else if ((i & 1) == 0) {
       const int target_cpu = i % cpu_count;
       workers[i].initial_cpu = target_cpu;
-      workers[i].task = scheduler->CreateTaskOnCpu(StressWorkerEntry,  //
-                                                   &workers[i],        //
-                                                   worker_weight,      //
-                                                   target_cpu);
+      workers[i].task = scheduler->CreateTaskOnCpu(
+          StressWorkerEntry, &workers[i], worker_weight, target_cpu);
     } else {
       workers[i].initial_cpu = i % cpu_count;
-      workers[i].task = scheduler->CreateTask(StressWorkerEntry,  //
-                                              &workers[i],        //
-                                              worker_weight);
+      workers[i].task =
+          scheduler->CreateTask(StressWorkerEntry, &workers[i], worker_weight);
     }
     CHECK(workers[i].task != nullptr);
   }
@@ -1307,24 +1311,38 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
   // disabled while CPU 0 spins without yielding/stealing guarantees that each
   // AP holds at most one barrier task and every AP `1 .. cpu_count - 1` must
   // enter a barrier task before the rendezvous completes.
-  const uint64_t expected_cpu_mask =
+  const uint64_t expected_cpu_mask_low =
       (cpu_count >= 64) ? ~0ULL
                         : ((1ULL << static_cast<uint32_t>(cpu_count)) - 1ULL);
+  const uint64_t expected_cpu_mask_high =
+      (cpu_count <= 64)
+          ? 0ULL
+          : ((cpu_count >= 128)
+                 ? ~0ULL
+                 : ((1ULL << static_cast<uint32_t>(cpu_count - 64)) - 1ULL));
   if (cpu_count > 1 &&
       ((shared.cpu_participation_mask.load(std::memory_order_acquire) &
-        expected_cpu_mask) != expected_cpu_mask ||
+        expected_cpu_mask_low) != expected_cpu_mask_low ||
+       (shared.cpu_participation_mask_high.load(std::memory_order_acquire) &
+        expected_cpu_mask_high) != expected_cpu_mask_high ||
        shared.task_migrations_observed.load(std::memory_order_acquire) == 0)) {
     const bool prev_preempt = scheduler->IsPreemptEnabled();
     scheduler->SetPreemptEnabled(false);
     shared.cpu_participation_mask.fetch_or(1ULL, std::memory_order_acq_rel);
 
-    std::atomic<uint64_t> barrier_mask{1ULL};
-    CpuParticipationBarrierContext barrier_ctxs[64] = {};
-    Task* barrier_tasks[64] = {};
+    std::atomic<uint64_t> barrier_mask_low{1ULL};
+    std::atomic<uint64_t> barrier_mask_high{0ULL};
+    std::unique_ptr<CpuParticipationBarrierContext[]> barrier_ctxs(
+        new CpuParticipationBarrierContext[cpu_count]());
+    std::unique_ptr<Task*[]> barrier_tasks(new Task*[cpu_count]());
+    CHECK(barrier_ctxs != nullptr);
+    CHECK(barrier_tasks != nullptr);
     for (int c = 1; c < cpu_count; ++c) {
       barrier_ctxs[c].shared = &shared;
-      barrier_ctxs[c].barrier_mask = &barrier_mask;
-      barrier_ctxs[c].expected_cpu_mask = expected_cpu_mask;
+      barrier_ctxs[c].barrier_mask_low = &barrier_mask_low;
+      barrier_ctxs[c].barrier_mask_high = &barrier_mask_high;
+      barrier_ctxs[c].expected_cpu_mask_low = expected_cpu_mask_low;
+      barrier_ctxs[c].expected_cpu_mask_high = expected_cpu_mask_high;
       barrier_ctxs[c].initial_cpu = 0;
       barrier_tasks[c] =
           scheduler->CreateTaskOnCpu(CpuParticipationBarrierEntry,  //
@@ -1337,12 +1355,21 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
     }
 
     int wait_spins = 0;
-    while ((barrier_mask.load(std::memory_order_acquire) & expected_cpu_mask) !=
-           expected_cpu_mask) {
+    while ((barrier_mask_low.load(std::memory_order_acquire) &
+            expected_cpu_mask_low) != expected_cpu_mask_low ||
+           (barrier_mask_high.load(std::memory_order_acquire) &
+            expected_cpu_mask_high) != expected_cpu_mask_high) {
       if ((wait_spins & 255) == 0) {
-        const uint64_t mask = barrier_mask.load(std::memory_order_acquire);
+        const uint64_t mask_low =
+            barrier_mask_low.load(std::memory_order_acquire);
+        const uint64_t mask_high =
+            barrier_mask_high.load(std::memory_order_acquire);
         for (int c = 1; c < cpu_count; ++c) {
-          if ((mask & (1ULL << static_cast<uint32_t>(c))) == 0) {
+          const bool arrived =
+              (c < 64) ? ((mask_low & (1ULL << static_cast<uint32_t>(c))) != 0)
+                       : ((mask_high &
+                           (1ULL << static_cast<uint32_t>(c - 64))) != 0);
+          if (!arrived) {
             SmpSendIpi(c, kVectorWakeupIpi);
             shared.wakeup_ipis_sent.fetch_add(1, std::memory_order_acq_rel);
           }
@@ -1382,6 +1409,8 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
   stats.cpu_count = cpu_count;
   stats.cpu_participation_mask =
       shared.cpu_participation_mask.load(std::memory_order_acquire);
+  stats.cpu_participation_mask_high =
+      shared.cpu_participation_mask_high.load(std::memory_order_acquire);
   stats.cooperative_yields =
       shared.cooperative_yields.load(std::memory_order_acquire);
   stats.preemptive_spin_bursts =
@@ -1417,8 +1446,10 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
   CHECK(!shared.invariant_failed.load(std::memory_order_acquire));
   CHECK(shared.workers_completed.load(std::memory_order_acquire) ==
         num_workers);
-  CHECK((stats.cpu_participation_mask & expected_cpu_mask) ==
-        expected_cpu_mask);
+  CHECK((stats.cpu_participation_mask & expected_cpu_mask_low) ==
+        expected_cpu_mask_low);
+  CHECK((stats.cpu_participation_mask_high & expected_cpu_mask_high) ==
+        expected_cpu_mask_high);
   CHECK(stats.cooperative_yields > 0);
   CHECK(stats.preemptive_spin_bursts > 0);
   CHECK(stats.timer_preemptions_observed > 0);
@@ -1463,7 +1494,9 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
     constexpr char kSpinnerChars[4] = {'|', '/', '-', '\\'};
     const uint64_t pass_num =
         g_stress_pass_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    const char spinner_str[4] = {' ', kSpinnerChars[pass_num & 3ULL], ' ',
+    const char spinner_str[4] = {' ',                             //
+                                 kSpinnerChars[pass_num & 3ULL],  //
+                                 ' ',                             //
                                  '\0'};
     VgaWrite("\r[STRESS] random_multicpu_stress: PASS #");
     VgaWriteDec(pass_num);

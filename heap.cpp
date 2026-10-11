@@ -69,9 +69,8 @@ struct FreeBlockRbTraits {
   }
 };
 
-using FreeBlockTree = RbTree<HeapBlockHeader,            //
-                             &HeapBlockHeader::rb_node,  //
-                             FreeBlockRbTraits>;
+using FreeBlockTree =
+    RbTree<HeapBlockHeader, &HeapBlockHeader::rb_node, FreeBlockRbTraits>;
 
 // Spinlock protecting `g_free_tree`, `g_total_free_bytes`, and
 // `g_heap_initialized` across concurrent multi-CPU heap operations.
@@ -458,8 +457,8 @@ void Kfree(void* const ptr) {
   DCHECK((ptr_addr & (kHeapAlignment - 1)) == 0);
 
   HeapBlockHeader* block = reinterpret_cast<HeapBlockHeader*>(ptr) - 1;
-  DCHECK(block->magic == kHeapBlockMagic);
-  DCHECK(block->is_free == 0);
+  CHECK(block->magic == kHeapBlockMagic);
+  CHECK(block->is_free == 0);
   DCHECK(block->size >= kHeapAlignment);
   DCHECK((block->size & (kHeapAlignment - 1)) == 0);
   DCHECK(block->align_offset >= 0);

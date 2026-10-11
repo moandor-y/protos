@@ -5,6 +5,14 @@
 
 namespace protos {
 
+// Multiboot1 and Multiboot2 bootloader magic numbers passed in EAX.
+constexpr uint32_t kMultiboot1Magic = 0x2BADB002;
+constexpr uint32_t kMultiboot2Magic = 0x36D76289;
+// Multiboot1 info `flags` bit 0: `mem_lower` and `mem_upper` fields are valid.
+constexpr uint32_t kMultiboot1FlagMemBasic = 1u << 0;
+// Multiboot1 info `flags` bit 6: `mmap_length` and `mmap_addr` fields are
+// valid.
+constexpr uint32_t kMultiboot1FlagMmap = 1u << 6;
 // Multiboot memory map entry type indicating usable RAM.
 constexpr uint32_t kMemoryTypeAvailable = 1;
 // Maximum number of memory map regions stored in `MultibootMemoryMap`
@@ -52,9 +60,9 @@ bool MultibootRecordMmapEntry(MultibootMemoryMap* out_map,  //
 // bootloader structures on demand if they lie above the initial 64 MiB
 // bootstrap window, and populates `*out_map`. Returns true if a valid memory
 // map with usable RAM was found without region table overflow.
-bool MultibootParseMemoryMapFromBuffer(uint32_t multiboot_magic,      //
-                                       uint64_t multiboot_info_addr,  //
-                                       uintptr_t max_physical_addr,   //
+bool MultibootParseMemoryMapFromBuffer(uint32_t multiboot_magic,
+                                       uint64_t multiboot_info_addr,
+                                       uintptr_t max_physical_addr,
                                        MultibootMemoryMap* out_map);
 
 bool MultibootParseMemoryMap(uint32_t multiboot_magic,

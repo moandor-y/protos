@@ -57,6 +57,12 @@ int64_t PmmFreeFrameCount();
 // `PmmInit` completed.
 int64_t PmmTotalUsableFrameCount();
 
+#if __STDC_HOSTED__
+// Resets PMM internal state (`g_pmm_initialized`, free-run tree, and frame
+// counters) for hermetic host unit tests.
+void PmmResetForTest();
+#endif
+
 }  // namespace protos
 
 #endif  // PROTOS_PMM_H_

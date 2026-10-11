@@ -46,18 +46,14 @@ TEST(JoinLifecycleSchedulerTest, InitClearsAllJoinRecordsAndDelegatesToInner) {
   CapturedTaskLaunch zombie_launch;
 
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t weight) {
+      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
         EXPECT_THAT(entry, t::NotNull());
         EXPECT_THAT(arg, t::NotNull());
         EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight));
         zombie_launch = {entry, arg};
         return stale_zombie;
       })
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t weight) {
+      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
         EXPECT_THAT(entry, t::NotNull());
         EXPECT_THAT(arg, t::NotNull());
         EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight));
@@ -116,9 +112,7 @@ TEST(JoinLifecycleSchedulerTest,
 
   // Non-null CreateTask return.
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t weight) {
+      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
         EXPECT_THAT(entry, t::NotNull());
         EXPECT_THAT(arg, t::NotNull());
         EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight * 2));
@@ -133,9 +127,7 @@ TEST(JoinLifecycleSchedulerTest,
 
   // Nullptr CreateTask return releases its pre-allocated join record slot.
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t weight) {
+      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
         EXPECT_THAT(entry, t::NotNull());
         EXPECT_THAT(arg, t::NotNull());
         EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight));
@@ -176,10 +168,7 @@ TEST(JoinLifecycleSchedulerTest,
         EXPECT_THAT(target_cpu, t::Eq(1));
         return nullptr;
       });
-  EXPECT_THAT(sched->CreateTaskOnCpu(NoopTask,            //
-                                     nullptr,             //
-                                     kDefaultTaskWeight,  //
-                                     1),
+  EXPECT_THAT(sched->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 1),
               t::IsNull());
 
   // Verify both `task_a` and `task_b` run their user callbacks and mark exited
@@ -219,12 +208,11 @@ TEST(JoinLifecycleSchedulerTest,
   CapturedTaskLaunch target_launch;
 
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/) {
-        target_launch = {entry, arg};
-        return target_task;
-      });
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            target_launch = {entry, arg};
+            return target_task;
+          });
   EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
               t::Eq(target_task));
 
@@ -262,12 +250,11 @@ TEST(JoinLifecycleSchedulerTest,
   CapturedTaskLaunch target_launch;
 
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/) {
-        target_launch = {entry, arg};
-        return target_task;
-      });
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            target_launch = {entry, arg};
+            return target_task;
+          });
   EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
               t::Eq(target_task));
 
@@ -314,30 +301,26 @@ TEST(JoinLifecycleSchedulerTest,
   CapturedTaskLaunch launch_active;
 
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/) {
-        launch_z1 = {entry, arg};
-        return zombie_1;
-      })
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/) {
-        launch_running = {entry, arg};
-        return running_task;
-      })
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/) {
-        launch_z2 = {entry, arg};
-        return zombie_2;
-      })
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/) {
-        launch_active = {entry, arg};
-        return actively_joined_task;
-      });
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            launch_z1 = {entry, arg};
+            return zombie_1;
+          })
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            launch_running = {entry, arg};
+            return running_task;
+          })
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            launch_z2 = {entry, arg};
+            return zombie_2;
+          })
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            launch_active = {entry, arg};
+            return actively_joined_task;
+          });
 
   EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
               t::Eq(zombie_1));
@@ -492,8 +475,8 @@ TEST(JoinLifecycleSchedulerTest,
     Task* const worker_task = FakeTaskPtr(100 + round);
     CapturedTaskLaunch worker_launch;
     EXPECT_CALL(*mock_inner, CreateTask)
-        .WillOnce([worker_task, &worker_launch](const TaskFn entry,  //
-                                                void* const arg,     //
+        .WillOnce([worker_task, &worker_launch](const TaskFn entry,
+                                                void* const arg,
                                                 const int64_t /*weight*/) {
           worker_launch = {entry, arg};
           return worker_task;
@@ -502,8 +485,9 @@ TEST(JoinLifecycleSchedulerTest,
                     [](void* const raw) {
                       static_cast<std::atomic<int>*>(raw)->fetch_add(
                           1, std::memory_order_acq_rel);
-                    },
-                    &total_completions, kDefaultTaskWeight),
+                    },                   //
+                    &total_completions,  //
+                    kDefaultTaskWeight),
                 t::Eq(worker_task));
 
     std::atomic<bool> join_entered_yield{false};
@@ -648,12 +632,11 @@ TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   CapturedTaskLaunch target_launch;
 
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/) {
-        target_launch = {entry, arg};
-        return target_task;
-      });
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            target_launch = {entry, arg};
+            return target_task;
+          });
   ASSERT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
               t::Eq(target_task));
 
@@ -716,16 +699,16 @@ TEST(JoinLifecycleSchedulerTest,
   // Simulate same-CPU preemption where the newly created task is scheduled and
   // runs to completion inside inner_->CreateTask BEFORE CreateTask returns.
   EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/) {
-        entry(arg);
-        return sync_task_1;
-      });
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            entry(arg);
+            return sync_task_1;
+          });
   EXPECT_CALL(*mock_inner, CreateTaskOnCpu)
-      .WillOnce([&](const TaskFn entry,  //
-                    void* const arg,     //
-                    const int64_t /*weight*/, const int /*target_cpu*/) {
+      .WillOnce([&](const TaskFn entry,        //
+                    void* const arg,           //
+                    const int64_t /*weight*/,  //
+                    const int /*target_cpu*/) {
         entry(arg);
         return sync_task_2;
       });
@@ -812,6 +795,80 @@ TEST(JoinLifecycleSchedulerTest,
   EXPECT_THAT(sched->ReapZombies(), t::Eq(kNumConcurrentTasks - half));
   EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
   EXPECT_THAT(inner_join_calls, t::Eq(kNumConcurrentTasks));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+// 12. OOM during AllocateJoinRecord returns nullptr cleanly without invoking
+//     inner->CreateTask or inner->CreateTaskOnCpu, and remote-CPU task entry
+//     waits for FinalizeJoinRecord before executing the user callback.
+TEST(JoinLifecycleSchedulerTest,
+     AllocateJoinRecordOomReturnsNullptrAndRemoteCpuEntryWaitsForFinalization) {
+  SetupEnv(2);
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateJoinLifecycleScheduler(mock_inner);
+
+  // Force Kmalloc(sizeof(TaskJoinRecord)) to return nullptr. StrictMock
+  // verifies inner->CreateTask* is not called.
+  g_env.fail_kmalloc = true;
+  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
+              t::IsNull());
+  EXPECT_THAT(sched->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 0),
+              t::IsNull());
+  g_env.fail_kmalloc = false;
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+
+  // Verify remote CPU task launch waits for FinalizeJoinRecord before entering
+  // user callback so Join(remote_task) from a third thread or after entry
+  // always sees the finalized task_tree_ entry.
+  BindCpuLocal(SmpGetCpuLocal(0));
+  Task* const self_task = FakeTaskPtr(70);
+  Task* const remote_task = FakeTaskPtr(71);
+  std::atomic<bool> child_entered_inner{false};
+  std::atomic<bool> child_ran_user_fn{false};
+  std::thread remote_thread;
+
+  EXPECT_CALL(*mock_inner, CreateTaskOnCpu)
+      .WillOnce([&](const TaskFn entry,        //
+                    void* const arg,           //
+                    const int64_t /*weight*/,  //
+                    const int /*target_cpu*/) {
+        // Interrupts must be disabled across inner_->CreateTaskOnCpu +
+        // FinalizeJoinRecord.
+        EXPECT_FALSE(AreInterruptsEnabled());
+        remote_thread = std::thread([entry, arg, &child_entered_inner]() {
+          SetInterruptsEnabledForTest(true);
+          BindCpuLocal(SmpGetCpuLocal(1));
+          child_entered_inner.store(true, std::memory_order_release);
+          entry(arg);
+        });
+        while (!child_entered_inner.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        EXPECT_FALSE(child_ran_user_fn.load(std::memory_order_acquire));
+        return remote_task;
+      });
+
+  EXPECT_THAT(sched->CreateTaskOnCpu(
+                  [](void* const raw) {
+                    static_cast<std::atomic<bool>*>(raw)->store(
+                        true, std::memory_order_release);
+                  },                   //
+                  &child_ran_user_fn,  //
+                  kDefaultTaskWeight,  //
+                  1),
+              t::Eq(remote_task));
+  remote_thread.join();
+  EXPECT_TRUE(child_ran_user_fn.load(std::memory_order_acquire));
+
+  EXPECT_CALL(*mock_inner, CurrentTask).WillOnce([&]() { return self_task; });
+  EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
+    EXPECT_THAT(task, t::Eq(remote_task));
+  });
+  sched->Join(remote_task);
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 

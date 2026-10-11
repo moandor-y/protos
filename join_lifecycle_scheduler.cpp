@@ -1,5 +1,6 @@
 #include "join_lifecycle_scheduler.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -14,6 +15,7 @@
 #include "check.h"
 #include "heap.h"
 #include "rbtree.h"
+#include "smp.h"
 #include "spinlock.h"
 
 namespace protos {
@@ -27,6 +29,8 @@ struct TaskJoinRecord {
   void* arg = nullptr;
   Task* task = nullptr;
   Task* joiner = nullptr;
+  int creator_cpu_id = -1;
+  std::atomic<bool> finalized{false};
   bool exited = false;
   bool joined = false;
   bool in_list = false;
@@ -66,11 +70,16 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
                    const int64_t weight) override {
     DCHECK(entry != nullptr);
     TaskJoinRecord* const rec = AllocateJoinRecord(entry, arg);
-    Task* const task =
-        inner_->CreateTask(&JoinLifecycleTaskScheduler::TaskEntryWrapper,  //
-                           rec,                                            //
-                           weight);
-    return FinalizeJoinRecord(rec, task);
+    if (rec == nullptr) {
+      return nullptr;
+    }
+    const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
+    rec->creator_cpu_id = CurrentCpuIdOrUnbound();
+    Task* const task = inner_->CreateTask(
+        &JoinLifecycleTaskScheduler::TaskEntryWrapper, rec, weight);
+    Task* const finalized_task = FinalizeJoinRecord(rec, task);
+    internal::LocalRestoreInterrupts(saved_irq);
+    return finalized_task;
   }
 
   Task* CreateTaskOnCpu(const TaskFn entry,    //
@@ -79,12 +88,16 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
                         const int target_cpu) override {
     DCHECK(entry != nullptr);
     TaskJoinRecord* const rec = AllocateJoinRecord(entry, arg);
+    if (rec == nullptr) {
+      return nullptr;
+    }
+    const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
+    rec->creator_cpu_id = CurrentCpuIdOrUnbound();
     Task* const task = inner_->CreateTaskOnCpu(
-        &JoinLifecycleTaskScheduler::TaskEntryWrapper,  //
-        rec,                                            //
-        weight,                                         //
-        target_cpu);
-    return FinalizeJoinRecord(rec, task);
+        &JoinLifecycleTaskScheduler::TaskEntryWrapper, rec, weight, target_cpu);
+    Task* const finalized_task = FinalizeJoinRecord(rec, task);
+    internal::LocalRestoreInterrupts(saved_irq);
+    return finalized_task;
   }
 
   void Yield() override { inner_->Yield(); }
@@ -199,11 +212,21 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
   Task* CurrentTask() const override { return inner_->CurrentTask(); }
 
  private:
+  static int CurrentCpuIdOrUnbound() {
+    const CpuLocal* const cpu = CurrentCpuOrNull();
+    return (cpu != nullptr) ? cpu->cpu_id : -1;
+  }
+
   static void TaskEntryWrapper(void* const raw_arg) {
     TaskJoinRecord* const rec = static_cast<TaskJoinRecord*>(raw_arg);
     DCHECK(rec != nullptr);
     DCHECK(rec->owner != nullptr);
     DCHECK(rec->entry != nullptr);
+    if (CurrentCpuIdOrUnbound() != rec->creator_cpu_id) {
+      while (!rec->finalized.load(std::memory_order_acquire)) {
+        asm volatile("pause" : : : "memory");
+      }
+    }
     rec->entry(rec->arg);
 
     DCHECK(internal::TopHeldLock() == nullptr);
@@ -221,11 +244,14 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
 
   TaskJoinRecord* AllocateJoinRecord(const TaskFn entry, void* const arg) {
     void* const raw = Kmalloc(sizeof(TaskJoinRecord));
-    CHECK(raw != nullptr);
+    if (raw == nullptr) {
+      return nullptr;
+    }
     TaskJoinRecord* const rec = new (raw) TaskJoinRecord();
     rec->owner = this;
     rec->entry = entry;
     rec->arg = arg;
+    rec->creator_cpu_id = CurrentCpuIdOrUnbound();
     {
       const IrqSpinLockGuard join_guard(join_lock_);
       LinkRecordLocked(rec);
@@ -249,6 +275,7 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
     const bool inserted = task_tree_.Insert(rec);
     DCHECK(inserted);
     rec->in_tree = true;
+    rec->finalized.store(true, std::memory_order_release);
     return task;
   }
 

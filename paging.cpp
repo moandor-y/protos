@@ -15,7 +15,7 @@ constexpr uint64_t kPtePresent = 1ULL << 0;
 constexpr uint64_t kPteWritable = 1ULL << 1;
 constexpr uint64_t kPteWriteThrough = 1ULL << 3;
 constexpr uint64_t kPteCacheDisable = 1ULL << 4;
-constexpr uint64_t kPteHugePage = 1ULL << 7;
+constexpr uint64_t kPteHugePage = kPageEntryHugePage;
 constexpr uint64_t kPteAddressMask = 0x000FFFFFFFFFF000ULL;
 constexpr uint64_t kHugePageAddressMask = 0x000FFFFFFFE00000ULL;
 
@@ -108,6 +108,9 @@ static bool MapHugePageRangeLocked(const uintptr_t phys_addr,  //
       }
       pml4[pml4_idx] = new_pdpt_phys | kPtePresent | kPteWritable;
       tlb_flush_needed = true;
+    } else if ((pml4[pml4_idx] & kPteWritable) == 0) {
+      pml4[pml4_idx] |= kPteWritable;
+      tlb_flush_needed = true;
     }
 
     uint64_t* const pdpt =
@@ -119,13 +122,51 @@ static bool MapHugePageRangeLocked(const uintptr_t phys_addr,  //
       }
       pdpt[pdpt_idx] = new_pd_phys | kPtePresent | kPteWritable;
       tlb_flush_needed = true;
+    } else if ((pdpt[pdpt_idx] & kPteWritable) == 0) {
+      pdpt[pdpt_idx] |= kPteWritable;
+      tlb_flush_needed = true;
     }
 
     uint64_t* const pd =
         reinterpret_cast<uint64_t*>(pdpt[pdpt_idx] & kPteAddressMask);
-    if ((pd[pd_idx] & kPtePresent) == 0) {
-      pd[pd_idx] = addr | kPtePresent | kPteWritable | kPteHugePage;
+    const uint64_t pde = pd[pd_idx];
+    if ((pde & kPtePresent) == 0) {
+      pd[pd_idx] = addr | kPtePresent | kPteWritable | kPageEntryHugePage;
       tlb_flush_needed = true;
+      continue;
+    }
+
+    if ((pde & kPageEntryHugePage) != 0) {
+      if ((pde & kHugePageAddressMask) != addr) {
+        return false;
+      }
+      if ((pde & kPteWritable) == 0) {
+        pd[pd_idx] = pde | kPteWritable;
+        tlb_flush_needed = true;
+      }
+      continue;
+    }
+
+    if ((pde & kPteWritable) == 0) {
+      pd[pd_idx] = pde | kPteWritable;
+      tlb_flush_needed = true;
+    }
+    uint64_t* const pt = reinterpret_cast<uint64_t*>(pde & kPteAddressMask);
+    for (int i = 0; i < kEntriesPerPageTable; ++i) {
+      const uintptr_t page_phys = addr + static_cast<uintptr_t>(i) * kPageSize;
+      const uint64_t pte = pt[i];
+      if ((pte & kPtePresent) == 0) {
+        pt[i] = page_phys | kPtePresent | kPteWritable;
+        tlb_flush_needed = true;
+      } else {
+        if ((pte & kPteAddressMask) != page_phys) {
+          return false;
+        }
+        if ((pte & kPteWritable) == 0) {
+          pt[i] = pte | kPteWritable;
+          tlb_flush_needed = true;
+        }
+      }
     }
   }
 
@@ -140,6 +181,12 @@ static bool MapHugePageRangeLocked(const uintptr_t phys_addr,  //
 bool PagingMapBootstrapRange(const uintptr_t phys_addr, const int64_t size) {
   const IrqSpinLockGuard lock_guard(g_paging_lock);
   return MapHugePageRangeLocked(phys_addr, size, false);
+}
+
+bool PagingEnsureIdentityMappedRange(const uintptr_t phys_addr,
+                                     const int64_t size) {
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  return MapHugePageRangeLocked(phys_addr, size, true);
 }
 
 bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
@@ -161,7 +208,8 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
 
 bool PagingMarkPageUncacheable(const uintptr_t phys_addr) {
   const IrqSpinLockGuard lock_guard(g_paging_lock);
-  if (phys_addr == 0 || phys_addr >= kMaxCanonicalIdentityAddress) {
+  if (phys_addr < static_cast<uintptr_t>(kPageSize) ||
+      phys_addr >= kMaxCanonicalIdentityAddress) {
     return false;
   }
   const uintptr_t pml4_phys = ReadCr3();

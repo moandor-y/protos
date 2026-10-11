@@ -199,6 +199,41 @@ TEST(CoreRunqueueSchedulerTest,
   SetInterruptsEnabledForTest(true);
   EXPECT_THAT(curr_irq_on, t::Eq(curr_irq_off));
 
+  // Verify PollIdleCpu returns false if called for a different CPU than
+  // CurrentCpuId() or when the target CPU is offline, even when tasks are
+  // queued on that remote CPU.
+  Task* const queued_on_cpu2 =
+      core->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 2);
+  ASSERT_THAT(queued_on_cpu2, t::NotNull());
+  EXPECT_FALSE(core->PollIdleCpu(2));
+  g_env.cpu_locals[2].online = false;
+  BindCpuLocal(SmpGetCpuLocal(2));
+  EXPECT_FALSE(core->PollIdleCpu(2));
+  g_env.cpu_locals[2].online = true;
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_TRUE(core->StealTask(0, 2));
+  core->Join(queued_on_cpu2);
+
+  // Verify CreateTaskOnCpu returns nullptr without leaking heap or PMM memory
+  // when either Kmalloc(sizeof(Task)) or PmmAllocFrames(kTaskStackFrames) fails
+  // due to OOM.
+  const int64_t free_pmm_baseline = PmmFreeFrameCount();
+  const int64_t free_heap_baseline = HeapTotalFreeBytes();
+
+  // Case 1: PMM stack allocation fails while heap still has room for Task TCB.
+  g_env.fail_pmm_alloc = true;
+  EXPECT_THAT(core->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
+              t::IsNull());
+  g_env.fail_pmm_alloc = false;
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(free_pmm_baseline));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_heap_baseline));
+
+  // Case 2: Heap TCB allocation fails.
+  g_env.fail_kmalloc = true;
+  EXPECT_THAT(core->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
+              t::IsNull());
+  g_env.fail_kmalloc = false;
+
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
@@ -369,10 +404,8 @@ TEST(CoreRunqueueSchedulerTest,
   //     then spawns `newborn` on CPU 0. Because `newborn`'s vruntime is
   //     clamped to CPU 0's min_vruntime (instead of 0), `newborn` does not
   //     starve `veteran` for 4 consecutive slices — they interleave.
-  Task* const veteran = core->CreateTaskOnCpu(VeteranFloorWorker,  //
-                                              &ctx,                //
-                                              kDefaultTaskWeight,  //
-                                              0);
+  Task* const veteran =
+      core->CreateTaskOnCpu(VeteranFloorWorker, &ctx, kDefaultTaskWeight, 0);
   core->Join(veteran);
   ASSERT_THAT(ctx.newborn, t::NotNull());
   core->Join(ctx.newborn);
@@ -397,20 +430,16 @@ TEST(CoreRunqueueSchedulerTest,
   //     and run it alongside `local_peer` on CPU 0. Because `StealTask(0, 1)`
   //     clamps `remote_task`'s vruntime to CPU 0's min_vruntime, `remote_task`
   //     (20) interleaves with `local_peer` (10) instead of starving it.
-  Task* const remote_task = core->CreateTaskOnCpu(MigratedFloorWorker,  //
-                                                  &ctx,                 //
-                                                  kDefaultTaskWeight,   //
-                                                  1);
+  Task* const remote_task =
+      core->CreateTaskOnCpu(MigratedFloorWorker, &ctx, kDefaultTaskWeight, 1);
   EXPECT_THAT(core->RunqueueLoad(1), t::Eq(1));
   EXPECT_THAT(core->RunqueueLoad(0), t::Eq(0));
   EXPECT_TRUE(core->StealTask(0, 1));
   EXPECT_THAT(core->RunqueueLoad(1), t::Eq(0));
   EXPECT_THAT(core->RunqueueLoad(0), t::Eq(1));
 
-  Task* const local_peer = core->CreateTaskOnCpu(LocalPeerFloorWorker,  //
-                                                 &ctx,                  //
-                                                 kDefaultTaskWeight,    //
-                                                 0);
+  Task* const local_peer =
+      core->CreateTaskOnCpu(LocalPeerFloorWorker, &ctx, kDefaultTaskWeight, 0);
   core->Join(remote_task);
   core->Join(local_peer);
 
@@ -437,15 +466,11 @@ TEST(CoreRunqueueSchedulerTest,
   //     at the head of CPU 1's runqueue ahead of `cpu1_peer` instead of being
   //     stranded behind it with CPU 0's inflated `vruntime`.
   ctx.migrate_trace.clear();
-  Task* const from_high_cpu = core->CreateTaskOnCpu(MigratedFloorWorker,  //
-                                                    &ctx,                 //
-                                                    kDefaultTaskWeight,   //
-                                                    0);
+  Task* const from_high_cpu =
+      core->CreateTaskOnCpu(MigratedFloorWorker, &ctx, kDefaultTaskWeight, 0);
   EXPECT_TRUE(core->StealTask(1, 0));
-  Task* const cpu1_peer = core->CreateTaskOnCpu(LocalPeerFloorWorker,  //
-                                                &ctx,                  //
-                                                kDefaultTaskWeight,    //
-                                                1);
+  Task* const cpu1_peer =
+      core->CreateTaskOnCpu(LocalPeerFloorWorker, &ctx, kDefaultTaskWeight, 1);
   EXPECT_TRUE(core->StealTask(0, 1));
   core->Join(from_high_cpu);
   EXPECT_TRUE(core->StealTask(0, 1));
@@ -526,14 +551,10 @@ TEST(CoreRunqueueSchedulerTest,
   ctx.sched = core.get();
 
   // 2. Enqueue two tasks on CPU 2 (`t1` first, `t2` second).
-  Task* const t1 = core->CreateTaskOnCpu(RecordIdOneWorker,   //
-                                         &ctx,                //
-                                         kDefaultTaskWeight,  //
-                                         2);
-  Task* const t2 = core->CreateTaskOnCpu(RecordIdTwoWorker,   //
-                                         &ctx,                //
-                                         kDefaultTaskWeight,  //
-                                         2);
+  Task* const t1 =
+      core->CreateTaskOnCpu(RecordIdOneWorker, &ctx, kDefaultTaskWeight, 2);
+  Task* const t2 =
+      core->CreateTaskOnCpu(RecordIdTwoWorker, &ctx, kDefaultTaskWeight, 2);
   ASSERT_THAT(t1, t::NotNull());
   ASSERT_THAT(t2, t::NotNull());
   EXPECT_THAT(core->RunqueueLoad(2), t::Eq(2));
@@ -703,10 +724,8 @@ TEST(
   // Part B: Verify `OnWakeupIpi` and `OnTimerInterrupt` immediately preempt the
   // idle task on an Application Processor (CPU 1).
   int ap_wakeup_runs = 0;
-  Task* const ap_ipi_task = core->CreateTaskOnCpu(ApSimpleRunWorker,   //
-                                                  &ap_wakeup_runs,     //
-                                                  kDefaultTaskWeight,  //
-                                                  1);
+  Task* const ap_ipi_task = core->CreateTaskOnCpu(
+      ApSimpleRunWorker, &ap_wakeup_runs, kDefaultTaskWeight, 1);
   BindCpuLocal(SmpGetCpuLocal(1));
   InterruptFrame ipi_frame = {};
   ipi_frame.vector = kVectorWakeupIpi;
@@ -717,10 +736,8 @@ TEST(
   core->Join(ap_ipi_task);
 
   int ap_timer_runs = 0;
-  Task* const ap_timer_task = core->CreateTaskOnCpu(ApSimpleRunWorker,   //
-                                                    &ap_timer_runs,      //
-                                                    kDefaultTaskWeight,  //
-                                                    1);
+  Task* const ap_timer_task = core->CreateTaskOnCpu(
+      ApSimpleRunWorker, &ap_timer_runs, kDefaultTaskWeight, 1);
   BindCpuLocal(SmpGetCpuLocal(1));
   core->OnTimerInterrupt(&frame);
   EXPECT_THAT(ap_timer_runs, t::Eq(1));

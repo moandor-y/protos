@@ -176,10 +176,14 @@ static bool TestPmmAllocAndBounds(uintptr_t* const out_first_frame,
     return false;
   }
   // Verify that all allocated frames are identity-mapped in the active page
-  // tables and lie strictly within usable RAM (above 1 MiB and not overlapping
-  // the kernel image, PMM bitmap, or Multiboot structures).
+  // tables, that PagingEnsureIdentityMappedRange succeeds on ranges already
+  // covered by 2 MiB huge pages (kPageEntryHugePage), and that they lie
+  // strictly within usable RAM (above 1 MiB and not overlapping the kernel
+  // image, PMM bitmap, or Multiboot structures).
   if (!PagingIsIdentityMapped(frame1) || !PagingIsIdentityMapped(frame2) ||
       !PagingIsIdentityMapped(multi) ||
+      !PagingEnsureIdentityMappedRange(frame1, kPageSize) ||
+      !PagingEnsureIdentityMappedRange(multi, 4 * kPageSize) ||
       !PmmRangeIsValidUsableRam(frame1, kPageSize) ||
       !PmmRangeIsValidUsableRam(frame2, kPageSize) ||
       !PmmRangeIsValidUsableRam(multi, 4 * kPageSize)) {
@@ -598,8 +602,8 @@ struct KernelRbAugTraits {
   static uintptr_t GetKey(const KernelRbAugNode& item) {
     return reinterpret_cast<uintptr_t>(&item);
   }
-  static bool UpdateAugment(KernelRbAugNode& item,              //
-                            const KernelRbAugNode* const left,  //
+  static bool UpdateAugment(KernelRbAugNode& item,
+                            const KernelRbAugNode* const left,
                             const KernelRbAugNode* const right) {
     int64_t max_val = item.span;
     if (left != nullptr && left->max_subtree_span > max_val) {
@@ -741,7 +745,91 @@ static bool TestMultibootMmapEdgeCases() {
       map->regions[0].length != 3 * kPageSize) {
     return false;
   }
-  return true;
+
+  struct [[gnu::packed]] SyntheticMb2FbBuffer {
+    uint32_t total_size;
+    uint32_t reserved;
+    uint32_t mmap_type;
+    uint32_t mmap_size;
+    uint32_t entry_size;
+    uint32_t entry_version;
+    uint64_t addr;
+    uint64_t len;
+    uint32_t type;
+    uint32_t entry_reserved;
+    uint32_t fb_tag_type;
+    uint32_t fb_tag_size;
+    uint64_t fb_addr;
+    uint32_t fb_pitch;
+    uint32_t fb_width;
+    uint32_t fb_height;
+    uint8_t fb_bpp;
+    uint8_t fb_type;
+    uint16_t fb_reserved;
+    uint32_t end_type;
+    uint32_t end_size;
+  };
+
+  SyntheticMb2FbBuffer fb_buf = {};
+  fb_buf.total_size = sizeof(SyntheticMb2FbBuffer);
+  fb_buf.mmap_type = 6;
+  fb_buf.mmap_size = 40;
+  fb_buf.entry_size = 24;
+  fb_buf.addr = 0x200000;
+  fb_buf.len = 4 * kPageSize;
+  fb_buf.type = kMemoryTypeAvailable;
+  fb_buf.fb_tag_type = 8;
+  fb_buf.fb_tag_size = 32;
+  fb_buf.fb_addr = 0x300000;
+  fb_buf.fb_pitch = 640 * 4 - 1;
+  fb_buf.fb_width = 640;
+  fb_buf.fb_height = 480;
+  fb_buf.fb_bpp = 32;
+  fb_buf.fb_type = 1;
+  fb_buf.end_type = 0;
+  fb_buf.end_size = 8;
+
+  const uintptr_t fb_buf_addr = reinterpret_cast<uintptr_t>(&fb_buf);
+  constexpr uint32_t kOverInt32Max = static_cast<uint32_t>(INT32_MAX) + 1u;
+  if (!MultibootParseMemoryMapFromBuffer(kMultiboot2Magic,              //
+                                         fb_buf_addr,                   //
+                                         kMaxCanonicalIdentityAddress,  //
+                                         map.get()) ||
+      map->fb_addr != 0) {
+    return false;
+  }
+  fb_buf.fb_pitch = kOverInt32Max;
+  if (!MultibootParseMemoryMapFromBuffer(kMultiboot2Magic,              //
+                                         fb_buf_addr,                   //
+                                         kMaxCanonicalIdentityAddress,  //
+                                         map.get()) ||
+      map->fb_addr != 0) {
+    return false;
+  }
+  fb_buf.fb_pitch = 640 * 4;
+  fb_buf.fb_width = 0;
+  if (!MultibootParseMemoryMapFromBuffer(kMultiboot2Magic,              //
+                                         fb_buf_addr,                   //
+                                         kMaxCanonicalIdentityAddress,  //
+                                         map.get()) ||
+      map->fb_addr != 0) {
+    return false;
+  }
+
+  // Verify VgaInitFramebuffer rejects pitch < width * (bpp / 8) and zero
+  // dimensions without overwriting the active console or writing to the buffer.
+  const uintptr_t scratch_fb = PmmAllocFrame();
+  if (scratch_fb == 0) {
+    return false;
+  }
+  volatile uint64_t* const scratch_words =
+      reinterpret_cast<volatile uint64_t*>(scratch_fb);
+  scratch_words[0] = 0xDEADBEEFCAFEBABEULL;
+  VgaInitFramebuffer(scratch_fb, 640 * 4 - 4, 640, 400, 32);
+  VgaInitFramebuffer(scratch_fb, 640 * 4, 0, 400, 32);
+  const bool scratch_untouched = (scratch_words[0] == 0xDEADBEEFCAFEBABEULL);
+  PmmFreeFrame(scratch_fb);
+  return scratch_untouched;
 }
 
 static bool TestEdgeCasesAndOom() {
@@ -789,6 +877,15 @@ static bool TestEdgeCasesAndOom() {
   }
 #endif
 
+  // Verify PagingMarkPageUncacheable rejects physical page 0 (both base 0 and
+  // non-zero offsets such as 0x400 and kPageSize - 1) and non-canonical
+  // addresses without splitting huge pages or allocating page tables.
+  if (PagingMarkPageUncacheable(0) || PagingMarkPageUncacheable(0x400) ||
+      PagingMarkPageUncacheable(kPageSize - 1) ||
+      PagingMarkPageUncacheable(kMaxCanonicalIdentityAddress)) {
+    return false;
+  }
+
   if (!TestRbTreeEdgeCases() || !TestMultibootMmapEdgeCases()) {
     return false;
   }
@@ -797,23 +894,126 @@ static bool TestEdgeCasesAndOom() {
   return free_after == free_before;
 }
 
+struct SmpAllCpuStartupVerifyContext {
+  int cpu_count = 0;
+  std::atomic<uint64_t> mask_low{0};
+  std::atomic<uint64_t> mask_high{0};
+  std::atomic<bool> failed{false};
+};
+
+static uint64_t ReadGsBaseMsrForSmpVerify() {
+  uint32_t low = 0;
+  uint32_t high = 0;
+  asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(kMsrIa32GsBase));
+  return (static_cast<uint64_t>(high) << 32) | low;
+}
+
+static uint64_t ReadCr0ForSmpVerify() {
+  uint64_t cr0 = 0;
+  asm volatile("mov %0, cr0" : "=r"(cr0));
+  return cr0;
+}
+
+static uint64_t ReadEferForSmpVerify() {
+  constexpr uint32_t kMsrIa32Efer = 0xC0000080u;
+  uint32_t low = 0;
+  uint32_t high = 0;
+  asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(kMsrIa32Efer));
+  return (static_cast<uint64_t>(high) << 32) | low;
+}
+
+static void SmpAllCpuStartupVerifyWorker(const int cpu_index,
+                                         void* const raw_ctx) {
+  SmpAllCpuStartupVerifyContext* const ctx =
+      static_cast<SmpAllCpuStartupVerifyContext*>(raw_ctx);
+  if (ctx == nullptr || cpu_index < 0 || cpu_index >= ctx->cpu_count ||
+      cpu_index >= kMaxSupportedCpus) {
+    if (ctx != nullptr) {
+      ctx->failed.store(true, std::memory_order_release);
+    }
+    return;
+  }
+
+  constexpr uint64_t kCr0WriteProtect = 1ULL << 16;
+  constexpr uint64_t kEferNoExecuteEnable = 1ULL << 11;
+  const CpuLocal* const local = CurrentCpu();
+  const CpuInfo* const info = SmpGetCpuInfo(cpu_index);
+  if (local == nullptr || info == nullptr ||
+      local != SmpGetCpuLocal(cpu_index) || local->self != local ||
+      ReadGsBaseMsrForSmpVerify() != reinterpret_cast<uintptr_t>(local) ||
+      (ReadCr0ForSmpVerify() & kCr0WriteProtect) == 0 ||
+      (ReadEferForSmpVerify() & kEferNoExecuteEnable) == 0 ||
+      CurrentCpuId() != cpu_index || local->cpu_id != cpu_index ||
+      local->apic_id != info->apic_id || info->apic_id == kInvalidX2ApicId) {
+    ctx->failed.store(true, std::memory_order_release);
+    return;
+  }
+
+  if (cpu_index < 64) {
+    ctx->mask_low.fetch_or(1ULL << static_cast<uint32_t>(cpu_index),
+                           std::memory_order_acq_rel);
+  } else {
+    ctx->mask_high.fetch_or(1ULL << static_cast<uint32_t>(cpu_index - 64),
+                            std::memory_order_acq_rel);
+  }
+}
+
+static bool VerifySmpAllCpuStartupAndGsBase() {
+  const int cpu_count = SmpCpuCount();
+  if (cpu_count < 1 || cpu_count > kMaxSupportedCpus ||
+      SmpOnlineCpuCount() != cpu_count) {
+    return false;
+  }
+
+  SmpAllCpuStartupVerifyContext ctx = {};
+  ctx.cpu_count = cpu_count;
+  SmpRunOnAllCpus(SmpAllCpuStartupVerifyWorker, &ctx);
+  if (ctx.failed.load(std::memory_order_acquire)) {
+    return false;
+  }
+
+  const uint64_t expected_low =
+      (cpu_count >= 64) ? ~0ULL
+                        : ((1ULL << static_cast<uint32_t>(cpu_count)) - 1ULL);
+  const uint64_t expected_high =
+      (cpu_count <= 64) ? 0ULL
+      : (cpu_count >= 128)
+          ? ~0ULL
+          : ((1ULL << static_cast<uint32_t>(cpu_count - 64)) - 1ULL);
+  return ctx.mask_low.load(std::memory_order_acquire) == expected_low &&
+         ctx.mask_high.load(std::memory_order_acquire) == expected_high;
+}
+
 static bool TestSmpDiscoveryAndApBringup() {
   const int cpu_count = SmpCpuCount();
   const int online_count = SmpOnlineCpuCount();
   const uintptr_t lapic_phys = SmpLocalApicPhysAddr();
-  const uintptr_t lapic_neighbor_phys =
-      (lapic_phys & ~(static_cast<uintptr_t>(kHugePageSize) - 1)) + kPageSize;
-  if (cpu_count < 1 || online_count != cpu_count || lapic_phys == 0 ||
-      !PagingIsIdentityMapped(lapic_phys) ||
-      !PagingIsIdentityMapped(lapic_neighbor_phys)) {
+  if (cpu_count < 1 || cpu_count > kMaxSupportedCpus ||
+      online_count != cpu_count) {
     return false;
+  }
+  if (!SmpIsX2ApicEnabled()) {
+    if (lapic_phys == 0) {
+      return false;
+    }
+    const uintptr_t lapic_neighbor_phys =
+        (lapic_phys & ~(static_cast<uintptr_t>(kHugePageSize) - 1)) + kPageSize;
+    if (!PagingIsIdentityMapped(lapic_phys) ||
+        !PagingIsIdentityMapped(lapic_neighbor_phys) ||
+        !PagingEnsureIdentityMappedRange(lapic_phys, kPageSize) ||
+        !PagingEnsureIdentityMappedRange(lapic_neighbor_phys, kPageSize) ||
+        !PagingIsIdentityMapped(lapic_phys) ||
+        !PagingIsIdentityMapped(lapic_neighbor_phys)) {
+      return false;
+    }
   }
 
   const CpuInfo* const bsp = SmpGetCpuInfo(0);
   if (bsp == nullptr || !bsp->is_bsp || !bsp->online ||
-      !bsp->long_mode_active || bsp->observed_apic_id != bsp->apic_id ||
-      bsp->stack_base == 0 || bsp->stack_top <= bsp->stack_base ||
-      (bsp->stack_top & 0xF) != 0 || bsp->observed_rsp <= bsp->stack_base ||
+      !bsp->long_mode_active || bsp->apic_id == kInvalidX2ApicId ||
+      bsp->observed_apic_id != bsp->apic_id || bsp->stack_base == 0 ||
+      bsp->stack_top <= bsp->stack_base || (bsp->stack_top & 0xF) != 0 ||
+      bsp->observed_rsp <= bsp->stack_base ||
       bsp->observed_rsp > bsp->stack_top || bsp->observed_cr3 == 0) {
     return false;
   }
@@ -821,6 +1021,7 @@ static bool TestSmpDiscoveryAndApBringup() {
   for (int i = 1; i < cpu_count; ++i) {
     const CpuInfo* const ap = SmpGetCpuInfo(i);
     if (ap == nullptr || ap->is_bsp || !ap->online || !ap->long_mode_active ||
+        ap->apic_id == kInvalidX2ApicId ||
         ap->observed_apic_id != ap->apic_id || ap->stack_base == 0 ||
         ap->stack_top != ap->stack_base + kApStackSize ||
         (ap->stack_top & 0xF) != 0 || ap->observed_rsp <= ap->stack_base ||
@@ -840,7 +1041,7 @@ static bool TestSmpDiscoveryAndApBringup() {
     }
   }
 
-  return true;
+  return VerifySmpAllCpuStartupAndGsBase();
 }
 
 struct ConcurrentHeapItem {
@@ -1030,10 +1231,11 @@ static void MultiCpuStressWorker(const int cpu_index, void* const raw_context) {
     }
 
     // 4. Concurrent UART and VGA console logging on first and last iterations.
-    //    Pass a complete string per UartWrite / VgaWrite call so g_uart_lock
-    //    and g_vga_lock serialize the entire message atomically, and use '\r'
-    //    on VGA so Row 0 ("Hello, x86-64 Kernel World!") at 0xB8000 is never
-    //    scrolled off screen.
+    //    Exercise VgaWrite, VgaPutChar, VgaWriteDec, and VgaWriteHex across
+    //    all online CPUs while keeping cursor on the current line with '\r' so
+    //    it never wraps past 80 columns on high-core-count machines and Row 0
+    //    ("Hello, x86-64 Kernel World!") at 0xB8000 is never scrolled off
+    //    screen.
     if (iter == 0 || iter + 1 == kMultiCpuStressIterations) {
       const char cpu_digit = static_cast<char>('0' + (cpu_index % 10));
       const char pass_digit = (iter == 0) ? '0' : '1';
@@ -1046,6 +1248,18 @@ static void MultiCpuStressWorker(const int cpu_index, void* const raw_context) {
                               'U', ' ', cpu_digit, ' ', 'o', 'k', '\r', '\0'};
       UartWrite(uart_msg);
       VgaWrite(vga_msg);
+      VgaPutChar('\r');
+      {
+        const IrqSpinLockGuard guard(ctx->counter_lock);
+        VgaWriteDec(static_cast<uint64_t>(cpu_index));
+        VgaWriteHex(static_cast<uint64_t>(iter));
+        VgaPutChar('\r');
+      }
+      const int cur_row = VgaGetCursorRow();
+      const int cur_col = VgaGetCursorCol();
+      if (cur_row < 0 || cur_row >= 25 || cur_col < 0 || cur_col >= 80) {
+        ok = false;
+      }
     }
   }
 
@@ -1065,7 +1279,8 @@ static void MultiCpuSecondPassWorker(const int cpu_index,
 
 static bool TestSmpMultiCpuSyncStress() {
   const int cpu_count = SmpCpuCount();
-  if (cpu_count < 1 || SmpOnlineCpuCount() != cpu_count) {
+  if (cpu_count < 1 || cpu_count > kMaxSupportedCpus ||
+      SmpOnlineCpuCount() != cpu_count) {
     return false;
   }
 
@@ -1083,8 +1298,13 @@ static bool TestSmpMultiCpuSyncStress() {
   }
 
   SmpRunOnAllCpus(MultiCpuStressWorker, &ctx);
-  // Ensure cursor is at column 0 before LogTestResult writes the test summary.
-  VgaPutc('\r');
+  // Clear any scratch characters written to the current line and ensure the
+  // cursor is at column 0 before LogTestResult writes the test summary.
+  VgaWrite("                      \r");
+  if (VgaGetCursorRow() < 0 || VgaGetCursorRow() >= 25 ||
+      VgaGetCursorCol() != 0) {
+    return false;
+  }
 
   // Dispatch a second round of work across all CPUs to verify APs returned
   // cleanly to their halted state after the first round and can be re-woken.
@@ -1111,6 +1331,7 @@ static bool TestSmpMultiCpuSyncStress() {
 }
 
 constexpr uint64_t kInt3CanaryBase = 0x1111222233334440ULL;
+constexpr uint64_t kRflagsDirectionFlag = 1ULL << 10;
 
 std::atomic<int> g_int3_handler_hits{0};
 std::atomic<bool> g_int3_frame_ok{false};
@@ -1119,9 +1340,13 @@ static void Int3VerificationHandler(InterruptFrame* const frame) {
   if (frame == nullptr) {
     return;
   }
+  uint64_t live_rflags = 0;
+  asm volatile("pushfq\n\tpop %0" : "=r"(live_rflags) : : "memory");
   const bool ok = frame->vector == static_cast<uint64_t>(kVectorBreakpoint) &&
                   frame->error_code == 0 &&
                   frame->cs == kIdtKernelCodeSelector &&
+                  (live_rflags & kRflagsDirectionFlag) == 0 &&
+                  (frame->rflags & kRflagsDirectionFlag) != 0 &&
                   frame->rax == (kInt3CanaryBase + 0) &&
                   frame->rbx == (kInt3CanaryBase + 1) &&
                   frame->rcx == (kInt3CanaryBase + 2) &&
@@ -1148,23 +1373,26 @@ static bool TriggerInt3AndVerifyAllRegisters() {
   g_int3_frame_ok.store(false, std::memory_order_release);
   IdtRegisterHandler(kVectorBreakpoint, Int3VerificationHandler);
 
-  uint64_t post_regs[15] = {};
+  uint64_t post_regs[16] = {};
   uint64_t* const out_ptr = post_regs;
-  // End-to-end hardware trap test for all 15 general-purpose registers:
+  // End-to-end hardware trap test for all 15 general-purpose registers and
+  // System V AMD64 ABI direction-flag (`RFLAGS.DF`) hygiene:
   // 1. Save callee-saved registers (`rbp`, `rbx`, `r12`..`r15`) that GCC
   //    forbids listing in the clobber list (especially `rbp`/`rbx`), and push
   //    `out_ptr` (`&post_regs[0]`) onto the stack before overwriting all 15
   //    GPRs (`rax`..`r15`) so we still have `out_ptr` afterwards.
-  // 2. Reserve a 120-byte scratch area on the stack (`15 * 8` bytes, at
-  //    `[rsp + 0 .. 112]`) to dump the post-`iretq` register values, while
-  //    `out_ptr` sits right above it at `[rsp + 120]`.
+  // 2. Reserve a 128-byte scratch area on the stack (`16 * 8` bytes, at
+  //    `[rsp + 0 .. 120]`) to dump the 15 post-`iretq` GPRs plus the restored
+  //    post-`iretq` `RFLAGS`, while `out_ptr` sits at `[rsp + 128]`.
   // 3. Load distinct 64-bit canary values (`kInt3CanaryBase + 0..14`) into all
-  //    15 GPRs and execute `int3` (Vector 3 `#BP`), trapping into `isr_stub_3`
-  //    -> `isr_common_stub` -> `IdtDispatch` -> `Int3VerificationHandler`.
+  //    15 GPRs, set `RFLAGS.DF = 1` via `std`, and execute `int3` (Vector 3
+  //    `#BP`), trapping into `isr_stub_3` -> `isr_common_stub` (`cld`) ->
+  //    `IdtDispatch` -> `Int3VerificationHandler`.
   // 4. Immediately after `iretq` returns from the interrupt, store all 15 GPRs
-  //    into the `[rsp + 0 .. 112]` scratch buffer before touching any register,
-  //    then copy those 15 qwords (`rep movsq`) into `out_ptr` (`post_regs`).
-  // 5. Reclaim the 128 bytes of stack space (`120` scratch + `8` for `out_ptr`)
+  //    into `[rsp + 0 .. 112]` without touching `RFLAGS`, capture the restored
+  //    `RFLAGS` into `[rsp + 120]` via `pushfq; pop rax`, clear `DF` via `cld`,
+  //    and copy all 16 qwords (`rep movsq`) into `out_ptr` (`post_regs`).
+  // 5. Reclaim the 136 bytes of stack space (`128` scratch + `8` for `out_ptr`)
   //    and restore the caller's callee-saved registers.
   asm volatile(
       "push rbp\n\t"
@@ -1174,7 +1402,7 @@ static bool TriggerInt3AndVerifyAllRegisters() {
       "push r14\n\t"
       "push r15\n\t"
       "push %[out]\n\t"
-      "sub rsp, 120\n\t"
+      "sub rsp, 128\n\t"
       "mov rax, 0x1111222233334440\n\t"
       "mov rbx, 0x1111222233334441\n\t"
       "mov rcx, 0x1111222233334442\n\t"
@@ -1190,6 +1418,7 @@ static bool TriggerInt3AndVerifyAllRegisters() {
       "mov r13, 0x111122223333444C\n\t"
       "mov r14, 0x111122223333444D\n\t"
       "mov r15, 0x111122223333444E\n\t"
+      "std\n\t"
       "int3\n\t"
       "mov qword ptr [rsp + 0],   rax\n\t"
       "mov qword ptr [rsp + 8],   rbx\n\t"
@@ -1206,12 +1435,15 @@ static bool TriggerInt3AndVerifyAllRegisters() {
       "mov qword ptr [rsp + 96],  r13\n\t"
       "mov qword ptr [rsp + 104], r14\n\t"
       "mov qword ptr [rsp + 112], r15\n\t"
-      "mov rdi, qword ptr [rsp + 120]\n\t"
-      "mov rsi, rsp\n\t"
-      "mov rcx, 15\n\t"
+      "pushfq\n\t"
+      "pop rax\n\t"
+      "mov qword ptr [rsp + 120], rax\n\t"
       "cld\n\t"
+      "mov rdi, qword ptr [rsp + 128]\n\t"
+      "mov rsi, rsp\n\t"
+      "mov rcx, 16\n\t"
       "rep movsq\n\t"
-      "add rsp, 128\n\t"
+      "add rsp, 136\n\t"
       "pop r15\n\t"
       "pop r14\n\t"
       "pop r13\n\t"
@@ -1226,7 +1458,8 @@ static bool TriggerInt3AndVerifyAllRegisters() {
   IdtUnregisterHandler(kVectorBreakpoint);
   if (IdtGetHandler(kVectorBreakpoint) != nullptr ||
       g_int3_handler_hits.load(std::memory_order_acquire) != 1 ||
-      !g_int3_frame_ok.load(std::memory_order_acquire)) {
+      !g_int3_frame_ok.load(std::memory_order_acquire) ||
+      (post_regs[15] & kRflagsDirectionFlag) == 0) {
     return false;
   }
   for (int i = 0; i < 15; ++i) {
@@ -1382,24 +1615,60 @@ static void ProgramLocalApicTimerInitCount(const uint32_t init_count) {
   SmpSetLocalApicTimerInitialCount(init_count);
 }
 
+struct CpuMask128 {
+  uint64_t low = 0;
+  uint64_t high = 0;
+};
+
+struct AtomicCpuMask128 {
+  std::atomic<uint64_t> low{0};
+  std::atomic<uint64_t> high{0};
+
+  bool SetBit(const int cpu) {
+    if (cpu >= 0 && cpu < 64) {
+      const uint64_t bit = 1ULL << static_cast<uint32_t>(cpu);
+      const uint64_t prev = low.fetch_or(bit, std::memory_order_acq_rel);
+      return (prev & bit) == 0;
+    }
+    if (cpu >= 64 && cpu < kMaxSupportedCpus) {
+      const uint64_t bit = 1ULL << static_cast<uint32_t>(cpu - 64);
+      const uint64_t prev = high.fetch_or(bit, std::memory_order_acq_rel);
+      return (prev & bit) == 0;
+    }
+    return false;
+  }
+
+  bool HasExpected(const CpuMask128& expected) const {
+    return (low.load(std::memory_order_acquire) & expected.low) ==
+               expected.low &&
+           (high.load(std::memory_order_acquire) & expected.high) ==
+               expected.high;
+  }
+
+  bool HasAnyRemoteCpu() const {
+    return (low.load(std::memory_order_acquire) & ~1ULL) != 0 ||
+           high.load(std::memory_order_acquire) != 0;
+  }
+};
+
 struct SchedulerTestContext {
   Task* bootstrap_task = nullptr;
-  std::atomic<uint32_t> observed_cpu_mask{0};
-  std::atomic<uint32_t> stolen_cpu_mask{0};
+  AtomicCpuMask128 observed_cpu_mask;
+  AtomicCpuMask128 stolen_cpu_mask;
   std::atomic<int64_t> remote_steal_slices{0};
   std::atomic<int> weighted_completed{0};
   std::atomic<int> steal_completed{0};
   std::atomic<int> stress_completed{0};
   std::atomic<int64_t> stress_child_completed{0};
   std::atomic<bool> stress_failed{false};
-  std::atomic<uint32_t> timer_boosted_mask{0};
-  std::atomic<uint32_t> timer_restored_mask{0};
-  std::atomic<uint32_t> spinner_started_mask{0};
+  AtomicCpuMask128 timer_boosted_mask;
+  AtomicCpuMask128 timer_restored_mask;
+  AtomicCpuMask128 spinner_started_mask;
   std::unique_ptr<std::atomic<int64_t>[]> spinner_iters;
   std::atomic<int> progress_done{0};
   std::atomic<bool> preempt_verified{false};
   std::atomic<bool> stop_spinners{false};
-  uint32_t expected_cpu_mask = 0;
+  CpuMask128 expected_cpu_mask = {};
   uint32_t calibrated_timer_count = 0;
   uint32_t stress_timer_count = 0;
 };
@@ -1440,10 +1709,7 @@ struct StressChildArg {
 static void MaybeBoostCurrentCpuTimer(SchedulerTestContext* const ctx) {
   const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
   const int cpu = CurrentCpuId();
-  const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
-  const uint32_t prev =
-      ctx->timer_boosted_mask.fetch_or(bit, std::memory_order_acq_rel);
-  if ((prev & bit) == 0 && ctx->stress_timer_count > 0) {
+  if (ctx->timer_boosted_mask.SetBit(cpu) && ctx->stress_timer_count > 0) {
     ProgramLocalApicTimerInitCount(ctx->stress_timer_count);
   }
   internal::LocalRestoreInterrupts(saved_irq);
@@ -1452,10 +1718,7 @@ static void MaybeBoostCurrentCpuTimer(SchedulerTestContext* const ctx) {
 static void MaybeRestoreCurrentCpuTimer(SchedulerTestContext* const ctx) {
   const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
   const int cpu = CurrentCpuId();
-  const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
-  const uint32_t prev =
-      ctx->timer_restored_mask.fetch_or(bit, std::memory_order_acq_rel);
-  if ((prev & bit) == 0 && ctx->calibrated_timer_count > 0) {
+  if (ctx->timer_restored_mask.SetBit(cpu) && ctx->calibrated_timer_count > 0) {
     ProgramLocalApicTimerInitCount(ctx->calibrated_timer_count);
   }
   internal::LocalRestoreInterrupts(saved_irq);
@@ -1487,8 +1750,7 @@ static void StressChildWorker(void* const raw_arg) {
   for (int step = 0; step < 2; ++step) {
     MaybeBoostCurrentCpuTimer(ctx);
     const int cpu = CurrentCpuId();
-    ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
-                                    std::memory_order_acq_rel);
+    ctx->observed_cpu_mask.SetBit(cpu);
     scheduler->Yield();
     if (scheduler->CurrentTask() != self || !AreInterruptsEnabled()) {
       ctx->stress_failed.store(true, std::memory_order_release);
@@ -1540,8 +1802,7 @@ static void StressWorker(void* const raw_arg) {
     }
 
     const int cpu = CurrentCpuId();
-    ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
-                                    std::memory_order_acq_rel);
+    ctx->observed_cpu_mask.SetBit(cpu);
 
     // Bombard a peer CPU with a wakeup/reschedule IPI (0x21) so asynchronous
     // interrupt handlers collide frequently with active scheduler operations.
@@ -1570,7 +1831,8 @@ static void StressWorker(void* const raw_arg) {
       child_arg.ctx = ctx;
       child_arg.parent_task = self;
       child_arg.expected_token = round_tag ^ 0xA5A5A5A55A5A5A5AULL;
-      Task* const child = scheduler->CreateTask(StressChildWorker, &child_arg,
+      Task* const child = scheduler->CreateTask(StressChildWorker,  //
+                                                &child_arg,         //
                                                 kDefaultTaskWeight);
       if (child == nullptr) {
         ctx->stress_failed.store(true, std::memory_order_release);
@@ -1619,8 +1881,7 @@ static void WeightedYieldWorker(void* const raw_arg) {
 
   for (int i = 0; i < kWeightedYieldIters; ++i) {
     const int cpu = CurrentCpuId();
-    arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
-                                         std::memory_order_acq_rel);
+    arg->ctx->observed_cpu_mask.SetBit(cpu);
     for (int spin = 0; spin < 400; ++spin) {
       asm volatile("pause" : : : "memory");
     }
@@ -1632,8 +1893,7 @@ static void WeightedYieldWorker(void* const raw_arg) {
   }
 
   const int cpu = CurrentCpuId();
-  arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
-                                       std::memory_order_acq_rel);
+  arg->ctx->observed_cpu_mask.SetBit(cpu);
   arg->done.store(true, std::memory_order_release);
   arg->ctx->weighted_completed.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -1647,9 +1907,8 @@ static void StealWorker(void* const raw_arg) {
   const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
   for (int s = 0; s < kStealWorkerSlices; ++s) {
     const int cpu = CurrentCpuId();
-    const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
-    arg->ctx->stolen_cpu_mask.fetch_or(bit, std::memory_order_acq_rel);
-    arg->ctx->observed_cpu_mask.fetch_or(bit, std::memory_order_acq_rel);
+    arg->ctx->stolen_cpu_mask.SetBit(cpu);
+    arg->ctx->observed_cpu_mask.SetBit(cpu);
     if (cpu != 0) {
       arg->ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -1660,9 +1919,8 @@ static void StealWorker(void* const raw_arg) {
   }
 
   const int cpu = CurrentCpuId();
-  const uint32_t bit = 1u << static_cast<uint32_t>(cpu);
-  arg->ctx->stolen_cpu_mask.fetch_or(bit, std::memory_order_acq_rel);
-  arg->ctx->observed_cpu_mask.fetch_or(bit, std::memory_order_acq_rel);
+  arg->ctx->stolen_cpu_mask.SetBit(cpu);
+  arg->ctx->observed_cpu_mask.SetBit(cpu);
   if (cpu != 0) {
     arg->ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
   }
@@ -1679,10 +1937,8 @@ static void SpinnerWorker(void* const raw_arg) {
   MaybeBoostCurrentCpuTimer(arg->ctx);
   const int idx = arg->spinner_index;
   const int cpu = CurrentCpuId();
-  arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
-                                       std::memory_order_acq_rel);
-  arg->ctx->spinner_started_mask.fetch_or(1u << static_cast<uint32_t>(idx),
-                                          std::memory_order_acq_rel);
+  arg->ctx->observed_cpu_mask.SetBit(cpu);
+  arg->ctx->spinner_started_mask.SetBit(idx);
 
   // CPU-bound spinner that NEVER calls Yield(); relies strictly on Local APIC
   // timer (0x20) preemption so PreemptProgressWorker tasks can run.
@@ -1690,14 +1946,13 @@ static void SpinnerWorker(void* const raw_arg) {
                      !arg->ctx->stop_spinners.load(std::memory_order_acquire);
        ++spin) {
     const int cur_cpu = CurrentCpuId();
-    arg->ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cur_cpu),
-                                         std::memory_order_relaxed);
+    arg->ctx->observed_cpu_mask.SetBit(cur_cpu);
     const int64_t iters =
         arg->ctx->spinner_iters[idx].fetch_add(1, std::memory_order_relaxed) +
         1;
     if (iters >= 64 &&
-        arg->ctx->spinner_started_mask.load(std::memory_order_acquire) ==
-            arg->ctx->expected_cpu_mask &&
+        arg->ctx->spinner_started_mask.HasExpected(
+            arg->ctx->expected_cpu_mask) &&
         arg->ctx->progress_done.load(std::memory_order_acquire) ==
             kPreemptProgressTasks) {
       arg->ctx->preempt_verified.store(true, std::memory_order_release);
@@ -1718,16 +1973,14 @@ static void PreemptProgressWorker(void* const raw_arg) {
   }
 
   const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
-  while (ctx->spinner_started_mask.load(std::memory_order_acquire) !=
-             ctx->expected_cpu_mask &&
+  while (!ctx->spinner_started_mask.HasExpected(ctx->expected_cpu_mask) &&
          !ctx->stop_spinners.load(std::memory_order_acquire)) {
     scheduler->Yield();
   }
 
   for (int step = 0; step < 4; ++step) {
     const int cpu = CurrentCpuId();
-    ctx->observed_cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
-                                    std::memory_order_acq_rel);
+    ctx->observed_cpu_mask.SetBit(cpu);
     for (int spin = 0; spin < 4000; ++spin) {
       asm volatile("pause" : : : "memory");
     }
@@ -1738,7 +1991,7 @@ static void PreemptProgressWorker(void* const raw_arg) {
 static bool TestTaskSchedulerSmp() {
   const int cpu_count = SmpCpuCount();
   const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
-  if (scheduler == nullptr || cpu_count < 1 ||
+  if (scheduler == nullptr || cpu_count < 1 || cpu_count > kMaxSupportedCpus ||
       SmpOnlineCpuCount() != cpu_count) {
     return false;
   }
@@ -1751,7 +2004,7 @@ static bool TestTaskSchedulerSmp() {
 
   SchedulerTestContext ctx = {};
   ctx.bootstrap_task = bootstrap;
-  ctx.observed_cpu_mask.fetch_or(1u, std::memory_order_relaxed);
+  ctx.observed_cpu_mask.SetBit(0);
   ctx.calibrated_timer_count = SmpCalibratedTimerInitialCount();
   ctx.stress_timer_count = (ctx.calibrated_timer_count > 32u)
                                ? (ctx.calibrated_timer_count / 16u)
@@ -1781,9 +2034,8 @@ static bool TestTaskSchedulerSmp() {
     const int64_t weight = (i < kHighWeightTaskCount)
                                ? (kDefaultTaskWeight * 2)
                                : (kDefaultTaskWeight / 2);
-    weighted_tasks[i] = scheduler->CreateTask(WeightedYieldWorker,  //
-                                              &weighted_args[i],    //
-                                              weight);
+    weighted_tasks[i] =
+        scheduler->CreateTask(WeightedYieldWorker, &weighted_args[i], weight);
     if (weighted_tasks[i] == nullptr) {
       return false;
     }
@@ -1840,7 +2092,7 @@ static bool TestTaskSchedulerSmp() {
     }
   }
   if (cpu_count > 1) {
-    if ((ctx.stolen_cpu_mask.load(std::memory_order_acquire) & ~1u) == 0 ||
+    if (!ctx.stolen_cpu_mask.HasAnyRemoteCpu() ||
         ctx.remote_steal_slices.load(std::memory_order_acquire) <= 0) {
       return false;
     }
@@ -1859,9 +2111,8 @@ static bool TestTaskSchedulerSmp() {
     stress_args[i].worker_index = i;
     const int64_t weight =
         kDefaultTaskWeight + static_cast<int64_t>((i % 4) - 1) * 256;
-    stress_tasks[i] = scheduler->CreateTask(StressWorker,     //
-                                            &stress_args[i],  //
-                                            weight);
+    stress_tasks[i] =
+        scheduler->CreateTask(StressWorker, &stress_args[i], weight);
     if (stress_tasks[i] == nullptr) {
       ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
       return false;
@@ -1894,28 +2145,30 @@ static bool TestTaskSchedulerSmp() {
   //    `cpu_count` non-yielding CPU-bound spinners plus progress tasks, and
   //    restore the calibrated Local APIC timer count on each CPU as its spinner
   //    exits.
-  const uint32_t expected_cpu_mask =
-      (cpu_count >= 32) ? 0xFFFFFFFFu
-                        : ((1u << static_cast<uint32_t>(cpu_count)) - 1u);
+  const CpuMask128 expected_cpu_mask = {
+      (cpu_count >= 64) ? ~0ULL
+                        : ((1ULL << static_cast<uint32_t>(cpu_count)) - 1ULL),
+      (cpu_count <= 64) ? 0ULL
+      : (cpu_count >= 128)
+          ? ~0ULL
+          : ((1ULL << static_cast<uint32_t>(cpu_count - 64)) - 1ULL),
+  };
   ctx.expected_cpu_mask = expected_cpu_mask;
   Task* progress_tasks[kPreemptProgressTasks] = {};
 
   for (int i = 0; i < cpu_count; ++i) {
     spinner_args[i].ctx = &ctx;
     spinner_args[i].spinner_index = i;
-    spinner_tasks[i] = scheduler->CreateTaskOnCpu(SpinnerWorker,        //
-                                                  &spinner_args[i],     //
-                                                  kDefaultTaskWeight,   //
-                                                  i);
+    spinner_tasks[i] = scheduler->CreateTaskOnCpu(
+        SpinnerWorker, &spinner_args[i], kDefaultTaskWeight, i);
     if (spinner_tasks[i] == nullptr) {
       ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
       return false;
     }
   }
   for (int i = 0; i < kPreemptProgressTasks; ++i) {
-    progress_tasks[i] = scheduler->CreateTask(PreemptProgressWorker,  //
-                                              &ctx,                   //
-                                              kDefaultTaskWeight);
+    progress_tasks[i] =
+        scheduler->CreateTask(PreemptProgressWorker, &ctx, kDefaultTaskWeight);
     if (progress_tasks[i] == nullptr) {
       ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
       return false;
@@ -1940,8 +2193,7 @@ static bool TestTaskSchedulerSmp() {
       return false;
     }
   }
-  if ((ctx.observed_cpu_mask.load(std::memory_order_acquire) &
-       expected_cpu_mask) != expected_cpu_mask) {
+  if (!ctx.observed_cpu_mask.HasExpected(expected_cpu_mask)) {
     return false;
   }
 
@@ -1953,8 +2205,9 @@ static bool TestTaskSchedulerSmp() {
       [](void* const arg) {
         static_cast<std::atomic<bool>*>(arg)->store(true,
                                                     std::memory_order_release);
-      },
-      &detached_ran, kDefaultTaskWeight);
+      },              //
+      &detached_ran,  //
+      kDefaultTaskWeight);
   if (detached == nullptr) {
     return false;
   }
@@ -1974,7 +2227,7 @@ static bool TestTaskSchedulerSmp() {
   UartWriteDec(
       static_cast<uint64_t>(ctx.progress_done.load(std::memory_order_acquire)));
   UartWrite(", cpu_mask=");
-  UartWriteHex(ctx.observed_cpu_mask.load(std::memory_order_acquire));
+  UartWriteHex(ctx.observed_cpu_mask.low.load(std::memory_order_acquire));
   UartWrite("\n");
 
   return pmm_free_after == pmm_free_before &&
